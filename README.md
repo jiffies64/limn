@@ -37,6 +37,10 @@ also needs a C compiler on `PATH` as `cc`. The `cuda` device needs an NVIDIA dri
 NVRTC: either a CUDA toolkit, or no root access at all with `uv sync --extra cuda`, which
 pulls NVRTC as a wheel.
 
+Contributing? `git config core.hooksPath .githooks` turns on the repo hooks: commit messages
+follow `type: subject` (feat, fix, docs, refactor, test, speedup, chore) and pushes run the
+linter and the test suite.
+
 ## Architecture
 
 Tensor methods never compute. They build a DAG over the primitive ops, and the graph runs
