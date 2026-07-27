@@ -14,6 +14,11 @@ value before the target is touched.
 A backend provides the rest: runners() turns lowered nests into callables, out_alloc and
 commit move bytes on its memory, prepare() admits buffers that live elsewhere (a host array
 handed to a device backend), finish() is its end-of-batch barrier.
+
+Plans, and the compiled programs behind them, live for the process and are never evicted:
+the intended workload is fixed shapes, where the caches converge after the first step. A
+workload with unboundedly many distinct graph structures (say, ragged sequence lengths)
+grows them without bound; bucket or pad shapes instead.
 """
 
 from __future__ import annotations
