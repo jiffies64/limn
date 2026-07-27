@@ -32,6 +32,31 @@ def test_matmul_4x5_5x3():
     check_cuda(a @ b)
 
 
+@pytest.mark.parametrize("name", list(GRAPHS))
+def test_corpus_gradients_match_numpy_device(name):
+    a = Tensor(randf(3, 4), requires_grad=True)
+    b = Tensor(randf(3, 4), requires_grad=True)
+    loss = GRAPHS[name](a, b).sum()
+    if not loss.requires_grad:
+        assert name == "cast round trip"  # casting detaches; every other graph must reach a leaf
+        return
+    loss.backward()
+    grads = [g for g in (a.grad, b.grad) if g is not None]
+    assert grads
+    for grad in grads:
+        check_cuda(grad)
+
+
+def test_batched_matmul_forward_and_backward():
+    a = Tensor(randf(2, 3, 4, 5), requires_grad=True)
+    b = Tensor(randf(5, 6), requires_grad=True)  # broadcast against the batch dims
+    out = a @ b
+    check_cuda(out)
+    out.sum().backward()
+    check_cuda(a.grad)
+    check_cuda(b.grad)
+
+
 def test_backward_pass():
     x = Tensor(randf(4, 5), requires_grad=True)
     w = Tensor(randf(5, 3), requires_grad=True)
