@@ -4,14 +4,14 @@
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Runtime dependency: numpy](https://img.shields.io/badge/runtime%20dependency-numpy-013243?logo=numpy&logoColor=white)
-![Backends: numpy and c](https://img.shields.io/badge/backends-numpy%20%C2%B7%20c-555555)
+![Backends: numpy, c and cuda](https://img.shields.io/badge/backends-numpy%20%C2%B7%20c%20%C2%B7%20cuda-555555)
 
 A deep learning framework built to be read. The whole stack is here: lazy tensors over a
 closed set of 19 primitive ops, reverse-mode autograd, a scheduler that fuses the graph into
-kernels, an IR you can print, and a C backend that JIT-compiles it, in about 2,000 lines of
-Python with numpy as the only runtime dependency. In spirit it sits between micrograd and
-tinygrad: small enough to read in one sitting, real enough that a matmul comes out the other
-end as one fused loop nest with the stride-1 dim innermost.
+kernels, an IR you can print, and C and CUDA backends that JIT-compile it, in about 2,500
+lines of Python with numpy as the only runtime dependency. In spirit it sits between
+micrograd and tinygrad: small enough to read in one sitting, real enough that a matmul comes
+out the other end as one fused loop nest with the stride-1 dim innermost.
 
 ```python
 from limn import Tensor
@@ -33,7 +33,9 @@ uv run python examples/train_mlp.py    # AdamW on a toy regression; loss must dr
 ```
 
 `uv sync` installs numpy plus the dev group (pytest, ruff, CPU-only torch). The `c` device
-also needs a C compiler on `PATH` as `cc`.
+also needs a C compiler on `PATH` as `cc`. The `cuda` device needs an NVIDIA driver and
+NVRTC: either a CUDA toolkit, or no root access at all with `uv sync --extra cuda`, which
+pulls NVRTC as a wheel.
 
 ## Architecture
 
@@ -48,7 +50,9 @@ flowchart LR
     G --> N["numpy interpreter<br>device.py"]
     G --> S["scheduler, fused kernels<br>schedule.py"]
     S --> I["loop-nest IR<br>codegen.py"]
-    I --> C["C JIT<br>backend_c.py"]
+    I --> J["plan executor<br>jit.py"]
+    J --> C["C JIT<br>backend_c.py"]
+    J --> U["CUDA JIT<br>backend_cuda.py"]
 ```
 
 Three rules hold it together:
@@ -129,8 +133,8 @@ Two things the dump shows:
 
 ## Backends
 
-`set_device` picks the executor. Buffers are host bytes on every current device, so tensors
-created before a switch keep working after it.
+`set_device` picks the executor. The host devices share bytes, so tensors move freely
+between them; the cuda device's memory rules are a paragraph down.
 
 ```python
 import numpy as np
@@ -145,17 +149,28 @@ print((x @ x.transpose()).sum().item())
 |---|---|---|
 | `numpy` | interprets the op graph, one numpy call per node | nothing |
 | `c` | schedule → loop-nest IR → C source → `cc -O3 -march=native` → ctypes | a C compiler |
+| `cuda` | schedule → loop-nest IR → CUDA C → NVRTC → PTX → driver API | an NVIDIA driver, and NVRTC from a toolkit or `uv sync --extra cuda` |
 
-The C device caches twice: shared libraries by source hash, execution plans by graph
+Both compiled devices cache twice: programs by source hash, execution plans by graph
 structure. A training loop at fixed shapes schedules, emits, and compiles on the first step;
-every step after goes straight to the compiled kernels. Selecting `"c"` with no compiler
-installed fails at `set_device`, not later inside a subprocess.
+every step after goes straight to the compiled kernels. Selecting a device whose toolchain is
+missing fails at `set_device` with the reason, not later inside a subprocess.
+
+The cuda device binds libcuda and NVRTC through ctypes at runtime, so nothing is pinned to a
+CUDA version: kernels compile to PTX for the newest architecture the loaded NVRTC supports
+that does not exceed the GPU's, and the driver JIT covers the gap when the GPU is newer than
+the toolkit. One thread runs one point of the non-reduce dims with reduce loops sequential
+inside it, so results fold in the same order as the C backend and only scatters need
+atomics. Its buffers live in GPU memory: host tensors handed to it are uploaded per batch
+(and assigns to them written back), but tensors created under cuda are readable only there.
 
 ### Adding one
 
 The IR is the contract: twelve opcodes (loops, loads, arithmetic, accumulators, stores) with
-all index arithmetic made explicit. A backend is one rendering of that instruction stream
-plus buffer management, which is exactly what `backend_c.py` is for C.
+all index arithmetic made explicit, and `jit.py` already owns planning, caching and the
+assign transaction. A backend is one rendering of that instruction stream plus five hooks
+for moving bytes, which is exactly what `backend_c.py` is for C and `backend_cuda.py` is for
+CUDA.
 
 ## nn and optim
 
@@ -175,6 +190,7 @@ Every layer answers to an oracle above it:
 | ops + autograd | PyTorch (CPU, test-only) | a seeded fuzzer builds 300 random DAGs (movement, broadcasting, reduces, matmul), runs them forward and backward in both frameworks, and requires agreement to 1e-4; failures print a reproducer |
 | scheduler + codegen | the numpy device | tests interpret the lowered IR instruction by instruction and diff the numbers, so the printed nest means what it says (strides, masks, reduce identities) |
 | `c` backend | the numpy device | a shared graph corpus runs on both devices and is diffed at 1e-5 |
+| `cuda` backend | the numpy device | the same corpus, plus grid-stride coverage past one launch's thread count, atomic scatter collisions on a single row, and a training loop on the device |
 
 ## Layout
 
@@ -186,7 +202,9 @@ limn/
   device.py      the device protocol and the numpy reference interpreter
   schedule.py    cuts the graph into fused kernels
   codegen.py     lowers kernels to the printable loop-nest IR
+  jit.py         the shared executor: plan caching and the assign transaction
   backend_c.py   renders the IR as C, compiles it, calls it through ctypes
+  backend_cuda.py  renders the IR as CUDA C, compiles with NVRTC, launches via the driver API
   nn.py          Linear, LayerNorm, Embedding
   optim.py       SGD, AdamW
 tests/           one file per layer, a 300-case autograd fuzzer, an IR interpreter
