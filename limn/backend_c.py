@@ -15,16 +15,14 @@ import math
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
-from limn.codegen import LoopNest, Opcode, Valid, lower_all
+from limn.codegen import LoopNest, Opcode, Valid
 from limn.device import Buffer, HostDevice
-from limn.ops import DType, Node, Op, float32, int32, topological
-from limn.schedule import realized
+from limn.jit import CompiledDevice, Runner
+from limn.ops import DType, Op, float32, int32
 
 C_TYPE = {float32: "float", int32: "int32_t"}
 
@@ -63,10 +61,6 @@ def c_literal(value: float | int, dtype: DType) -> str:
             return "NAN"
         return f"{value}f"
     return "(-2147483647 - 1)" if value == -(2**31) else str(value)
-
-
-def nbytes(node: Node) -> int:
-    return node.dtype.itemsize * math.prod(node.shape)
 
 
 def guard(valid: Valid, dtype: DType) -> tuple[str, str]:
@@ -209,104 +203,28 @@ def cleanup() -> None:
 atexit.register(cleanup)
 
 
-def graph_key(order: list[Node], position: dict[Node, int], sinks: list[Node]) -> tuple:
-    """This graph's structure, as a hashable key: two graphs with the same key lower to the same C.
+class CDevice(CompiledDevice, HostDevice):
+    """Runs op graphs as C: renders the loop-nest IR, compiles with cc, calls through ctypes.
 
-    A training loop rebuilds an identical graph every step, and scheduling plus emission cost more
-    than running the kernels do, so plans are cached on what they depend on: each node's op, dtype,
-    shape and arg, the wiring between them as positions in topological order, and which positions
-    are the sinks. A BUFFER's bytes are the one thing lowering never looks at, only its shape and
-    dtype, so its arg is left out; that is what lets the same plan serve every step. A CONST's arg
-    stays in, because it is baked into the source as a literal.
-    """
-    at = position.__getitem__
-    parts = tuple(
-        (node.op, node.dtype, node.shape, None if node.op is Op.BUFFER else node.arg, tuple(map(at, node.srcs))) for node in order
-    )
-    return parts, tuple(map(at, sinks))
-
-
-@dataclass(frozen=True, slots=True)
-class Call:
-    """One compiled kernel invocation, with its buffers named by position in topological order."""
-
-    fn: Callable[..., None]  # the ctypes function, argtypes already set
-    inputs: tuple[int, ...]
-    output: int  # the position whose value this call produces (the ASSIGN node itself for assigns)
-    out_nbytes: int
-    zero_fill: bool  # a scatter adds into its output and reaches only the rows its indices name
-    assign_target: int | None  # the BUFFER position an assign commits to, once every call has run
-
-
-@dataclass(frozen=True, slots=True)
-class Plan:
-    calls: tuple[Call, ...]
-    buffers: tuple[int, ...]  # the BUFFER positions, whose bytes come from this step's graph
-    sinks: tuple[int, ...]  # realized() resolved to positions, so alias chains are walked once
-
-
-class CDevice(HostDevice):
-    """Executes op graphs by compiling the scheduled IR to C. Host-memory only for now.
-
-    Plans are cached per graph structure (graph_key), so a repeated graph skips scheduling,
-    emission and the source hash, and goes straight to calling the compiled kernels with this
-    graph's buffers.
+    Planning, caching and the assign transaction come from CompiledDevice; buffers are host
+    bytes from HostDevice. Identical source (a training loop's repeated step) reuses its
+    shared library by hash.
     """
 
-    def __init__(self) -> None:
-        self.plans: dict[tuple, Plan] = {}
+    def runners(self, nests: list[LoopNest]) -> list[Runner]:
+        if not nests:
+            return []
+        lib = compile_c(emit_c(nests))
+        runners: list[Runner] = []
+        for nest in nests:
+            fn = getattr(lib, nest.name)
+            fn.argtypes = [ctypes.c_void_p] * (len(nest.kernel.inputs) + 1)
+            fn.restype = None
+            runners.append(lambda inputs, out, fn=fn: fn(*[b.ctypes.data for b in inputs], out.ctypes.data))
+        return runners
 
-    def execute(self, sinks: list[Node]) -> list[Buffer]:
-        order = topological(sinks)
-        position = {node: p for p, node in enumerate(order)}
-        key = graph_key(order, position, sinks)
-        plan = self.plans.get(key)
-        if plan is None:
-            plan = self.plans[key] = plan_of(order, position, sinks)
+    def out_alloc(self, nb: int, zero: bool) -> Buffer:
+        return (np.zeros if zero else np.empty)(nb, dtype=np.uint8)
 
-        bufs: list[Buffer] = [None] * len(order)
-        for p in plan.buffers:
-            bufs[p] = order[p].arg
-
-        deferred: list[tuple[Buffer, Buffer]] = []
-        for call in plan.calls:
-            # a fresh output per call, never a buffer the kernel also reads, is what lets
-            # emit_function mark _out restrict; an assign relies on it too, and commits below
-            fill = np.zeros if call.zero_fill else np.empty
-            out_buf = fill(call.out_nbytes, dtype=np.uint8)
-            call.fn(*[bufs[p].ctypes.data for p in call.inputs], out_buf.ctypes.data)
-            bufs[call.output] = out_buf
-            if call.assign_target is not None:
-                deferred.append((order[call.assign_target].arg, out_buf))
-
-        for target_buf, src_buf in deferred:
-            target_buf[:] = src_buf
-
-        return [bufs[p] for p in plan.sinks]
-
-
-def plan_of(order: list[Node], position: dict[Node, int], sinks: list[Node]) -> Plan:
-    """Lower, emit and compile these sinks' kernels, wired up by position instead of by node."""
-    nests = lower_all(sinks, order)
-    lib = compile_c(emit_c(nests)) if nests else None
-    calls = []
-    for nest in nests:
-        kernel = nest.kernel
-        fn = getattr(lib, nest.name)
-        fn.argtypes = [ctypes.c_void_p] * (len(kernel.inputs) + 1)
-        fn.restype = None
-        calls.append(
-            Call(
-                fn=fn,
-                inputs=tuple(position[node] for node in kernel.inputs),
-                output=position[kernel.ast],
-                out_nbytes=nbytes(kernel.target),
-                zero_fill=kernel.ast.op is Op.SCATTER,
-                assign_target=position[kernel.target] if kernel.ast.op is Op.ASSIGN else None,
-            )
-        )
-    return Plan(
-        tuple(calls),
-        tuple(p for p, node in enumerate(order) if node.op is Op.BUFFER),
-        tuple(position[realized(sink)] for sink in sinks),
-    )
+    def commit(self, target: Buffer, value: Buffer) -> None:
+        target[:] = value
