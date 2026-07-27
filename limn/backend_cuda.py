@@ -339,19 +339,24 @@ def compile_cuda(source: str, arch: int, kernel_names: list[str]) -> Program:
 
 
 class CudaBuffer:
-    """Bytes in device memory, freed when the last reference drops."""
+    """Bytes in device memory, recycled through the owning device's pool when the last reference drops.
 
-    __slots__ = ("ptr", "nbytes")
+    cuMemAlloc and cuMemFree are slow enough to dominate a training step, which retires one
+    output buffer per kernel, so freed pointers go back to a per-size free list instead of
+    the driver. The pool therefore holds device memory at its high-water mark per size;
+    trim() gives it back, and allocation failure trims and retries before giving up.
+    """
 
-    def __init__(self, ptr: int, nbytes: int):
+    __slots__ = ("ptr", "nbytes", "pool")
+
+    def __init__(self, ptr: int, nbytes: int, pool: dict[int, list[int]]):
         self.ptr = ptr
         self.nbytes = nbytes
+        self.pool = pool
 
     def __del__(self) -> None:
         try:
-            api = driver()
-            if api is not None:
-                api.cuMemFree(self.ptr)  # result deliberately unchecked
+            self.pool.setdefault(self.nbytes, []).append(self.ptr)
         except Exception:  # interpreter teardown can have unloaded anything by now
             pass
 
@@ -391,6 +396,7 @@ class CudaDevice(CompiledDevice):
         check(api.cuDeviceGetAttribute(ctypes.byref(major), 75, dev), "querying compute capability")
         check(api.cuDeviceGetAttribute(ctypes.byref(minor), 76, dev), "querying compute capability")
         self.arch = pick_arch(major.value * 10 + minor.value, nv)
+        self.pool: dict[int, list[int]] = {}
         context = ctypes.c_void_p()
         check(api.cuDevicePrimaryCtxRetain(ctypes.byref(context), dev), "retaining the primary context")
         check(api.cuCtxSetCurrent(context), "making the context current")
@@ -398,9 +404,23 @@ class CudaDevice(CompiledDevice):
     # ---- Device protocol: raw byte buffers ----
 
     def _alloc(self, nb: int) -> CudaBuffer:
+        recycled = self.pool.get(nb)
+        if recycled:
+            return CudaBuffer(recycled.pop(), nb, self.pool)
         ptr = CUdeviceptr()
-        check(self.api.cuMemAlloc(ctypes.byref(ptr), nb), f"allocating {nb} bytes")
-        return CudaBuffer(ptr.value, nb)
+        result = self.api.cuMemAlloc(ctypes.byref(ptr), nb)
+        if result != 0 and self.pool:
+            self.trim()  # the pool may be hoarding what this allocation needs
+            result = self.api.cuMemAlloc(ctypes.byref(ptr), nb)
+        check(result, f"allocating {nb} bytes")
+        return CudaBuffer(ptr.value, nb, self.pool)
+
+    def trim(self) -> None:
+        """Return every pooled buffer to the driver."""
+        for pointers in self.pool.values():
+            for ptr in pointers:
+                self.api.cuMemFree(ptr)
+        self.pool.clear()
 
     def alloc(self, nbytes: int) -> Buffer:
         buf = self._alloc(nbytes)

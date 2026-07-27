@@ -131,6 +131,19 @@ def test_scatter_collisions_hit_one_row_atomically():
     np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)  # adds land in atomic order, not loop order
 
 
+def test_the_pool_recycles_dropped_buffers():
+    dev = CudaDevice()
+    first = dev._alloc(1024)
+    ptr = first.ptr
+    del first
+    second = dev._alloc(1024)
+    assert second.ptr == ptr
+    del second
+    dev.trim()
+    assert not dev.pool
+    assert dev._alloc(1024).ptr != 0
+
+
 def test_a_repeated_graph_reuses_the_plan_and_reads_fresh_bytes():
     dev = CudaDevice()
     for x in (randf(3, 4), randf(3, 4)):
