@@ -13,7 +13,9 @@ atomics, and a cell folds its elements in ascending reduce order, matching the C
 exactly. The innermost non-reduce dim (picked by loop_order for being stride-1 in the most
 buffers) becomes the fastest-varying thread index, which is what makes warp loads coalesce.
 SCATTER is the one racing write, since two values can name the same row, so it adds with
-atomicAdd. A reduce over every dim runs on a single thread.
+atomicAdd. A large reduce over few output cells is the exception to one-thread-per-cell: it
+runs as two kernels, strided partial accumulators and then their fold, with a fixed grouping
+that keeps it deterministic but matches the host backends to rounding rather than bit for bit.
 
 Launches are grid-stride loops over at most GRID blocks of BLOCK threads, so any size runs a
 bounded launch, and execute() synchronizes per batch, which keeps the queue short and pins a
@@ -40,7 +42,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from limn.backend_c import C_TYPE, arith_c, c_literal, fold_c, guard
-from limn.codegen import REDUCES, LoopNest, Opcode
+from limn.codegen import REDUCES, Instr, LoopNest, Opcode
 from limn.device import Buffer
 from limn.jit import CompiledDevice, Runner
 
@@ -204,6 +206,115 @@ def outer_extent(nest: LoopNest) -> int:
     return math.prod(size for d, size in enumerate(nest.space) if d not in axes)
 
 
+def reduce_extent(nest: LoopNest) -> int:
+    axes = reduce_axes(nest)
+    return math.prod(nest.space[d] for d in axes)
+
+
+SPLIT_MIN = 4096  # a reduce at least this long, over fewer than this many cells, gets a second stage
+
+
+def split_partials(nest: LoopNest) -> int:
+    """How many partial accumulators a split reduce uses per cell; 0 when the nest is not split.
+
+    Only the register form splits: there each output cell is one thread, so few cells over a
+    long reduce leaves the GPU idle while single threads walk millions of elements. The ACCUM
+    form already spreads its work across the non-reduce dims. Partials are capped so a shorter
+    reduce still hands every partial a real chunk.
+    """
+    if not any(instr.opcode is Opcode.ACC for instr in nest.instrs):
+        return 0
+    r = reduce_extent(nest)
+    if r < SPLIT_MIN or outer_extent(nest) >= SPLIT_MIN:
+        return 0
+    return min(4096, r // 64)
+
+
+def value_line(instr: Instr, indent: str) -> str:
+    """One value-producing instruction as a C declaration; shared by both kernel forms."""
+    match instr.opcode:
+        case Opcode.CONST:
+            value, valid = instr.arg
+            pre, post = guard(valid, instr.value_type)
+            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}{c_literal(value, instr.value_type)}{post};"
+        case Opcode.LOAD:
+            buf, index, valid = instr.arg
+            pre, post = guard(valid, instr.value_type)
+            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}{buf}[{index.render()}]{post};"
+        case Opcode.ARITH:
+            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {arith_c(instr.arg, list(instr.srcs), instr.value_type)};"
+        case Opcode.CAST:
+            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = ({C_TYPE[instr.value_type]}){instr.srcs[0]};"
+        case _:
+            raise NotImplementedError(f"{instr.opcode} does not define a value")
+
+
+def emit_split(nest: LoopNest, partials: int) -> str:
+    """A register reduce as two kernels: strided partials per output cell, then their fold.
+
+    Partial p of a cell accumulates elements p, p + partials, p + 2*partials, ... so warp
+    loads stay coalesced and the grouping is fixed, which is what makes the result
+    deterministic; it is grouped differently from the sequential nest, so it agrees with the
+    host backends to rounding rather than bit for bit (int folds stay exact, addition being
+    associative modulo 2**32).
+    """
+    kernel = nest.kernel
+    root = kernel.ast
+    fold = REDUCES[root.op].fold
+    ctype = C_TYPE[root.dtype]
+    reduce_vars = {f"r{d}" for d in reduce_axes(nest)}
+    outer: list[tuple[str, int]] = []
+    loops: list[tuple[str, int]] = []
+    for instr in nest.instrs:
+        if instr.opcode is Opcode.LOOP and all(var != instr.dest for var, _ in outer + loops):
+            (loops if instr.dest in reduce_vars else outer).append((instr.dest, instr.arg))
+    total = reduce_extent(nest)
+    first = "blockIdx.x * (long long)blockDim.x + threadIdx.x"
+    stride = "(long long)gridDim.x * blockDim.x"
+
+    params = [f"const {C_TYPE[node.dtype]}* __restrict__ in{k}" for k, node in enumerate(kernel.inputs)]
+    lines = [f'extern "C" __global__ void {nest.name}_part({", ".join(params + [f"{ctype}* __restrict__ out"])}) {{']
+    lines.append(f"  for (long long gid = {first}; gid < {outer_extent(nest) * partials}LL; gid += {stride}) {{")
+    lines.append(f"    const int p = (int)(gid % {partials});")
+    lines.append(f"    long long t = gid / {partials};")
+    for var, bound in reversed(outer[1:]):
+        lines.append(f"    const int {var} = (int)(t % {bound}); t /= {bound};")
+    if outer:
+        lines.append(f"    const int {outer[0][0]} = (int)t;")
+    for instr in nest.instrs:
+        match instr.opcode:
+            case Opcode.LOOP | Opcode.ENDLOOP:
+                continue
+            case Opcode.ACC:
+                lines.append(f"    {ctype} {instr.dest} = {c_literal(instr.arg, instr.value_type)};")
+                lines.append(f"    for (long long j = p; j < {total}LL; j += {partials}) {{")
+                lines.append("      long long u = j;")
+                for var, bound in reversed(loops[1:]):
+                    lines.append(f"      const int {var} = (int)(u % {bound}); u /= {bound};")
+                lines.append(f"      const int {loops[0][0]} = (int)u;")
+            case Opcode.UPDATE:
+                lines.append("      " + fold_c(instr.arg, instr.dest, instr.srcs[0]))
+            case Opcode.STORE:
+                lines.append("    }")
+                lines.append(f"    out[(gid / {partials}) * {partials} + p] = acc;")
+            case _:
+                lines.append(value_line(instr, "      "))
+    lines.append("  }")
+    lines.append("}")
+
+    lines.append("")
+    lines.append(f'extern "C" __global__ void {nest.name}(const {ctype}* __restrict__ in0, {ctype}* __restrict__ out) {{')
+    lines.append(f"  for (long long gid = {first}; gid < {outer_extent(nest)}LL; gid += {stride}) {{")
+    lines.append(f"    {ctype} acc = {c_literal(REDUCES[root.op].identity[root.dtype], root.dtype)};")
+    lines.append(f"    for (int p = 0; p < {partials}; p++) {{")
+    lines.append("      " + fold_c(fold, "acc", f"in0[gid * {partials} + p]"))
+    lines.append("    }")
+    lines.append("    out[gid] = acc;")
+    lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines)
+
+
 def emit_kernel(nest: LoopNest) -> str:
     kernel = nest.kernel
     reduce_vars = {f"r{d}" for d in reduce_axes(nest)}
@@ -248,21 +359,8 @@ def emit_kernel(nest: LoopNest) -> str:
         match instr.opcode:
             case Opcode.ACC:
                 lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {c_literal(instr.arg, instr.value_type)};")
-            case Opcode.CONST:
-                value, valid = instr.arg
-                pre, post = guard(valid, instr.value_type)
-                lines.append(
-                    f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}{c_literal(value, instr.value_type)}{post};"
-                )
-            case Opcode.LOAD:
-                buf, index, valid = instr.arg
-                pre, post = guard(valid, instr.value_type)
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}{buf}[{index.render()}]{post};")
-            case Opcode.ARITH:
-                expr = arith_c(instr.arg, list(instr.srcs), instr.value_type)
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {expr};")
-            case Opcode.CAST:
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = ({C_TYPE[instr.value_type]}){instr.srcs[0]};")
+            case Opcode.CONST | Opcode.LOAD | Opcode.ARITH | Opcode.CAST:
+                lines.append(value_line(instr, indent))
             case Opcode.UPDATE:
                 lines.append(indent + fold_c(instr.arg, instr.dest, instr.srcs[0]))
             case Opcode.STORE:
@@ -284,7 +382,8 @@ def emit_kernel(nest: LoopNest) -> str:
 
 
 def emit_cuda(nests: list[LoopNest]) -> str:
-    return "\n".join([PRELUDE] + [emit_kernel(nest) + "\n" for nest in nests])
+    kernels = [emit_split(nest, p) if (p := split_partials(nest)) else emit_kernel(nest) for nest in nests]
+    return "\n".join([PRELUDE] + [kernel + "\n" for kernel in kernels])
 
 
 # ---- compilation ----
@@ -463,13 +562,31 @@ class CudaDevice(CompiledDevice):
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
         if not nests:
             return []
-        program = compile_cuda(emit_cuda(nests), self.arch, [nest.name for nest in nests])
+        names = [name for nest in nests for name in ([nest.name + "_part"] if split_partials(nest) else []) + [nest.name]]
+        program = compile_cuda(emit_cuda(nests), self.arch, names)
         out: list[Runner] = []
         for nest in nests:
-            threads = outer_extent(nest)
-            grid = min((threads + BLOCK - 1) // BLOCK, GRID)
-            out.append(self._launcher(program.functions[nest.name], grid))
+            outer = outer_extent(nest)
+            partials = split_partials(nest)
+            final = self._launcher(program.functions[nest.name], self._grid(outer))
+            if partials:
+                part = self._launcher(program.functions[nest.name + "_part"], self._grid(outer * partials))
+                out.append(self._split_runner(part, final, outer * partials * nest.kernel.target.dtype.itemsize))
+            else:
+                out.append(final)
         return out
+
+    @staticmethod
+    def _grid(threads: int) -> int:
+        return min((threads + BLOCK - 1) // BLOCK, GRID)
+
+    def _split_runner(self, part: Runner, final: Runner, partials_nbytes: int) -> Runner:
+        def run(inputs: list[Buffer], out: Buffer) -> None:
+            partials = self._alloc(partials_nbytes)
+            part(inputs, partials)
+            final([partials], out)
+
+        return run
 
     def _launcher(self, fn: ctypes.c_void_p, grid: int) -> Runner:
         def run(inputs: list[Buffer], out: Buffer) -> None:

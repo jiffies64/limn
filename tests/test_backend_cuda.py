@@ -131,6 +131,43 @@ def test_scatter_collisions_hit_one_row_atomically():
     np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)  # adds land in atomic order, not loop order
 
 
+def test_a_large_full_sum_splits_and_matches_numpy():
+    data = randf(1 << 22)
+    total = Tensor(data).sum()
+    expected = total.numpy()
+    got = cudev.copyout(cudev.execute([total.node])[0]).view(np.float32)
+    np.testing.assert_allclose(got, expected, rtol=1e-4)  # split grouping reassociates the float adds
+
+
+def test_a_large_full_max_is_exact():
+    biggest = Tensor(randf(1 << 22)).max()
+    expected = biggest.numpy()
+    got = cudev.copyout(cudev.execute([biggest.node])[0]).view(np.float32)
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_a_large_int_sum_is_exact():
+    values = np.arange(1 << 20, dtype=np.int32)
+    total = Tensor(values).sum()
+    got = cudev.copyout(cudev.execute([total.node])[0]).view(np.int32)
+    np.testing.assert_array_equal(got, values.sum(dtype=np.int32))  # int folds associate modulo 2**32
+
+
+def test_a_split_reduce_is_deterministic():
+    total = Tensor(randf(1 << 20)).sum()
+    once = cudev.copyout(cudev.execute([total.node])[0])
+    again = cudev.copyout(cudev.execute([total.node])[0])
+    np.testing.assert_array_equal(once, again)
+
+
+def test_a_split_reduce_with_a_fused_and_masked_body():
+    x = Tensor(randf(100_000))
+    r = (x * 2.0 + 1.0).pad(((3, 5),)).sum()
+    expected = r.numpy()
+    got = cudev.copyout(cudev.execute([r.node])[0]).view(np.float32)
+    np.testing.assert_allclose(got, expected, rtol=1e-4)
+
+
 def test_the_pool_recycles_dropped_buffers():
     dev = CudaDevice()
     first = dev._alloc(1024)
