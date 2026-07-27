@@ -37,7 +37,7 @@ class Device(Protocol):
 
 
 class HostDevice:
-    """Buffers as host bytes: flat uint8 arrays. Every backend so far shares these three primitives."""
+    """Buffers as host bytes: flat uint8 arrays. The host backends share these three primitives."""
 
     def alloc(self, nbytes: int) -> Buffer:
         return np.zeros(nbytes, dtype=np.uint8)
@@ -161,7 +161,16 @@ def _c_device() -> Device:
     return CDevice()
 
 
-DEVICES: dict[str, Callable[[], Device]] = {"numpy": _numpy_device, "c": _c_device}
+def _cuda_device() -> Device:
+    from limn.backend_cuda import CudaDevice, cuda_unavailable
+
+    reason = cuda_unavailable()
+    if reason is not None:
+        raise RuntimeError(f"the 'cuda' device is unavailable: {reason}")
+    return CudaDevice()
+
+
+DEVICES: dict[str, Callable[[], Device]] = {"numpy": _numpy_device, "c": _c_device, "cuda": _cuda_device}
 
 active_device: Device = NumpyDevice()
 
@@ -173,9 +182,11 @@ def active() -> Device:
 def set_device(name: str) -> None:
     """Point every graph built from here on at a different backend.
 
-    Buffers are host bytes in both backends, so tensors allocated before a switch keep working
-    after it. The C device is imported inside its factory because it is written against this
-    module, and it is checked for a compiler now instead of failing later inside a subprocess.
+    The host devices share bytes, so tensors move freely between them; the cuda device uploads
+    any host buffer it is handed and writes assigns back, but its own buffers live in device
+    memory and only it can read them, so tensors created under cuda stay there. Backends are
+    imported inside their factories because they are written against this module, and each is
+    checked for its toolchain now instead of failing later inside a subprocess.
     """
     global active_device
     if name not in DEVICES:

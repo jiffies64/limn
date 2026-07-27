@@ -47,7 +47,7 @@ def test_an_assign_whose_value_is_a_plain_buffer_still_reads_pre_assign_bytes():
 
 def test_set_device_rejects_unknown_names():
     with pytest.raises(ValueError, match="unknown device"):
-        set_device("cuda")
+        set_device("tpu")
     assert type(device.active()).__name__ == "NumpyDevice"
 
 

@@ -5,6 +5,11 @@ description = "A small, readable deep learning framework: lazy tensors, autograd
 requires-python = ">=3.12"
 dependencies = ["numpy>=2.0"]
 
+[project.optional-dependencies]
+cuda = [
+    "nvidia-cuda-nvrtc>=13.3.33",
+]
+
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6", "torch>=2.4"]
 
