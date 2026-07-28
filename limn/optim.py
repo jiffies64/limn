@@ -16,6 +16,7 @@ plan serve the whole run and a captured step (limn.capture) replay with no host 
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 
 from limn.ops import DType, float32, promote
@@ -117,4 +118,79 @@ class AdamW(Optimizer):
             v_hat = new_v * inv2
             update = m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * p  # decoupled decay, torch AdamW
             updates += [(m, new_m), (v, new_v), (p, (p - self.lr * update).cast(p.dtype))]
+        return updates
+
+
+class Muon(Optimizer):
+    """Orthogonalized momentum, for 2D parameters only (Jordan et al.'s Muon).
+
+    Route embeddings, output heads, biases and norm gains to AdamW; Newton-Schulz is only
+    defined on matrices, and the shape-scaled step assumes hidden-layer geometry.
+
+    The buffer keeps the original accumulator convention, buf = momentum * buf + grad, where
+    torch.optim.Muon keeps an EMA. The two buffers differ by a factor of 1 - momentum, which
+    the Frobenius normalization inside Newton-Schulz cancels, so under torch's
+    match_rms_adamw scaling the steps agree to the bfloat16 torch orthogonalizes in.
+    """
+
+    NS_COEFFS = (3.4445, -4.7750, 2.0315)  # Jordan et al., tuned for 5 steps
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 0.02,
+        momentum: float = 0.95,
+        weight_decay: float = 0.1,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        eps: float = 1e-7,
+    ):
+        super().__init__(params)
+        if any(len(p.shape) != 2 for p in self.params):
+            raise ValueError("Muon takes 2D parameters only; reshape convs, send the rest to AdamW")
+        self.lr = lr
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        self.nesterov = nesterov
+        self.ns_steps = ns_steps
+        self.eps = eps
+        self.buf = [state_like(p) for p in self.params]
+
+    def newton_schulz(self, mat: Tensor) -> Tensor:
+        """Approximate the matrix sign function: drives every singular value toward 1.
+
+        Cheaper than an SVD by a mile, and the approximation being loose doesn't hurt.
+        Iterates the odd polynomial aX + bX^3 + cX^5, written in matrix form.
+        """
+        a, b, c = self.NS_COEFFS
+        transposed = mat.shape[0] > mat.shape[1]  # iterate on the wide orientation
+        if transposed:
+            mat = mat.transpose()
+
+        mat = mat / ((mat**2).sum().sqrt() + self.eps)  # singular values into [0, 1]
+
+        for _ in range(self.ns_steps):
+            gram = mat @ mat.transpose()
+            poly = b * gram + c * (gram @ gram)
+            mat = a * mat + poly @ mat
+
+        return mat.transpose() if transposed else mat
+
+    def updates(self) -> list[tuple[Tensor, Tensor]]:
+        updates: list[tuple[Tensor, Tensor]] = []
+        for p, buf in zip(self.params, self.buf):
+            if p.grad is None:
+                continue
+            new_buf = self.momentum * buf + p.grad
+            direction = p.grad + self.momentum * new_buf if self.nesterov else new_buf
+
+            ortho = self.newton_schulz(direction)
+
+            # Shape-scaled step, so matrices of different sizes move by a comparable
+            # amount and one lr works for the whole model (Moonlight, arXiv 2502.16982).
+            rows, cols = p.shape
+            scaled_lr = self.lr * 0.2 * math.sqrt(max(rows, cols))
+
+            decayed = p - self.lr * self.weight_decay * p  # decoupled, base lr
+            updates += [(buf, new_buf), (p, (decayed - scaled_lr * ortho).cast(p.dtype))]
         return updates

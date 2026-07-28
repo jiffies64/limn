@@ -8,7 +8,7 @@ from limn import Tensor, capture, device, realize, set_device, set_seed
 from limn.jit import CompiledDevice
 from limn.nn import Linear, parameters
 from limn.ops import custom, float32
-from limn.optim import SGD, AdamW
+from limn.optim import SGD, AdamW, Muon
 
 
 def batches(n: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -255,6 +255,36 @@ def test_an_output_nothing_reads_still_gets_its_buffer():
     runs, _, (_, incremented) = pair_device()
     np.testing.assert_array_equal(incremented.numpy(), np.arange(4) + 1.0)
     assert runs == ["pair"]
+
+
+@needs_cc
+def test_a_captured_muon_hybrid_step_matches_plain_steps():
+    """Muon on the matrix, AdamW on the bias: two optimizers, two realize batches per step,
+    and a Newton-Schulz graph that must come out identical on every call for capture to hold."""
+    set_device("c")
+    data = batches(6)
+
+    def losses(captured: bool) -> list[float]:
+        set_seed(5)
+        layer = Linear(4, 3)
+        matrices = [p for p in parameters(layer) if len(p.shape) == 2]
+        rest = [p for p in parameters(layer) if len(p.shape) != 2]
+        muon, adamw = Muon(matrices, lr=0.02), AdamW(rest, lr=1e-2)
+
+        def step(x: Tensor, y: Tensor) -> Tensor:
+            muon.zero_grad()
+            adamw.zero_grad()
+            err = layer(x) - y
+            loss = (err * err).mean()
+            loss.backward()
+            muon.step()
+            adamw.step(loss)
+            return loss
+
+        fn = capture(step) if captured else step
+        return [fn(Tensor(x), Tensor(y)).item() for x, y in data]
+
+    assert losses(True) == losses(False)
 
 
 @needs_cc

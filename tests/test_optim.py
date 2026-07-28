@@ -1,11 +1,20 @@
-"""SGD and AdamW trajectories over several steps must match torch.optim exactly."""
+"""SGD, AdamW and Muon trajectories over several steps must match torch.optim exactly.
+
+Muon is compared under adjust_lr_fn="match_rms_adamw": limn implements that scaling, and its
+accumulator momentum differs from torch's EMA by a factor Newton-Schulz normalizes away.
+torch orthogonalizes in bfloat16 where limn stays in float32, so the torch comparison runs at
+a tolerance sized to bfloat16 noise and catches algorithm-level drift; the float32 numpy
+replica below it pins the exact arithmetic.
+"""
+
+import math
 
 import numpy as np
 import pytest
 import torch
 
 from limn import Tensor, no_grad
-from limn.optim import SGD, AdamW
+from limn.optim import SGD, AdamW, Muon
 
 rng = np.random.default_rng(11)
 
@@ -93,6 +102,75 @@ def test_adamw_updates_builds_without_committing():
     topt.step()
     for lp, tp in zip(lparams, tparams):
         np.testing.assert_allclose(lp.numpy(), tp.detach().numpy(), atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("nesterov", [True, False])
+def test_muon_matches_torch(nesterov):
+    lparams, tparams = make_params((4, 6), (6, 3))  # one wide, one tall, so both orientations transpose
+    lopt = Muon(lparams, lr=0.02, momentum=0.9, weight_decay=0.1, nesterov=nesterov)
+    topt = torch.optim.Muon(tparams, lr=0.02, momentum=0.9, weight_decay=0.1, nesterov=nesterov, adjust_lr_fn="match_rms_adamw")
+    for step in range(6):
+        x = rng.standard_normal((5, 4)).astype(np.float32)
+        lopt.zero_grad()
+        topt.zero_grad()
+        lloss = ((Tensor(x) @ lparams[0]).relu() @ lparams[1]).sum()
+        tloss = ((torch.tensor(x) @ tparams[0]).relu() @ tparams[1]).sum()
+        lloss.backward()
+        tloss.backward()
+        lopt.step()
+        topt.step()
+        for i, (lp, tp) in enumerate(zip(lparams, tparams)):
+            # torch's bfloat16 Newton-Schulz perturbs the direction by ~1e-4; an algorithmic
+            # divergence (scaling, decay, momentum) would be two orders larger
+            np.testing.assert_allclose(
+                lp.numpy(), tp.detach().numpy(), atol=2e-3, rtol=2e-3, err_msg=f"param {i} diverged at step {step}"
+            )
+
+
+def muon_reference_step(param, grad, buf, lr, momentum, wd, nesterov, ns_steps=5, eps=1e-7):
+    buf = momentum * buf + grad
+    direction = grad + momentum * buf if nesterov else buf
+    x = direction.T if direction.shape[0] > direction.shape[1] else direction
+    x = x / (np.sqrt((x * x).sum()) + eps)
+    a, b, c = Muon.NS_COEFFS
+    for _ in range(ns_steps):
+        gram = x @ x.T
+        x = a * x + (b * gram + c * (gram @ gram)) @ x
+    ortho = x.T if direction.shape[0] > direction.shape[1] else x
+    return param * (1 - lr * wd) - lr * 0.2 * math.sqrt(max(param.shape)) * ortho, buf
+
+
+@pytest.mark.parametrize("nesterov", [True, False])
+def test_muon_trajectory_matches_the_float32_replica(nesterov):
+    datas = [rng.standard_normal(s).astype(np.float32) for s in ((4, 6), (6, 3))]
+    params = [Tensor(d.copy(), requires_grad=True) for d in datas]
+    opt = Muon(params, lr=0.02, momentum=0.9, weight_decay=0.1, nesterov=nesterov)
+    expected = [d.copy() for d in datas]
+    bufs = [np.zeros_like(d) for d in datas]
+    for step in range(5):
+        x = rng.standard_normal((5, 4)).astype(np.float32)
+        opt.zero_grad()
+        loss = ((Tensor(x) @ params[0]).relu() @ params[1]).sum()
+        loss.backward()
+        grads = [p.grad.numpy() for p in params if p.grad is not None]
+        assert len(grads) == len(params)
+        opt.step()
+        for i, (p, g) in enumerate(zip(params, grads)):
+            expected[i], bufs[i] = muon_reference_step(expected[i], g, bufs[i], 0.02, 0.9, 0.1, nesterov)
+            np.testing.assert_allclose(p.numpy(), expected[i], atol=1e-5, rtol=1e-5, err_msg=f"param {i} diverged at step {step}")
+
+
+@pytest.mark.parametrize("shape", [(8, 4), (4, 8)])
+def test_newton_schulz_lands_singular_values_near_one(shape):
+    opt = Muon([Tensor(np.zeros((2, 2), dtype=np.float32), requires_grad=True)])
+    ortho = opt.newton_schulz(Tensor(rng.standard_normal(shape).astype(np.float32))).numpy()
+    singular = np.linalg.svd(ortho, compute_uv=False)
+    assert 0.6 < singular.min() and singular.max() < 1.2  # the 5-step quintic's published band is (0.68, 1.13)
+
+
+def test_muon_rejects_non_2d_parameters():
+    with pytest.raises(ValueError, match="2D"):
+        Muon([Tensor(np.ones(3, dtype=np.float32), requires_grad=True)])
 
 
 def test_step_realizes_extras_in_the_same_batch():
