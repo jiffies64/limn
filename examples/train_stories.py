@@ -1,10 +1,4 @@
-"""Train a byte-level GPT on TinyStories and make it tell one.
-
-The default run is small (50M tokens): enough for word-correct baby English. --full trains
-500M tokens overnight. Both log loss and throughput, checkpoint as they go, resume with
---resume, and finish by sampling a story. The dataset (about 2 GB of text) downloads on
-first use into examples/data/.
-"""
+# we rock cuda here now, G
 
 import argparse
 import time
