@@ -8,7 +8,7 @@
 
 A deep learning framework built to be read. The whole stack is here: lazy tensors over a
 closed set of 19 primitive ops, reverse-mode autograd, a scheduler that fuses the graph into
-kernels, an IR you can print, and C and CUDA backends that JIT-compile it, in about 2,500
+kernels, an IR you can print, and C and CUDA backends that JIT-compile it, in about 3,200
 lines of Python with numpy as the only runtime dependency. In spirit it sits between
 micrograd and tinygrad: small enough to read in one sitting, real enough that a matmul comes
 out the other end as one fused loop nest with the stride-1 dim innermost.
@@ -28,8 +28,9 @@ print(x.grad.numpy())    # nothing computes until here
 git clone https://github.com/jiffies64/limn.git
 cd limn
 uv sync
-uv run pytest                          # the whole suite, about ten seconds
-uv run python examples/train_mlp.py    # AdamW on a toy regression; loss must drop 20x
+uv run pytest                            # the whole suite, about ten seconds
+uv run python examples/train_mlp.py      # AdamW on a toy regression; loss must drop 20x
+uv run python examples/train_stories.py  # byte-level GPT on TinyStories; --full for the long run
 ```
 
 `uv sync` installs numpy plus the dev group (pytest, ruff, CPU-only torch). The `c` device
@@ -56,7 +57,7 @@ flowchart LR
     S --> I["loop-nest IR<br>codegen.py"]
     I --> J["plan executor<br>jit.py"]
     J --> C["C JIT<br>backend_c.py"]
-    J --> U["CUDA JIT<br>backend_cuda.py"]
+    J --> U["CUDA JIT<br>cuda_emit.py, backend_cuda.py"]
 ```
 
 Three rules hold it together:
@@ -65,7 +66,11 @@ Three rules hold it together:
   composed in `tensor.py` from the 19 primitives, so a backend implements those and gets
   everything else for free.
 - **The numpy device is the permanent reference.** It interprets the graph one numpy call per
-  node, no fusion, no cleverness. Every compiled backend is diffed against it.
+  node, no fusion, no cleverness. Every compiled backend is diffed against it. Being a reference
+  rather than a backend costs it the shapes fusion exists for: a matmul is a broadcast multiply
+  and a reduce, so it builds the whole (m, n, k) intermediate instead of walking it, and a large
+  one runs out of memory rather than slowly. Diff compiled kernels against it at sizes whose
+  product fits, not whose operands do.
 - **Layout is arithmetic, not data.** A `View` is (shape, strides, offset, mask). `reshape`,
   `permute`, `expand`, `pad`, and `shrink` compose into a single `View`, cost nothing when
   built, and lower to index arithmetic inside the kernels.
@@ -83,7 +88,13 @@ Three rules hold it together:
 | indexed | `GATHER`, `SCATTER` |
 | barriers | `CONTIGUOUS`, `ASSIGN` |
 
-Two dtypes: `float32` and `int32`.
+Three dtypes: `float32`, `float16`, and `int32`. `float16` is a storage width, not a working
+precision: it halves the bytes a kernel moves, and every device widens it to compute, so a
+reduce keeps its running total in `float32` and rounds back once at the end. Mixing it with
+`float32` promotes, and casting between the two carries gradients, which is what makes a
+`float32` master weight met by `float16` activations train. The `c` device has no `float16` and
+says so; on `cuda` a `float16` scatter is the one gap, since its atomic add needs an
+architecture the emitter cannot see.
 
 ## Reading the schedule
 
@@ -155,6 +166,13 @@ print((x @ x.transpose()).sum().item())
 | `c` | schedule → loop-nest IR → C source → `cc -O3 -march=native` → ctypes | a C compiler |
 | `cuda` | schedule → loop-nest IR → CUDA C → NVRTC → PTX → driver API | an NVIDIA driver, and NVRTC from a toolkit or `uv sync --extra cuda` |
 
+The cuda device picks one of three kernel shapes per nest. One thread per output cell is the
+default. A long reduce over few cells splits into strided partial totals and a fold, the one
+shape that regroups the arithmetic. A nest that reads as a matmul gets a block per output tile,
+both operands staged through shared memory and a patch of cells held in registers per thread,
+which leaves the numbers alone: the reduce axis is still walked in order, so only where the
+operands are read from changes.
+
 Both compiled devices cache twice: programs by source hash, execution plans by graph
 structure. A training loop at fixed shapes schedules, emits, and compiles on the first step;
 every step after goes straight to the compiled kernels. Selecting a device whose toolchain is
@@ -173,8 +191,8 @@ atomics. Its buffers live in GPU memory: host tensors handed to it are uploaded 
 The IR is the contract: twelve opcodes (loops, loads, arithmetic, accumulators, stores) with
 all index arithmetic made explicit, and `jit.py` already owns planning, caching and the
 assign transaction. A backend is one rendering of that instruction stream plus five hooks
-for moving bytes, which is exactly what `backend_c.py` is for C and `backend_cuda.py` is for
-CUDA.
+for moving bytes. `backend_c.py` is both halves for C; on the CUDA side the rendering lives
+in `cuda_emit.py` and the hooks in `backend_cuda.py`.
 
 ## nn and optim
 
@@ -194,7 +212,9 @@ Every layer answers to an oracle above it:
 | ops + autograd | PyTorch (CPU, test-only) | a seeded fuzzer builds 300 random DAGs (movement, broadcasting, reduces, matmul), runs them forward and backward in both frameworks, and requires agreement to 1e-4; failures print a reproducer |
 | scheduler + codegen | the numpy device | tests interpret the lowered IR instruction by instruction and diff the numbers, so the printed nest means what it says (strides, masks, reduce identities) |
 | `c` backend | the numpy device | a shared graph corpus runs on both devices and is diffed at 1e-5 |
-| `cuda` backend | the numpy device | the same corpus, plus grid-stride coverage past one launch's thread count, atomic scatter collisions on a single row, and a training loop on the device |
+| `cuda` backend | the numpy device | the same corpus, plus grid-stride coverage past one launch's thread count, atomic scatter collisions on a single row, tiled matmuls across every tile width and tail, and a training loop on the device |
+| cuda emission | its own invariants | no GPU needed: the tiling decision is checked for covering every output cell and for staging whole slabs, since a tile the block cannot fill in whole passes would fold shared memory nobody wrote |
+| `float16` | the numpy device | the corpus and the matmuls again at half width, diffed at float16's own rounding, plus the dtype rules and that a cast between float dtypes still carries gradients |
 
 ## Layout
 
@@ -208,9 +228,10 @@ limn/
   codegen.py     lowers kernels to the printable loop-nest IR
   jit.py         the shared executor: plan caching and the assign transaction
   backend_c.py   renders the IR as C, compiles it, calls it through ctypes
-  backend_cuda.py  renders the IR as CUDA C, compiles with NVRTC, launches via the driver API
+  cuda_emit.py   renders the IR as CUDA C: one thread per cell, split reduces, tiled matmuls
+  backend_cuda.py  binds the driver and NVRTC, compiles, owns device memory and launching
   nn.py          Linear, LayerNorm, Embedding
   optim.py       SGD, AdamW
 tests/           one file per layer, a 300-case autograd fuzzer, an IR interpreter
-examples/        train_mlp.py, a regression that must reach 5% of its starting loss
+examples/        train_mlp.py, a toy regression; train_stories.py, a byte-level GPT on TinyStories
 ```
