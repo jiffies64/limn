@@ -1,4 +1,4 @@
-"""CUDA backend: emit CUDA C from the loop nest IR, compile with NVRTC, launch via the driver API.
+"""CUDA device: bind the driver and NVRTC through ctypes, compile the emitted kernels, launch them.
 
 Everything is reached through ctypes, so there is no build step and no pinned CUDA version.
 libcuda ships with the display driver and NVRTC comes from a CUDA toolkit or from the
@@ -7,19 +7,10 @@ architecture this NVRTC supports that does not exceed the device's; PTX for an o
 architecture still JITs onto a newer GPU, so an old toolkit serves a new card, and a driver
 error names the one combination that cannot work (a toolkit newer than the driver).
 
-The thread mapping: one thread per point of the non-reduce dims, reduce loops run sequentially
-inside it. Every output cell then belongs to exactly one thread, so STORE and ACCUM need no
-atomics, and a cell folds its elements in ascending reduce order, matching the C backend
-exactly. The innermost non-reduce dim (picked by loop_order for being stride-1 in the most
-buffers) becomes the fastest-varying thread index, which is what makes warp loads coalesce.
-SCATTER is the one racing write, since two values can name the same row, so it adds with
-atomicAdd. A large reduce over few output cells is the exception to one-thread-per-cell: it
-runs as two kernels, strided partial accumulators and then their fold, with a fixed grouping
-that keeps it deterministic but matches the host backends to rounding rather than bit for bit.
-
-Launches are grid-stride loops over at most GRID blocks of BLOCK threads, so any size runs a
-bounded launch, and execute() synchronizes per batch, which keeps the queue short and pins a
-failure to the batch that launched it.
+cuda_emit.py renders the kernels; what is left here is the memory and the launching. Launches
+are grid-stride loops over at most GRID blocks of BLOCK threads, so any size runs a bounded
+launch, and execute() synchronizes per batch, which keeps the queue short and pins a failure to
+the batch that launched it.
 
 A host numpy buffer handed to this device (a tensor created while a host device was active)
 is uploaded per batch by prepare(), and an assign whose target is host gets the new bytes
@@ -35,18 +26,15 @@ import functools
 import glob
 import hashlib
 import importlib.util
-import math
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import numpy as np
 
-from limn.backend_c import C_TYPE, arith_c, c_literal, fold_c, guard
-from limn.codegen import REDUCES, Instr, LoopNest, Opcode
+from limn.codegen import LoopNest
+from limn.cuda_emit import BLOCK, emit_cuda, outer_extent, part_name, split_partials, split_scratch, tile_count, tiled
 from limn.device import Buffer
 from limn.jit import CompiledDevice, Runner
 
-BLOCK = 256
 GRID = 4096  # most blocks per launch; the grid-stride loop covers whatever is left
 
 CUdeviceptr = ctypes.c_uint64
@@ -154,10 +142,10 @@ def nvrtc() -> Lib | None:
 def check(result: int, doing: str) -> None:
     if result == 0:
         return
-    message = ctypes.c_char_p()
     api = driver()
-    if api is not None:
-        api.cuGetErrorString(result, ctypes.byref(message))
+    assert api is not None, "a driver call produced this result"
+    message = ctypes.c_char_p()
+    api.cuGetErrorString(result, ctypes.byref(message))  # leaves message NULL for a code it does not know
     detail = message.value.decode() if message.value else f"error {result}"
     raise RuntimeError(f"cuda: {doing}: {detail}")
 
@@ -182,223 +170,14 @@ def has_cuda() -> bool:
     return cuda_unavailable() is None
 
 
-# ---- emission: a second rendering of the Instr stream, like emit_function in backend_c ----
-
-PRELUDE = """\
-typedef int int32_t;
-#ifndef INFINITY
-#define INFINITY (__int_as_float(0x7f800000))
-#endif
-#ifndef NAN
-#define NAN (__int_as_float(0x7fc00000))
-#endif
-"""
-
-
-def reduce_axes(nest: LoopNest) -> tuple[int, ...]:
-    root = nest.kernel.ast
-    return root.arg if root.op in REDUCES else ()
-
-
-def outer_extent(nest: LoopNest) -> int:
-    """How many points the non-reduce dims span: one thread per point."""
-    axes = reduce_axes(nest)
-    return math.prod(size for d, size in enumerate(nest.space) if d not in axes)
-
-
-def reduce_extent(nest: LoopNest) -> int:
-    axes = reduce_axes(nest)
-    return math.prod(nest.space[d] for d in axes)
-
-
-SPLIT_MIN = 4096  # a reduce at least this long, over fewer than this many cells, gets a second stage
-
-
-def split_partials(nest: LoopNest) -> int:
-    """How many partial accumulators a split reduce uses per cell; 0 when the nest is not split.
-
-    Only the register form splits: there each output cell is one thread, so few cells over a
-    long reduce leaves the GPU idle while single threads walk millions of elements. The ACCUM
-    form already spreads its work across the non-reduce dims. Partials are capped so a shorter
-    reduce still hands every partial a real chunk.
-    """
-    if not any(instr.opcode is Opcode.ACC for instr in nest.instrs):
-        return 0
-    r = reduce_extent(nest)
-    if r < SPLIT_MIN or outer_extent(nest) >= SPLIT_MIN:
-        return 0
-    return min(4096, r // 64)
-
-
-def value_line(instr: Instr, indent: str) -> str:
-    """One value-producing instruction as a C declaration; shared by both kernel forms."""
-    match instr.opcode:
-        case Opcode.CONST:
-            value, valid = instr.arg
-            pre, post = guard(valid, instr.value_type)
-            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}{c_literal(value, instr.value_type)}{post};"
-        case Opcode.LOAD:
-            buf, index, valid = instr.arg
-            pre, post = guard(valid, instr.value_type)
-            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}{buf}[{index.render()}]{post};"
-        case Opcode.ARITH:
-            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {arith_c(instr.arg, list(instr.srcs), instr.value_type)};"
-        case Opcode.CAST:
-            return f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = ({C_TYPE[instr.value_type]}){instr.srcs[0]};"
-        case _:
-            raise NotImplementedError(f"{instr.opcode} does not define a value")
-
-
-def emit_split(nest: LoopNest, partials: int) -> str:
-    """A register reduce as two kernels: strided partials per output cell, then their fold.
-
-    Partial p of a cell accumulates elements p, p + partials, p + 2*partials, ... so warp
-    loads stay coalesced and the grouping is fixed, which is what makes the result
-    deterministic; it is grouped differently from the sequential nest, so it agrees with the
-    host backends to rounding rather than bit for bit (int folds stay exact, addition being
-    associative modulo 2**32).
-    """
-    kernel = nest.kernel
-    root = kernel.ast
-    fold = REDUCES[root.op].fold
-    ctype = C_TYPE[root.dtype]
-    reduce_vars = {f"r{d}" for d in reduce_axes(nest)}
-    outer: list[tuple[str, int]] = []
-    loops: list[tuple[str, int]] = []
-    for instr in nest.instrs:
-        if instr.opcode is Opcode.LOOP and all(var != instr.dest for var, _ in outer + loops):
-            (loops if instr.dest in reduce_vars else outer).append((instr.dest, instr.arg))
-    total = reduce_extent(nest)
-    first = "blockIdx.x * (long long)blockDim.x + threadIdx.x"
-    stride = "(long long)gridDim.x * blockDim.x"
-
-    params = [f"const {C_TYPE[node.dtype]}* __restrict__ in{k}" for k, node in enumerate(kernel.inputs)]
-    lines = [f'extern "C" __global__ void {nest.name}_part({", ".join(params + [f"{ctype}* __restrict__ out"])}) {{']
-    lines.append(f"  for (long long gid = {first}; gid < {outer_extent(nest) * partials}LL; gid += {stride}) {{")
-    lines.append(f"    const int p = (int)(gid % {partials});")
-    lines.append(f"    long long t = gid / {partials};")
-    for var, bound in reversed(outer[1:]):
-        lines.append(f"    const int {var} = (int)(t % {bound}); t /= {bound};")
-    if outer:
-        lines.append(f"    const int {outer[0][0]} = (int)t;")
-    for instr in nest.instrs:
-        match instr.opcode:
-            case Opcode.LOOP | Opcode.ENDLOOP:
-                continue
-            case Opcode.ACC:
-                lines.append(f"    {ctype} {instr.dest} = {c_literal(instr.arg, instr.value_type)};")
-                lines.append(f"    for (long long j = p; j < {total}LL; j += {partials}) {{")
-                lines.append("      long long u = j;")
-                for var, bound in reversed(loops[1:]):
-                    lines.append(f"      const int {var} = (int)(u % {bound}); u /= {bound};")
-                lines.append(f"      const int {loops[0][0]} = (int)u;")
-            case Opcode.UPDATE:
-                lines.append("      " + fold_c(instr.arg, instr.dest, instr.srcs[0]))
-            case Opcode.STORE:
-                lines.append("    }")
-                lines.append(f"    out[(gid / {partials}) * {partials} + p] = acc;")
-            case _:
-                lines.append(value_line(instr, "      "))
-    lines.append("  }")
-    lines.append("}")
-
-    lines.append("")
-    lines.append(f'extern "C" __global__ void {nest.name}(const {ctype}* __restrict__ in0, {ctype}* __restrict__ out) {{')
-    lines.append(f"  for (long long gid = {first}; gid < {outer_extent(nest)}LL; gid += {stride}) {{")
-    lines.append(f"    {ctype} acc = {c_literal(REDUCES[root.op].identity[root.dtype], root.dtype)};")
-    lines.append(f"    for (int p = 0; p < {partials}; p++) {{")
-    lines.append("      " + fold_c(fold, "acc", f"in0[gid * {partials} + p]"))
-    lines.append("    }")
-    lines.append("    out[gid] = acc;")
-    lines.append("  }")
-    lines.append("}")
-    return "\n".join(lines)
-
-
-def emit_kernel(nest: LoopNest) -> str:
-    kernel = nest.kernel
-    reduce_vars = {f"r{d}" for d in reduce_axes(nest)}
-    outer: list[tuple[str, int]] = []  # non-reduce loop vars in nesting order, outermost first
-    for instr in nest.instrs:
-        if instr.opcode is Opcode.LOOP and instr.dest not in reduce_vars and all(var != instr.dest for var, _ in outer):
-            outer.append((instr.dest, instr.arg))
-
-    params = [f"const {C_TYPE[node.dtype]}* __restrict__ in{k}" for k, node in enumerate(kernel.inputs)]
-    params.append(f"{C_TYPE[kernel.target.dtype]}* __restrict__ out")
-    # restrict on the inputs is safe even when two of them are the same buffer (a @ a.transpose()):
-    # it only promises that nothing *written* is reachable through another name, and only out is
-    # written, to memory out_alloc freshly allocated
-    lines = [f'extern "C" __global__ void {nest.name}({", ".join(params)}) {{']
-    stride = "(long long)gridDim.x * blockDim.x"
-    first = "blockIdx.x * (long long)blockDim.x + threadIdx.x"
-    lines.append(f"  for (long long gid = {first}; gid < {outer_extent(nest)}LL; gid += {stride}) {{")
-
-    # bind the non-reduce dims from gid, the innermost one varying fastest: neighbouring threads
-    # then touch neighbouring elements of whatever loop_order found to be stride-1, and coalesce
-    if len(outer) == 1:
-        lines.append(f"    const int {outer[0][0]} = (int)gid;")
-    elif outer:
-        lines.append("    long long t = gid;")
-        for var, bound in reversed(outer[1:]):
-            lines.append(f"    const int {var} = (int)(t % {bound}); t /= {bound};")
-        lines.append(f"    const int {outer[0][0]} = (int)t;")
-
-    depth = 2
-    for instr in nest.instrs:
-        if instr.opcode is Opcode.LOOP:
-            if instr.dest in reduce_vars:
-                lines.append("  " * depth + f"for (int {instr.dest} = 0; {instr.dest} < {instr.arg}; {instr.dest}++) {{")
-                depth += 1
-            continue
-        if instr.opcode is Opcode.ENDLOOP:
-            if instr.arg in reduce_vars:
-                depth -= 1
-                lines.append("  " * depth + "}")
-            continue
-        indent = "  " * depth
-        match instr.opcode:
-            case Opcode.ACC:
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {c_literal(instr.arg, instr.value_type)};")
-            case Opcode.CONST | Opcode.LOAD | Opcode.ARITH | Opcode.CAST:
-                lines.append(value_line(instr, indent))
-            case Opcode.UPDATE:
-                lines.append(indent + fold_c(instr.arg, instr.dest, instr.srcs[0]))
-            case Opcode.STORE:
-                buf, index = instr.arg
-                lines.append(f"{indent}{buf}[{index.render()}] = {instr.srcs[0]};")
-            case Opcode.ACCUM:
-                # no atomic: the cell's index uses only thread-bound vars, so one thread owns it
-                buf, index, fold = instr.arg
-                lines.append(indent + fold_c(fold, f"{buf}[{index.render()}]", instr.srcs[0]))
-            case Opcode.GATHER:
-                buf, index = instr.arg
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {buf}[{index.render()}];")
-            case Opcode.SCATTER:
-                buf, index = instr.arg  # threads collide wherever indices repeat a row
-                lines.append(f"{indent}atomicAdd(&{buf}[{index.render()}], {instr.srcs[0]});")
-    lines.append("  }")
-    lines.append("}")
-    return "\n".join(lines)
-
-
-def emit_cuda(nests: list[LoopNest]) -> str:
-    kernels = [emit_split(nest, p) if (p := split_partials(nest)) else emit_kernel(nest) for nest in nests]
-    return "\n".join([PRELUDE] + [kernel + "\n" for kernel in kernels])
-
-
 # ---- compilation ----
 
 
-@dataclass(frozen=True)
-class Program:
-    module: ctypes.c_void_p
-    functions: dict[str, ctypes.c_void_p]
+cache: dict[str, dict[str, ctypes.c_void_p]] = {}
 
 
-cache: dict[str, Program] = {}
-
-
-def compile_cuda(source: str, arch: int, kernel_names: list[str]) -> Program:
+def compile_cuda(source: str, arch: int, kernel_names: list[str]) -> dict[str, ctypes.c_void_p]:
+    """PTX-compile this source for the arch and resolve the named kernels to function handles."""
     key = hashlib.sha256(f"compute_{arch}:{source}".encode()).hexdigest()
     if key in cache:
         return cache[key]
@@ -429,9 +208,8 @@ def compile_cuda(source: str, arch: int, kernel_names: list[str]) -> Program:
         fn = ctypes.c_void_p()
         check(api.cuModuleGetFunction(ctypes.byref(fn), module, name.encode()), f"resolving kernel {name}")
         functions[name] = fn
-    program = Program(module, functions)
-    cache[key] = program
-    return program
+    cache[key] = functions  # the module handle is dropped: it stays loaded in the context for the process, like the plans
+    return functions
 
 
 # ---- the device ----
@@ -522,13 +300,11 @@ class CudaDevice(CompiledDevice):
         self.pool.clear()
 
     def alloc(self, nbytes: int) -> Buffer:
-        buf = self._alloc(nbytes)
-        check(self.api.cuMemsetD8(buf.ptr, 0, nbytes), "zeroing an allocation")  # HostDevice zeroes too
-        return buf
+        return self.out_alloc(nbytes, zero=True)  # HostDevice zeroes too
 
     def copyin(self, buf: Buffer, array: np.ndarray) -> None:
-        flat = np.ascontiguousarray(array).view(np.uint8).reshape(-1)
-        check(self.api.cuMemcpyHtoD(buf.ptr, flat.ctypes.data, flat.nbytes), "uploading bytes")
+        data = np.ascontiguousarray(array)
+        check(self.api.cuMemcpyHtoD(buf.ptr, data.ctypes.data, data.nbytes), "uploading bytes")
 
     def copyout(self, buf: Buffer) -> np.ndarray:
         out = np.empty(buf.nbytes, dtype=np.uint8)
@@ -540,14 +316,14 @@ class CudaDevice(CompiledDevice):
     def prepare(self, buf: Buffer) -> Buffer:
         if isinstance(buf, np.ndarray):  # a tensor created while a host device was active
             device_buf = self._alloc(buf.nbytes)
-            check(self.api.cuMemcpyHtoD(device_buf.ptr, buf.ctypes.data, buf.nbytes), "uploading a host buffer")
+            self.copyin(device_buf, buf)
             return device_buf
         return buf
 
     def out_alloc(self, nb: int, zero: bool) -> Buffer:
         buf = self._alloc(nb)
         if zero:
-            check(self.api.cuMemsetD8(buf.ptr, 0, nb), "zeroing a scatter output")
+            check(self.api.cuMemsetD8(buf.ptr, 0, nb), "zeroing an allocation")
         return buf
 
     def commit(self, target: Buffer, value: Buffer) -> None:
@@ -560,20 +336,22 @@ class CudaDevice(CompiledDevice):
         check(self.api.cuCtxSynchronize(), "waiting for the batch")
 
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
-        if not nests:
-            return []
-        names = [name for nest in nests for name in ([nest.name + "_part"] if split_partials(nest) else []) + [nest.name]]
-        program = compile_cuda(emit_cuda(nests), self.arch, names)
+        splits = [split_partials(nest) for nest in nests]
+        names = [name for nest, p in zip(nests, splits, strict=True) for name in ([part_name(nest)] if p else []) + [nest.name]]
+        functions = compile_cuda(emit_cuda(nests), self.arch, names)
         out: list[Runner] = []
-        for nest in nests:
-            outer = outer_extent(nest)
-            partials = split_partials(nest)
-            final = self._launcher(program.functions[nest.name], self._grid(outer))
+        for nest, partials in zip(nests, splits, strict=True):
+            cells = outer_extent(nest)
+            nargs = len(nest.kernel.inputs) + 1
             if partials:
-                part = self._launcher(program.functions[nest.name + "_part"], self._grid(outer * partials))
-                out.append(self._split_runner(part, final, outer * partials * nest.kernel.target.dtype.itemsize))
+                part = self._launcher(functions[part_name(nest)], self._grid(cells * partials), nargs)
+                final = self._launcher(functions[nest.name], self._grid(cells), 2)
+                out.append(self._split_runner(part, final, split_scratch(nest, partials)))
+            elif plan := tiled(nest):
+                # a tiled kernel's unit of work is a tile, not a cell, and its block is LANES^2 threads
+                out.append(self._launcher(functions[nest.name], min(tile_count(*plan), GRID), nargs))
             else:
-                out.append(final)
+                out.append(self._launcher(functions[nest.name], self._grid(cells), nargs))
         return out
 
     @staticmethod
@@ -581,17 +359,30 @@ class CudaDevice(CompiledDevice):
         return min((threads + BLOCK - 1) // BLOCK, GRID)
 
     def _split_runner(self, part: Runner, final: Runner, partials_nbytes: int) -> Runner:
+        # one scratch buffer serves every call: the stream orders each final-read before the next
+        # part-write. Taken on the first call, so a plan that is compiled but never run holds none.
+        scratch: list[Buffer] = []
+
         def run(inputs: list[Buffer], out: Buffer) -> None:
-            partials = self._alloc(partials_nbytes)
-            part(inputs, partials)
-            final([partials], out)
+            if not scratch:
+                scratch.append(self._alloc(partials_nbytes))
+            part(inputs, scratch[0])
+            final(scratch, out)
 
         return run
 
-    def _launcher(self, fn: ctypes.c_void_p, grid: int) -> Runner:
+    def _launcher(self, fn: ctypes.c_void_p, grid: int, nargs: int) -> Runner:
+        launch = self.api.cuLaunchKernel
+        # the param arrays are built once and refilled per call, which is safe because
+        # cuLaunchKernel copies the pointed-to arguments before it returns
+        ptrs = (CUdeviceptr * nargs)()
+        size = ctypes.sizeof(CUdeviceptr)
+        params = (ctypes.c_void_p * nargs)(*[ctypes.addressof(ptrs) + k * size for k in range(nargs)])
+
         def run(inputs: list[Buffer], out: Buffer) -> None:
-            ptrs = (CUdeviceptr * (len(inputs) + 1))(*[b.ptr for b in inputs], out.ptr)
-            params = (ctypes.c_void_p * len(ptrs))(*[ctypes.addressof(ptrs) + i * 8 for i in range(len(ptrs))])
-            check(self.api.cuLaunchKernel(fn, grid, 1, 1, BLOCK, 1, 1, 0, None, params, None), "launching a kernel")
+            for k, buf in enumerate(inputs):
+                ptrs[k] = buf.ptr
+            ptrs[nargs - 1] = out.ptr
+            check(launch(fn, grid, 1, 1, BLOCK, 1, 1, 0, None, params, None), "launching a kernel")
 
         return run

@@ -13,12 +13,19 @@ pytestmark = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, 
 cudev = CudaDevice() if has_cuda() else None
 
 
-def check_cuda(t: Tensor, dev: CudaDevice | None = None) -> None:
+def check_cuda(t: Tensor, dev: CudaDevice | None = None, tol: float = 1e-5) -> None:
+    """Diff against the numpy device. tol has to grow with how long the graph's reduces are.
+
+    numpy sums pairwise and a kernel sums straight down its reduce axis, so the two drift apart
+    by roughly the length of the reduce in units of float32's epsilon. At the corpus shapes that
+    is nothing; over a couple of hundred elements it is not, and a cell that lands near zero by
+    cancellation shows it as a large relative difference over a tiny absolute one.
+    """
     dev = dev or cudev
     expected = t.numpy()
     bufs = dev.execute([t.node])
     got = dev.copyout(bufs[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
-    np.testing.assert_allclose(got, expected, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(got, expected, atol=tol, rtol=tol)
 
 
 @pytest.mark.parametrize("name", list(GRAPHS))
@@ -66,6 +73,55 @@ def test_backward_pass():
     check_cuda(loss)
     check_cuda(w.grad)
     check_cuda(x.grad)
+
+
+# ---- the tiled matmul: big enough shapes that emit_tiled takes them, unlike the corpus above ----
+
+# Every shape here is kept small on m*n*k, not on m*n. The oracle is the numpy device, which does
+# not fuse, so a matmul there materialises the whole (m, n, k) broadcast: an int64 index array of
+# that shape, both operands gathered through it, and their product. That is around 20 bytes per
+# m*n*k, so a shape a GPU shrugs at (8192x192x768 is 1.2e9 points, over 20 GB) takes the host down
+# long before the kernel is reached. Tiling needs m*n*k >= TILE_MIN and both sides >= BLOCK/TILE_K,
+# which these clear with room to spare.
+
+
+@pytest.mark.parametrize(
+    "m,k,n",
+    [
+        (128, 128, 128),  # the widest tile on both sides, every extent dividing it
+        (129, 40, 65),  # no tile divides any side, so every tail check is live
+        (64, 96, 160),  # a middle tile against the widest one, with a tail on the columns
+        (33, 64, 160),  # the narrowest tile the block can stage, one row of tail over it
+        (96, 33, 96),  # both sides land between tiles, and k leaves a remainder against TILE_K
+        (16, 192, 256),  # rows too short to stage, so this one must fall back and still be right
+    ],
+)
+@pytest.mark.parametrize("transposed", [False, True])
+def test_a_matmul_big_enough_to_tile_matches_the_numpy_device(m, k, n, transposed):
+    a = Tensor(randf(m, k))
+    b = Tensor(randf(n, k)) if transposed else Tensor(randf(k, n))
+    check_cuda(a @ (b.transpose() if transposed else b), tol=1e-4)
+
+
+def test_a_tiled_matmul_with_elementwise_work_fused_in_matches_the_numpy_device():
+    """matmul_shape reads through a fused body, so the tile has to compute it per cell."""
+    a, b = Tensor(randf(128, 64)), Tensor(randf(64, 128))
+    check_cuda((a * 2.0) @ (b + 1.0), tol=1e-4)
+
+
+def test_a_batched_matmul_big_enough_to_tile_matches_the_numpy_device():
+    """Batch dims belong to neither side: each point of them gets its own tiles."""
+    a, b = Tensor(randf(4, 64, 64)), Tensor(randf(4, 64, 128))
+    check_cuda(a @ b, tol=1e-4)
+
+
+def test_a_tiled_matmul_backward_matches_the_numpy_device():
+    """Both gradients are matmuls too, so this covers three tiled nests, not one."""
+    x = Tensor(randf(128, 96), requires_grad=True)
+    w = Tensor(randf(96, 128), requires_grad=True)
+    (x @ w).relu().sum().backward()
+    check_cuda(x.grad, tol=1e-4)
+    check_cuda(w.grad, tol=1e-4)
 
 
 def test_grid_stride_covers_more_elements_than_one_launch_has_threads():
