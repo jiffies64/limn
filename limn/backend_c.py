@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from limn.codegen import LoopNest, Opcode, Valid
+from limn.codegen import Instr, LoopNest, Opcode, Valid
 from limn.device import Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
 from limn.ops import DType, Op, float32, int32
@@ -105,6 +105,37 @@ def arith_c(op: Op, srcs: list[str], dtype: DType) -> str:
             raise NotImplementedError(f"no C lowering for {op}")
 
 
+def value_c(instr: Instr, indent: str, prefix: str, types: dict[DType, str], store: dict[DType, str]) -> str:
+    """One value-defining instruction as a C declaration, shared by both compiled backends.
+
+    prefix is what the caller puts before buffer names: "_" for this backend's typed casts of the
+    void* params, nothing for CUDA's typed params. types spells a dtype as a value, store spells it
+    in memory, for a backend that computes wider than it stores; a CAST goes through the stored
+    spelling.
+    """
+    decl = f"{indent}{types[instr.value_type]} {instr.dest} = "
+    match instr.opcode:
+        case Opcode.ACC:
+            return f"{decl}{c_literal(instr.arg, instr.value_type)};"
+        case Opcode.CONST:
+            value, valid = instr.arg
+            pre, post = guard(valid, instr.value_type)
+            return f"{decl}{pre}{c_literal(value, instr.value_type)}{post};"
+        case Opcode.LOAD:
+            buf, index, valid = instr.arg
+            pre, post = guard(valid, instr.value_type)
+            return f"{decl}{pre}{prefix}{buf}[{index.render()}]{post};"
+        case Opcode.ARITH:
+            return f"{decl}{arith_c(instr.arg, list(instr.srcs), instr.value_type)};"
+        case Opcode.CAST:
+            return f"{decl}({store[instr.value_type]}){instr.srcs[0]};"
+        case Opcode.GATHER:
+            buf, index = instr.arg
+            return f"{decl}{prefix}{buf}[{index.render()}];"
+        case _:
+            raise NotImplementedError(f"{instr.opcode} does not define a value")
+
+
 def emit_function(nest: LoopNest) -> str:
     kernel = nest.kernel
     lines: list[str] = []
@@ -128,23 +159,8 @@ def emit_function(nest: LoopNest) -> str:
             case Opcode.ENDLOOP:
                 depth -= 1
                 lines.append(f"{'  ' * (depth + 1)}}}")
-            case Opcode.ACC:
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {c_literal(instr.arg, instr.value_type)};")
-            case Opcode.CONST:
-                value, valid = instr.arg
-                pre, post = guard(valid, instr.value_type)
-                lines.append(
-                    f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}{c_literal(value, instr.value_type)}{post};"
-                )
-            case Opcode.LOAD:
-                buf, index, valid = instr.arg
-                pre, post = guard(valid, instr.value_type)
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {pre}_{buf}[{index.render()}]{post};")
-            case Opcode.ARITH:
-                expr = arith_c(instr.arg, list(instr.srcs), instr.value_type)
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = {expr};")
-            case Opcode.CAST:
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = ({C_TYPE[instr.value_type]}){instr.srcs[0]};")
+            case Opcode.ACC | Opcode.CONST | Opcode.LOAD | Opcode.ARITH | Opcode.CAST | Opcode.GATHER:
+                lines.append(value_c(instr, indent, "_", C_TYPE, C_TYPE))
             case Opcode.UPDATE:
                 lines.append(indent + fold_c(instr.arg, instr.dest, instr.srcs[0]))
             case Opcode.STORE:
@@ -153,9 +169,6 @@ def emit_function(nest: LoopNest) -> str:
             case Opcode.ACCUM:
                 buf, index, fold = instr.arg
                 lines.append(indent + fold_c(fold, f"_{buf}[{index.render()}]", instr.srcs[0]))
-            case Opcode.GATHER:
-                buf, index = instr.arg
-                lines.append(f"{indent}{C_TYPE[instr.value_type]} {instr.dest} = _{buf}[{index.render()}];")
             case Opcode.SCATTER:
                 buf, index = instr.arg
                 # two iterations can name the same row, so a threaded backend owes this an atomic add
@@ -212,8 +225,6 @@ class CDevice(CompiledDevice, HostDevice):
     """
 
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
-        if not nests:
-            return []
         lib = compile_c(emit_c(nests))
         runners: list[Runner] = []
         for nest in nests:

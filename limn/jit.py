@@ -83,7 +83,7 @@ class CompiledDevice:
     # ---- what a backend implements ----
 
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
-        """Compile these nests and return one callable per nest, in order."""
+        """Compile these nests, always at least one, and return one callable per nest, in order."""
         raise NotImplementedError
 
     def out_alloc(self, nb: int, zero: bool) -> Buffer:
@@ -135,6 +135,7 @@ class CompiledDevice:
     def plan_of(self, order: list[Node], position: dict[Node, int], sinks: list[Node]) -> Plan:
         """Lower, compile and wire up these sinks' kernels by position instead of by node."""
         nests = lower_all(sinks, order)
+        fns = self.runners(nests) if nests else []  # a graph of pure views schedules no kernels
         calls = tuple(
             Call(
                 fn=fn,
@@ -144,7 +145,7 @@ class CompiledDevice:
                 zero_fill=nest.kernel.ast.op is Op.SCATTER,
                 assign_target=position[nest.kernel.target] if nest.kernel.ast.op is Op.ASSIGN else None,
             )
-            for nest, fn in zip(nests, self.runners(nests), strict=True)
+            for nest, fn in zip(nests, fns, strict=True)
         )
         return Plan(
             calls,
