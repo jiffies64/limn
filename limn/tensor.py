@@ -18,7 +18,7 @@ from contextlib import contextmanager
 import numpy as np
 
 from limn import device
-from limn.ops import DTYPES, DType, Node, Op, float32, int32, topological
+from limn.ops import DTYPES, FLOATS, DType, Node, Op, float16, float32, int32, promote, topological
 from limn.view import View
 
 grad_enabled: bool = True
@@ -57,8 +57,8 @@ class Tensor:
         buf = dev.alloc(array.nbytes)
         dev.copyin(buf, array)
         self.node: Node = Node(Op.BUFFER, (), dtype, array.shape, buf)
-        if requires_grad and dtype != float32:
-            raise ValueError(f"requires_grad needs float32, got {dtype}")
+        if requires_grad and dtype not in FLOATS:
+            raise ValueError(f"requires_grad needs a float dtype, got {dtype}")
         self.requires_grad: bool = requires_grad
         self.grad: Tensor | None = None
         self.parents: tuple[Tensor, ...] = ()
@@ -99,12 +99,12 @@ class Tensor:
         return Tensor(np.arange(n), dtype=dtype)
 
     @staticmethod
-    def randn(shape: Sequence[int], std: float = 1.0, requires_grad: bool = False) -> Tensor:
-        return Tensor(rng.standard_normal(shape) * std, dtype=float32, requires_grad=requires_grad)
+    def randn(shape: Sequence[int], std: float = 1.0, requires_grad: bool = False, dtype: DType = float32) -> Tensor:
+        return Tensor(rng.standard_normal(shape) * std, dtype=dtype, requires_grad=requires_grad)
 
     @staticmethod
-    def uniform(shape: Sequence[int], low: float, high: float, requires_grad: bool = False) -> Tensor:
-        return Tensor(rng.uniform(low, high, shape), dtype=float32, requires_grad=requires_grad)
+    def uniform(shape: Sequence[int], low: float, high: float, requires_grad: bool = False, dtype: DType = float32) -> Tensor:
+        return Tensor(rng.uniform(low, high, shape), dtype=dtype, requires_grad=requires_grad)
 
     # ---- basic properties ----
 
@@ -216,12 +216,21 @@ class Tensor:
     # ---- elementwise ops ----
 
     def cast(self, dtype: DType) -> Tensor:
-        """Convert dtype. Detaches from autograd: the only casts are float32 <-> int32."""
+        """Convert dtype. Between float dtypes this carries gradients; to or from int32 it detaches.
+
+        broadcast_pair inserts these itself wherever a float16 meets a float32, so detaching would
+        strip requires_grad off a parameter and leave the optimizer skipping it. An int carries no
+        gradient, so those casts still end the chain.
+        """
         if dtype == self.dtype:
             return self
         if dtype not in DTYPES:
             raise ValueError(f"cast: unsupported dtype {dtype}")
-        return Tensor.from_node(Node(Op.CAST, (self.node,), dtype, self.shape, dtype))
+        node = Node(Op.CAST, (self.node,), dtype, self.shape, dtype)
+        if self.dtype not in FLOATS or dtype not in FLOATS:
+            return Tensor.from_node(node)
+        source = self.dtype  # back at the source's width, so a leaf's .grad matches the leaf
+        return Tensor.from_node(node, (self,), lambda g: (g.cast(source),))
 
     def float(self) -> Tensor:
         return self.cast(float32)
@@ -229,9 +238,12 @@ class Tensor:
     def int(self) -> Tensor:
         return self.cast(int32)
 
+    def half(self) -> Tensor:
+        return self.cast(float16)
+
     def unary(self, op: Op, grad_fn: BackwardFn) -> Tensor:
-        if op in (Op.EXP, Op.LOG, Op.SQRT, Op.RECIP) and self.dtype != float32:
-            raise ValueError(f"{op.name} requires float32, got {self.dtype}")
+        if op in (Op.EXP, Op.LOG, Op.SQRT, Op.RECIP) and self.dtype not in FLOATS:
+            raise ValueError(f"{op.name} requires a float dtype, got {self.dtype}")
         node = Node(op, (self.node,), self.dtype, self.shape)
         return Tensor.from_node(node, (self,), grad_fn)
 
@@ -268,7 +280,11 @@ class Tensor:
         return self + (-as_tensor(other, self))
 
     def __truediv__(self, other: Tensor | float | int) -> Tensor:
-        return self.float() * as_tensor(other, self).float().reciprocal()
+        other = as_tensor(other, self)
+        wider = promote(self.dtype, other.dtype)
+        if wider not in FLOATS:  # int over int still divides as floats, since a reciprocal has to
+            wider = float32
+        return self.cast(wider) * other.cast(wider).reciprocal()
 
     def __radd__(self, other: float | int) -> Tensor:
         return self + other
@@ -280,7 +296,7 @@ class Tensor:
         return -self + other
 
     def __rtruediv__(self, other: float | int) -> Tensor:
-        return as_tensor(other, self).float() * self.float().reciprocal()
+        return as_tensor(other, self) / self
 
     def __pow__(self, exponent: int | float) -> Tensor:
         if exponent == 0.5:
@@ -313,7 +329,8 @@ class Tensor:
         """self is the condition (nonzero picks if_true). Gradient flows to the branches only."""
         x, y = as_tensor(if_true, self), as_tensor(if_false, self)
         if x.dtype != y.dtype:  # same promotion broadcast_pair does, applied across three operands
-            x, y = x.float(), y.float()
+            wider = promote(x.dtype, y.dtype)
+            x, y = x.cast(wider), y.cast(wider)
         shape = broadcast_shape(broadcast_shape(x.shape, y.shape, "WHERE"), self.shape, "WHERE")
         x, y = broadcast_to(x, shape, "WHERE"), broadcast_to(y, shape, "WHERE")
         cond = broadcast_to(self.detach(), shape, "WHERE")
@@ -427,8 +444,8 @@ class Tensor:
     def backward(self) -> None:
         if self.numel != 1:
             raise ValueError(f"backward() needs a scalar, got shape {self.shape}")
-        if self.dtype != float32 or not self.requires_grad:
-            raise ValueError("backward() needs a float32 tensor with requires_grad=True")
+        if self.dtype not in FLOATS or not self.requires_grad:
+            raise ValueError("backward() needs a float tensor with requires_grad=True")
         order: list[Tensor] = []
         visited: set[int] = set()
         stack: list[tuple[Tensor, bool]] = [(self, False)]
@@ -440,7 +457,7 @@ class Tensor:
                 visited.add(id(t))
                 stack.append((t, True))
                 stack.extend((p, False) for p in reversed(t.parents) if p.requires_grad)
-        grads: dict[int, Tensor] = {id(self): Tensor.const(1.0, float32).reshape(*self.shape)}
+        grads: dict[int, Tensor] = {id(self): Tensor.const(1.0, self.dtype).reshape(*self.shape)}
         with no_grad():
             for t in reversed(order):
                 g = grads.pop(id(t), None)
@@ -525,7 +542,7 @@ def canon_axes(axis: int | Sequence[int] | None, ndim: int) -> tuple[int, ...]:
 def as_tensor(x: Tensor | float | int, like: Tensor) -> Tensor:
     if isinstance(x, Tensor):
         return x
-    dtype = float32 if (like.dtype == float32 or isinstance(x, float)) else int32
+    dtype = like.dtype if like.dtype in FLOATS else (float32 if isinstance(x, float) else int32)
     return Tensor.const(x, dtype)
 
 
@@ -554,7 +571,8 @@ def broadcast_to(t: Tensor, shape: tuple[int, ...], opname: str) -> Tensor:
 
 def broadcast_pair(a: Tensor, b: Tensor | float | int, opname: str) -> tuple[Tensor, Tensor]:
     b = as_tensor(b, a)
-    if a.dtype != b.dtype:  # only promotion: int32 -> float32 (ints never carry gradients)
-        a, b = a.float(), b.float()
+    if a.dtype != b.dtype:
+        wider = promote(a.dtype, b.dtype)
+        a, b = a.cast(wider), b.cast(wider)
     shape = broadcast_shape(a.shape, b.shape, opname)
     return broadcast_to(a, shape, opname), broadcast_to(b, shape, opname)

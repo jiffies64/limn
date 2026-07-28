@@ -3,6 +3,10 @@
 step() builds every parameter's update expression against the pre-step values (the device
 defers ASSIGN writes until the whole batch is computed), so update order can't matter.
 Semantics match torch.optim exactly; test_optim.py holds them to it.
+
+State is float32 whatever the parameter is, since a moment accumulated in float16 loses the
+small updates it exists to carry. The update promotes with it, so a narrower parameter rounds
+once on the way back into its own dtype.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ class SGD(Optimizer):
             if v is not None:
                 updated.append(v.assign(self.momentum * v + g))
                 g = v
-            updated.append(p.assign(p - self.lr * g))
+            updated.append(p.assign((p - self.lr * g).cast(p.dtype)))
         return updated
 
 
@@ -97,5 +101,5 @@ class AdamW(Optimizer):
             m_hat = new_m / corrections[0]
             v_hat = new_v / corrections[1]
             update = m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * p  # decoupled decay, torch AdamW
-            updated += [m.assign(new_m), v.assign(new_v), p.assign(p - self.lr * update)]
+            updated += [m.assign(new_m), v.assign(new_v), p.assign((p - self.lr * update).cast(p.dtype))]
         return updated

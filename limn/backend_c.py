@@ -22,7 +22,7 @@ import numpy as np
 from limn.codegen import Instr, LoopNest, Opcode, Valid
 from limn.device import Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
-from limn.ops import DType, Op, float32, int32
+from limn.ops import DType, FLOATS, Op, float16, float32, int32
 
 C_TYPE = {float32: "float", int32: "int32_t"}
 
@@ -52,8 +52,13 @@ def cc_flags() -> tuple[str, ...]:
 
 
 def c_literal(value: float | int, dtype: DType) -> str:
-    """A scalar as a C literal of this dtype, including the awkward ones (infinities, NAN, int min)."""
-    if dtype == float32:
+    """A scalar as a C literal of this dtype, including the awkward ones (infinities, NAN, int min).
+
+    A float16 literal is the float it rounds to: backends compute in float, so this costs nothing.
+    """
+    if dtype == float16:
+        value = float(np.float16(value))
+    if dtype in FLOATS:
         value = float(value)
         if math.isinf(value):
             return "INFINITY" if value > 0 else "-INFINITY"
@@ -63,10 +68,15 @@ def c_literal(value: float | int, dtype: DType) -> str:
     return "(-2147483647 - 1)" if value == -(2**31) else str(value)
 
 
-def guard(valid: Valid, dtype: DType) -> tuple[str, str]:
+def guard(valid: Valid, dtype: DType, types: dict[DType, str]) -> tuple[str, str]:
+    """Wrap a read so it yields zero wherever the mask is off.
+
+    Both arms carry the value's type. Left bare, a half read against a float zero converts either
+    way, and the compiler stops on the ambiguity rather than choosing.
+    """
     if not valid.bounds:
         return "", ""
-    return f"({valid.render()}) ? ", f" : {c_literal(0, dtype)}"
+    return f"({valid.render()}) ? ({types[dtype]})", f" : ({types[dtype]}){c_literal(0, dtype)}"
 
 
 def fold_c(op: Op, dest: str, src: str) -> str:
@@ -81,7 +91,7 @@ def fold_c(op: Op, dest: str, src: str) -> str:
     return f"{dest} = ({dest} > {src} || {dest} != {dest}) ? {dest} : {src};"
 
 
-def arith_c(op: Op, srcs: list[str], dtype: DType) -> str:
+def arith_c(op: Op, srcs: list[str], dtype: DType, types: dict[DType, str]) -> str:
     match op:
         case Op.NEG:
             return f"-{srcs[0]}"
@@ -98,7 +108,7 @@ def arith_c(op: Op, srcs: list[str], dtype: DType) -> str:
         case Op.MUL:
             return f"{srcs[0]} * {srcs[1]}"
         case Op.CMPLT:
-            return f"({C_TYPE[dtype]})({srcs[0]} < {srcs[1]})"
+            return f"({types[dtype]})({srcs[0]} < {srcs[1]})"
         case Op.WHERE:
             return f"{srcs[0]} != 0 ? {srcs[1]} : {srcs[2]}"
         case _:
@@ -110,8 +120,8 @@ def value_c(instr: Instr, indent: str, prefix: str, types: dict[DType, str], sto
 
     prefix is what the caller puts before buffer names: "_" for this backend's typed casts of the
     void* params, nothing for CUDA's typed params. types spells a dtype as a value, store spells it
-    in memory, for a backend that computes wider than it stores; a CAST goes through the stored
-    spelling.
+    in memory; they differ only for float16 on cuda, which computes as float. A CAST goes through
+    the stored spelling, since casting to float16 means rounding to it.
     """
     decl = f"{indent}{types[instr.value_type]} {instr.dest} = "
     match instr.opcode:
@@ -119,14 +129,14 @@ def value_c(instr: Instr, indent: str, prefix: str, types: dict[DType, str], sto
             return f"{decl}{c_literal(instr.arg, instr.value_type)};"
         case Opcode.CONST:
             value, valid = instr.arg
-            pre, post = guard(valid, instr.value_type)
+            pre, post = guard(valid, instr.value_type, types)
             return f"{decl}{pre}{c_literal(value, instr.value_type)}{post};"
         case Opcode.LOAD:
             buf, index, valid = instr.arg
-            pre, post = guard(valid, instr.value_type)
+            pre, post = guard(valid, instr.value_type, types)
             return f"{decl}{pre}{prefix}{buf}[{index.render()}]{post};"
         case Opcode.ARITH:
-            return f"{decl}{arith_c(instr.arg, list(instr.srcs), instr.value_type)};"
+            return f"{decl}{arith_c(instr.arg, list(instr.srcs), instr.value_type, types)};"
         case Opcode.CAST:
             return f"{decl}({store[instr.value_type]}){instr.srcs[0]};"
         case Opcode.GATHER:
@@ -177,9 +187,22 @@ def emit_function(nest: LoopNest) -> str:
     return "\n".join(lines)
 
 
+def unsupported_dtype(nest: LoopNest) -> DType | None:
+    """A dtype in this nest that C_TYPE has no name for, if any.
+
+    Every instruction, not just the buffers: a CAST fuses, so a nest whose inputs and target are
+    all float32 can still compute an intermediate in float16.
+    """
+    dtypes = [node.dtype for node in nest.kernel.inputs] + [nest.kernel.target.dtype]
+    dtypes += [instr.dtype for instr in nest.instrs if instr.dtype is not None]
+    return next((dtype for dtype in dtypes if dtype not in C_TYPE), None)
+
+
 def emit_c(nests: list[LoopNest]) -> str:
     parts = ["#include <math.h>", "#include <stdint.h>", ""]
     for nest in nests:
+        if (dtype := unsupported_dtype(nest)) is not None:
+            raise NotImplementedError(f"the c device has no {dtype}; run this graph on the numpy or cuda device")
         parts.append(emit_function(nest))
         parts.append("")
     return "\n".join(parts)

@@ -14,12 +14,16 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from limn.ops import DType, Node, Op, float32, int32
+from limn.ops import DType, Node, Op, accumulate_in, float16, float32, int32
 from limn.view import View
 
 type Buffer = Any
 
-NUMPY_DTYPES: dict[DType, np.dtype] = {float32: np.dtype(np.float32), int32: np.dtype(np.int32)}
+NUMPY_DTYPES: dict[DType, np.dtype] = {
+    float32: np.dtype(np.float32),
+    float16: np.dtype(np.float16),
+    int32: np.dtype(np.int32),
+}
 
 
 class Device(Protocol):
@@ -128,8 +132,8 @@ class NumpyDevice(HostDevice):
                 result = (srcs[0] < srcs[1]).astype(NUMPY_DTYPES[node.dtype])
             case Op.WHERE:
                 result = np.where(srcs[0] != 0, srcs[1], srcs[2])
-            case Op.SUM:
-                result = srcs[0].sum(axis=node.arg, keepdims=True, dtype=NUMPY_DTYPES[node.dtype])
+            case Op.SUM:  # the running total is wider than float16; the astype below rounds it back
+                result = srcs[0].sum(axis=node.arg, keepdims=True, dtype=NUMPY_DTYPES[accumulate_in(node.dtype)])
             case Op.MAX:
                 result = srcs[0].max(axis=node.arg, keepdims=True)
             case Op.GATHER:

@@ -23,8 +23,28 @@ class DType:
 
 
 float32 = DType("float32", 4)
+float16 = DType("float16", 2)  # a storage width: half the bytes to move, and every backend widens it to compute
 int32 = DType("int32", 4)
-DTYPES = (float32, int32)
+DTYPES = (float32, float16, int32)
+FLOATS = (float32, float16)
+
+
+def promote(a: DType, b: DType) -> DType:
+    """The dtype an op on these two produces. Ints join the floats; the wider float wins."""
+    if a == b:
+        return a
+    if a in FLOATS and b in FLOATS:
+        return max(a, b, key=lambda dtype: dtype.itemsize)
+    return float32  # one side is int32, and ints never carry gradients
+
+
+def accumulate_in(dtype: DType) -> DType:
+    """What a reduce keeps its running total in: wider than float16, the dtype itself otherwise.
+
+    A float16 total loses its low bits within a few hundred elements. The answer rounds back to
+    float16 once at the end, and every device owes this rule, the numpy reference included.
+    """
+    return float32 if dtype == float16 else dtype
 
 
 class Op(Enum):

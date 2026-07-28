@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 from limn.backend_c import C_TYPE, c_literal, fold_c, value_c
 from limn.codegen import REDUCES, Index, Instr, LoopNest, Opcode
-from limn.ops import DType, Op, float32
+from limn.ops import DType, Op, accumulate_in, float16, float32
 
 BLOCK = 256  # threads per block; a tiled kernel needs exactly LANES * LANES of them
 
@@ -41,11 +41,11 @@ TILE_REGS = (8, 4, 2, 1)  # cells one thread may hold in each direction, widest 
 TILE_MIN = 1 << 16  # a matmul with fewer multiply-adds than this is not worth staging for
 TILE_PAD = 4  # slack on a staged row, so a column of it spreads over banks instead of piling on one
 UNROLL = 4  # vector steps of a reduce to unroll, so a thread has several loads in flight at once
-# How each dtype is spelled in memory, and while it is a value; the same until a dtype
-# stores narrower than it computes.
-CUDA_TYPE = C_TYPE
-CUDA_VALUE = C_TYPE
-VECTOR = {float32: "float4"}  # the four-wide load type, for the dtypes that have one
+# How each dtype is spelled in memory, and while it is a value. Rounding every float16
+# intermediate instead of just the stores costs two conversions per multiply-add in a matmul.
+CUDA_TYPE = C_TYPE | {float16: "half_t"}
+CUDA_VALUE = C_TYPE | {float16: "float"}
+VECTOR = {float32: "float4", float16: "half4_t"}  # the four-wide load type, for the dtypes that have one
 
 PRELUDE = """\
 typedef int int32_t;
@@ -55,6 +55,24 @@ typedef int int32_t;
 #ifndef NAN
 #define NAN (__int_as_float(0x7fc00000))
 #endif
+
+// float16 without cuda_fp16.h, which NVRTC has no include path for and which would put a
+// toolkit back in the requirements. Both conversions are single PTX instructions every
+// architecture has. The default constructor stays trivial, so __shared__ arrays need no
+// initialisation.
+struct __align__(2) half_t {
+  unsigned short bits;
+  half_t() = default;
+  __device__ half_t(float f) { asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(f)); }
+  __device__ operator float() const {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
+    return f;
+  }
+};
+struct __align__(8) half4_t {
+  half_t x, y, z, w;
+};
 """
 
 
@@ -181,7 +199,7 @@ def vector_loads(folded: Fold, var: str, bound: int) -> tuple[Instr, ...]:
 
 def fold_lines(folded: Fold, reduce_loops: list[tuple[str, int]], indent: str) -> list[str]:
     """A register total, the reduce loops around it, and one store when they are done."""
-    lines = [f"{indent}{CUDA_VALUE[folded.dtype]} acc = {c_literal(folded.identity, folded.dtype)};"]
+    lines = [f"{indent}{CUDA_VALUE[accumulate_in(folded.dtype)]} acc = {c_literal(folded.identity, folded.dtype)};"]
     for depth, (var, bound) in enumerate(reduce_loops[:-1]):
         lines.append(f"{indent}{'  ' * depth}for (int {var} = 0; {var} < {bound}; {var}++) {{")
 
@@ -270,7 +288,7 @@ def part_name(nest: LoopNest) -> str:
 
 def split_scratch(nest: LoopNest, partials: int) -> int:
     """Bytes the two stages of a split reduce pass between them: one running total per partial."""
-    return outer_extent(nest) * partials * nest.kernel.ast.dtype.itemsize
+    return outer_extent(nest) * partials * accumulate_in(nest.kernel.ast.dtype).itemsize
 
 
 def emit_split(nest: LoopNest, partials: int) -> str:
@@ -281,11 +299,14 @@ def emit_split(nest: LoopNest, partials: int) -> str:
     deterministic; it is grouped differently from the sequential nest, so it agrees with the
     host backends to rounding rather than bit for bit (int folds stay exact, addition being
     associative modulo 2**32).
+
+    The partials are running totals, so they move at the accumulator's width, not the output's;
+    split_scratch sizes the buffer backend_cuda allocates for them.
     """
     kernel = nest.kernel
     outer, loops = nest_loops(nest)
     folded = fold_form(nest)
-    wide = folded.dtype
+    wide = accumulate_in(folded.dtype)
     ctype = CUDA_VALUE[wide]
     cells = outer_extent(nest)
 
@@ -519,7 +540,7 @@ def stage_lines(mm: Matmul, spec: TileSpec, load: Instr, indent: str) -> list[st
     lines += unpack(group, mm.sizes, "fused", f"{indent}    ", "tile_left")
     checks = ([f"fused < {extent}"] if extent % width else []) + ([f"{mm.depth} < {k}"] if k % TILE_K else [])
     checks += [valid.render()] if valid.bounds else []
-    zero = f"({CUDA_TYPE[load.value_type]}){c_literal(0, load.value_type)}"  # a zero of the value's type
+    zero = f"({CUDA_TYPE[load.value_type]}){c_literal(0, load.value_type)}"  # same arm-type rule as guard()
     cell = f"{load.dest}_s[depth_at * {pitch} + tile_at]"
     if wide == 1:
         read = f"{buf}[{index.render()}]"
@@ -625,7 +646,7 @@ def emit_tiled(nest: LoopNest, mm: Matmul, spec: TileSpec) -> str:
     lines.append(f"    const int col_block = (int)(slab % {col_blocks}) * {spec.cols}; slab /= {col_blocks};")
     lines.append(f"    const int row_block = (int)(slab % {row_blocks}) * {spec.rows}; slab /= {row_blocks};")
     lines += unpack(mm.batch, mm.sizes, "(int)slab", "    ", "batch_left")
-    lines.append(f"    {CUDA_VALUE[folded.dtype]} acc[{tm}][{tn}];")
+    lines.append(f"    {CUDA_VALUE[accumulate_in(folded.dtype)]} acc[{tm}][{tn}];")
     lines.append("    #pragma unroll")
     lines.append(f"    for (int i = 0; i < {tm}; i++)")
     lines.append("      #pragma unroll")
@@ -664,6 +685,10 @@ def write_line(instr: Instr, indent: str) -> str:
             return f"{indent}{buf}[{index.render()}] = {instr.srcs[0]};"
         case Opcode.SCATTER:
             buf, index = instr.arg  # threads collide wherever indices repeat a row
+            if instr.value_type == float16:
+                # a float16 atomic add needs either cuda_fp16.h or a PTX instruction that only thank you claude
+                # sm_70 and later have, and emission does not know the architecture
+                raise NotImplementedError("the cuda device cannot scatter float16; cast the table to float32")
             return f"{indent}atomicAdd(&{buf}[{index.render()}], {instr.srcs[0]});"
         case _:
             return value_cuda(instr, indent)
