@@ -4,11 +4,13 @@ built from limn layers, forward+backward checked against an identical torch mode
 import math
 
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
+from conftest import randf
 
 from limn import Tensor, set_seed
-from limn.nn import Embedding, LayerNorm, Linear, parameters
+from limn.nn import Conv2d, Embedding, LayerNorm, Linear, parameters
 
 BATCH, SEQ, VOCAB, DIM, HEADS, LAYERS = 2, 6, 19, 16, 4, 2
 
@@ -147,6 +149,62 @@ def test_transformer_matches_torch():
         np.testing.assert_allclose(
             lparam.grad.numpy(), tparam.grad.numpy(), atol=1e-4, rtol=1e-4, err_msg=f"gradient mismatch for {name}"
         )
+
+
+CONV_CASES = [
+    (3, 4, 3, 1, 0, 1, 1, True),
+    (3, 4, 3, 1, 1, 1, 1, False),
+    (2, 5, 1, 1, 0, 1, 1, True),
+    (4, 6, (3, 2), 2, (2, 1), 1, 2, True),
+    (4, 4, 3, 1, "same", 2, 4, True),  # depthwise, dilated, output size held
+    (3, 3, (4, 2), 1, "same", 1, 1, False),  # even kernel: 'same' pads asymmetrically
+    (6, 9, (2, 3), (2, 3), (1, 2), (2, 1), 3, True),
+]
+
+
+@pytest.mark.parametrize("in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias", CONV_CASES)
+def test_conv2d_matches_torch(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias):
+    set_seed(0)
+    layer = Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
+    assert len(parameters(layer)) == (2 if bias else 1)
+
+    x = randf(2, in_channels, 9, 8)
+    lx = Tensor(x, requires_grad=True)
+    tx = torch.tensor(x, requires_grad=True)
+    tweight = torch.tensor(layer.weight.numpy(), requires_grad=True)
+    tbias = torch.tensor(layer.bias.numpy(), requires_grad=True) if layer.bias is not None else None
+
+    out = layer(lx)
+    tout = F.conv2d(tx, tweight, tbias, stride, padding, dilation, groups)
+    assert out.shape == tuple(tout.shape)
+    np.testing.assert_allclose(out.numpy(), tout.detach().numpy(), atol=1e-4, rtol=1e-4)
+
+    (out * out).sum().backward()  # a weighted sum, so every output position reaches the gradients
+    (tout * tout).sum().backward()
+    pairs = [("input", lx, tx), ("weight", layer.weight, tweight)]
+    if layer.bias is not None and tbias is not None:
+        pairs.append(("bias", layer.bias, tbias))
+    for name, lparam, tparam in pairs:
+        assert lparam.grad is not None and tparam.grad is not None, f"missing gradient for {name}"
+        np.testing.assert_allclose(
+            lparam.grad.numpy(), tparam.grad.numpy(), atol=1e-4, rtol=1e-4, err_msg=f"gradient mismatch for {name}"
+        )
+
+
+def test_conv2d_rejects_bad_configuration():
+    with pytest.raises(ValueError, match="groups"):
+        Conv2d(4, 6, 3, groups=4)
+    with pytest.raises(ValueError, match="padding"):
+        Conv2d(4, 6, 3, padding="valid")
+    with pytest.raises(ValueError, match="same"):
+        Conv2d(4, 6, 3, stride=2, padding="same")
+
+
+def test_conv2d_rejects_bad_input():
+    with pytest.raises(ValueError, match="does not fit"):
+        Conv2d(3, 4, 5)(Tensor.zeros((1, 3, 4, 4)))
+    with pytest.raises(ValueError, match="channels"):
+        Conv2d(3, 4, 3)(Tensor.zeros((1, 5, 8, 8)))
 
 
 def test_parameters_finds_layers_held_in_a_dict():
