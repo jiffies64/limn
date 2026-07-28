@@ -42,7 +42,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from limn.backend_c import C_TYPE, arith_c, c_literal, fold_c, guard
-from limn.codegen import REDUCES, Instr, LoopNest, Opcode
+from limn.codegen import REDUCES, Instr, LoopNest, Opcode, reduce_axes
 from limn.device import Buffer
 from limn.jit import CompiledDevice, Runner
 
@@ -193,11 +193,6 @@ typedef int int32_t;
 #define NAN (__int_as_float(0x7fc00000))
 #endif
 """
-
-
-def reduce_axes(nest: LoopNest) -> tuple[int, ...]:
-    root = nest.kernel.ast
-    return root.arg if root.op in REDUCES else ()
 
 
 def outer_extent(nest: LoopNest) -> int:

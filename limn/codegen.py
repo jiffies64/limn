@@ -158,6 +158,16 @@ class LoopNest:
     instrs: tuple[Instr, ...]
 
 
+def reduce_axes(nest: LoopNest) -> tuple[int, ...]:
+    """The dims of this nest's space that it reduces over; empty when the kernel is not a reduce.
+
+    Their loop variables are the ones lower() names r0, r1, ..., which is how a backend tells a
+    loop carrying a running total from a loop over independent output cells.
+    """
+    root = nest.kernel.ast
+    return root.arg if root.op in REDUCES else ()
+
+
 def accesses(kernel: Kernel, ndim: int) -> list[tuple[int, ...]]:
     """The stride vector of every buffer this reduce kernel touches, one entry per loop dim.
 

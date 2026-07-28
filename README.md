@@ -152,13 +152,26 @@ print((x @ x.transpose()).sum().item())
 | device | pipeline | requires |
 |---|---|---|
 | `numpy` | interprets the op graph, one numpy call per node | nothing |
-| `c` | schedule → loop-nest IR → C source → `cc -O3 -march=native` → ctypes | a C compiler |
+| `c` | schedule → loop-nest IR → C source → `cc -O3 -march=native -fopenmp` → ctypes | a C compiler |
 | `cuda` | schedule → loop-nest IR → CUDA C → NVRTC → PTX → driver API | an NVIDIA driver, and NVRTC from a toolkit or `uv sync --extra cuda` |
 
 Both compiled devices cache twice: programs by source hash, execution plans by graph
 structure. A training loop at fixed shapes schedules, emits, and compiles on the first step;
 every step after goes straight to the compiled kernels. Selecting a device whose toolchain is
 missing fails at `set_device` with the reason, not later inside a subprocess.
+
+The c device runs on every core. `-march=native` gets a nest the host's vector width, which is
+one core's worth of speed; the cores come from handing a nest's leading non-reduce loops to an
+OpenMP team, fusing as many of them as it takes to have work for every thread. Those are the
+dims the output is indexed by, so the threads split the output cells between them and each cell
+is still computed start to finish by one thread, folding in the order the serial nest folds:
+threading a kernel changes which core produced a number, not the number. The tests hold it to
+that bit for bit. A nest whose outermost loop is a reduce axis (a full reduce, or one whose only
+surviving dim is the stride-1 one) and a scatter's colliding adds stay serial, since neither can
+be split without regrouping the arithmetic; on an MLP step and on the convnet in
+`examples/mnist.py` they are under 1% of the time in kernels. The team is one thread per
+physical core unless `OMP_NUM_THREADS` says otherwise, and a `cc` with no OpenMP runtime gets
+the same source without the pragmas.
 
 The cuda device binds libcuda and NVRTC through ctypes at runtime, so nothing is pinned to a
 CUDA version: kernels compile to PTX for the newest architecture the loaded NVRTC supports
@@ -193,7 +206,7 @@ Every layer answers to an oracle above it:
 |---|---|---|
 | ops + autograd | PyTorch (CPU, test-only) | a seeded fuzzer builds 300 random DAGs (movement, broadcasting, reduces, matmul), runs them forward and backward in both frameworks, and requires agreement to 1e-4; failures print a reproducer |
 | scheduler + codegen | the numpy device | tests interpret the lowered IR instruction by instruction and diff the numbers, so the printed nest means what it says (strides, masks, reduce identities) |
-| `c` backend | the numpy device | a shared graph corpus runs on both devices and is diffed at 1e-5 |
+| `c` backend | the numpy device | a shared graph corpus runs on both devices and is diffed at 1e-5, plus each threaded nest against the same nest emitted serial, which must agree exactly |
 | `cuda` backend | the numpy device | the same corpus, plus grid-stride coverage past one launch's thread count, atomic scatter collisions on a single row, and a training loop on the device |
 
 ## Layout

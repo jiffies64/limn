@@ -1,14 +1,20 @@
 """C backend tests: every graph the numpy device can run, the C backend must match."""
 
+import os
+
 import numpy as np
 import pytest
 from conftest import GRAPHS, randf
 
+import limn.backend_c as backend_c
 from limn import Tensor, set_device
-from limn.backend_c import CDevice, cache, has_cc
+from limn.backend_c import PARALLEL_MIN, CDevice, cache, emit_c, has_cc, openmp, team_size
+from limn.codegen import lower_all
 from limn.device import NUMPY_DTYPES
 
 pytestmark = pytest.mark.skipif(not has_cc(), reason="no C compiler found")
+
+needs_openmp = pytest.mark.skipif(not (has_cc() and openmp()), reason="cc has no working OpenMP runtime")
 
 cdev = CDevice()
 
@@ -153,6 +159,92 @@ def test_a_repeated_assign_commits_through_the_cached_plan():
         assert len(active.plans) == 2  # one plan for the assign step, one for numpy()'s read
     finally:
         set_device("numpy")
+
+
+# ---- threading: which loops get a team, and that having one changes no numbers ----
+
+
+def emitted(t: Tensor) -> str:
+    return emit_c(lower_all([t.node]))
+
+
+def threaded_loops(source: str) -> list[str]:
+    """The loop variable each `omp parallel for` in this source governs."""
+    lines = source.splitlines()
+    return [lines[k + 1].split()[2] for k, line in enumerate(lines) if "omp parallel for" in line]
+
+
+@needs_openmp
+def test_a_big_nest_is_threaded_over_its_output_dims():
+    n = 256  # 256*256 points, comfortably over PARALLEL_MIN
+    a, b = Tensor(randf(n, n)), Tensor(randf(n, n))
+    assert threaded_loops(emitted((a + b) * 2.0)) == ["i0"]
+    # a matmul runs two nests: the identity fill, then the fold. Both thread over the output rows.
+    assert threaded_loops(emitted(a @ b)) == ["i0", "i0"]
+
+
+@needs_openmp
+def test_a_short_outer_dim_collapses_until_there_is_work_for_every_thread():
+    rows = Tensor(randf(2, PARALLEL_MIN))
+    source = emitted(rows * 2.0)
+    assert threaded_loops(source) == ["i0"]
+    assert f"collapse(2) num_threads({team_size()})" in source, source
+
+
+@needs_openmp
+def test_a_small_nest_runs_serial():
+    a, b = Tensor(randf(3, 4)), Tensor(randf(3, 4))
+    assert threaded_loops(emitted((a + b) * 2.0)) == []
+
+
+@needs_openmp
+@pytest.mark.parametrize("name", list(GRAPHS))
+def test_no_reduce_axis_is_ever_threaded(name):
+    """Threading a loop that carries a running total would regroup the folds; only i-loops qualify."""
+    a, b = Tensor(randf(256, 256)), Tensor(randf(256, 256))
+    assert all(var.startswith("i") for var in threaded_loops(emitted(GRAPHS[name](a, b))))
+
+
+@needs_openmp
+def test_a_scatter_nest_runs_serial():
+    """Two rows of the values can land on the same row of the table, so its adds stay ordered."""
+    table = Tensor(randf(64, 256), requires_grad=True)
+    indices = Tensor(np.zeros((64, 64), dtype=np.int32))
+    (table.gather_rows(indices) * Tensor(randf(64, 64, 256))).sum().backward()
+    assert table.grad is not None
+    source = emitted(table.grad)
+    assert "+=" in source and threaded_loops(source) == []
+
+
+THREADED_GRAPHS = {
+    "elementwise": lambda a, b: (a + b) * 2.0 - a,
+    "register reduce": lambda a, b: (a * b).sum(axis=1),  # reduce axis innermost: folds in a register
+    "output-folded reduce": lambda a, b: a @ b,  # reduce axis not innermost: folds into the output
+    "dot reduce": lambda a, b: a @ b.transpose(),
+    "softmax": lambda a, b: (a + b).softmax(axis=1),
+}
+
+
+@needs_openmp
+@pytest.mark.parametrize("name", list(THREADED_GRAPHS))
+def test_threading_changes_no_bits(name, monkeypatch):
+    """Every output cell is one thread's from start to finish, so the answer is the serial one exactly.
+
+    Both builds get the same flags; only the pragmas differ, so any difference is threading's.
+    """
+    a, b = Tensor(randf(256, 256)), Tensor(randf(256, 256))
+    graph = THREADED_GRAPHS[name]
+    assert threaded_loops(emitted(graph(a, b))), "nothing was threaded, so this proves nothing"
+
+    threaded = CDevice().execute([graph(a, b).node])[0]
+    monkeypatch.setattr(backend_c, "openmp", lambda: False)
+    serial = CDevice().execute([graph(a, b).node])[0]
+    np.testing.assert_array_equal(threaded, serial)
+
+
+@pytest.mark.skipif("OMP_NUM_THREADS" in os.environ, reason="the environment chose the team size")
+def test_the_default_team_never_outgrows_the_processors_this_process_may_use():
+    assert 1 <= team_size() <= (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count())
 
 
 def test_adamw_compiles_one_program_for_all_steps():
