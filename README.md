@@ -73,7 +73,9 @@ Three rules hold it together:
   product fits, not whose operands do.
 - **Layout is arithmetic, not data.** A `View` is (shape, strides, offset, mask). `reshape`,
   `permute`, `expand`, `pad`, and `shrink` compose into a single `View`, cost nothing when
-  built, and lower to index arithmetic inside the kernels.
+  built, and lower to index arithmetic inside the kernels. Indexing (`x[0, 1:5]`, `...`, `None`)
+  is a `shrink` and a `reshape` in Python syntax, and iterating or unpacking (`q, k, v = qkv`)
+  walks dim 0 the same way; a step other than 1 has no `View` behind it and says so.
 
 ### The op set
 

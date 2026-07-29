@@ -12,8 +12,11 @@ surface is whatever __init__.py re-exports.
 from __future__ import annotations
 
 import math
+import operator
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from types import EllipsisType
+from typing import SupportsIndex
 
 import numpy as np
 
@@ -41,6 +44,7 @@ def no_grad() -> Iterator[None]:
 
 
 BackwardFn = Callable[["Tensor"], tuple["Tensor | None", ...]]
+type Index = SupportsIndex | slice | EllipsisType | Tensor | None
 
 
 class Tensor:
@@ -395,6 +399,60 @@ class Tensor:
         return self.sum(axis, keepdim) / float(count)
 
     # ---- indexed access ----
+
+    def __getitem__(self, index: Index | tuple[Index, ...]) -> Tensor:
+        """numpy-style indexing, built out of shrink and reshape: `x[0, 1:5]`, `...`, `None`.
+
+        A step other than 1 needs a stride no View op produces, and an empty slice a zero-size
+        tensor limn does not have; both raise. An int32 Tensor index stands alone and gathers rows.
+        Out of range is IndexError, as numpy raises.
+        """
+        keys: list[Index] = list(index) if isinstance(index, tuple) else [index]
+        if len(keys) == 1 and isinstance(keys[0], Tensor):
+            return self.gather_rows(keys[0])
+        if any(isinstance(k, Tensor) for k in keys):
+            raise ValueError(f"index {index}: a Tensor index selects rows and cannot be combined with others")
+        ellipses = [d for d, k in enumerate(keys) if k is Ellipsis]
+        if len(ellipses) > 1:
+            raise ValueError(f"index {index}: at most one Ellipsis")
+        indexed = sum(k is not None and k is not Ellipsis for k in keys)
+        if indexed > self.ndim:
+            raise IndexError(f"index {index}: too many indices, {indexed} for {self.ndim} dims")
+        fill = ellipses[0] if ellipses else len(keys)  # an absent Ellipsis is an implicit trailing one
+        keys[fill : fill + 1] = [slice(None)] * (self.ndim - indexed)
+        bounds: list[tuple[int, int]] = []
+        shape: list[int] = []
+        for key in keys:
+            if key is None:
+                shape.append(1)
+                continue
+            dim = len(bounds)
+            size = self.shape[dim]
+            if isinstance(key, slice):
+                start, stop, step = key.indices(size)
+                if step != 1:
+                    raise ValueError(f"index {index}: only step-1 slices are supported")
+                if start >= stop:
+                    raise ValueError(f"index {index}: empty slice on dim {dim}, limn has no zero-size tensors")
+                bounds.append((start, stop))
+                shape.append(stop - start)
+                continue
+            if isinstance(key, bool):
+                raise ValueError(f"index {index}: a bool index is a numpy mask, which limn does not have")
+            if not isinstance(key, SupportsIndex):
+                raise ValueError(f"index {index}: {type(key).__name__} is not a valid index")
+            pos = operator.index(key)
+            start = pos + size if pos < 0 else pos
+            if not 0 <= start < size:
+                raise IndexError(f"index {index}: {pos} is out of range for dim {dim} of size {size}")
+            bounds.append((start, start + 1))
+        return self.shrink(bounds).reshape(*shape)
+
+    def __iter__(self) -> Iterator[Tensor]:
+        """Rows along dim 0, so `for row in t` and `q, k, v = qkv` mean what they do in numpy."""
+        if self.ndim == 0:
+            raise TypeError("iteration over a 0-d tensor")
+        return (self[i] for i in range(self.shape[0]))
 
     def gather_rows(self, indices: Tensor) -> Tensor:
         """Rows of this 2D table picked by int32 indices: (V, D) read at (...) gives (..., D).

@@ -28,11 +28,7 @@ class Block:
         b, t, c = x.shape
         hd = c // HEADS
         qkv = self.qkv(self.ln1(x)).reshape(b, t, 3, HEADS, hd).permute(2, 0, 3, 1, 4)
-
-        def part(i: int) -> Tensor:
-            return qkv.shrink(((i, i + 1), (0, b), (0, HEADS), (0, t), (0, hd))).reshape(b, HEADS, t, hd)
-
-        q, k, v = part(0), part(1), part(2)
+        q, k, v = qkv
         scores = (q @ k.transpose(-2, -1)) * (1.0 / hd**0.5)
         att = mask.where(scores, -1e9).softmax(-1)
         x = x + self.proj((att @ v).permute(0, 2, 1, 3).reshape(b, t, c))
@@ -101,8 +97,7 @@ def sample(model: GPT, mask: Tensor, n: int, temperature: float, rng: np.random.
     with no_grad():
         for _ in range(n):
             # only the last position predicts, so drop the rest on the device rather than copy it back
-            step = model(Tensor(window.reshape(1, CTX)), mask).shrink(((0, 1), (CTX - 1, CTX), (0, VOCAB)))
-            logits = step.numpy()[0, -1]
+            logits = model(Tensor(window.reshape(1, CTX)), mask)[0, -1].numpy()
             weights = np.exp((logits - logits.max()) / temperature)
             token = int(rng.choice(VOCAB, p=weights / weights.sum()))
             out.append(token)

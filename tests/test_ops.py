@@ -177,12 +177,72 @@ def test_scalar_tensors():
     check(t + 1.0, np.asarray(np.float32(3.5)))
 
 
+def test_getitem_matches_numpy():
+    a = randf(4, 5, 6)
+    t = Tensor(a)
+    check(t[1], a[1])
+    check(t[-1], a[-1])
+    check(t[1:3], a[1:3])
+    check(t[:, 2], a[:, 2])
+    check(t[0, 1:4, -2:], a[0, 1:4, -2:])
+    check(t[..., 3], a[..., 3])
+    check(t[1, ..., -2:], a[1, ..., -2:])
+    check(t[None], a[None])
+    check(t[:, None, 2], a[:, None, 2])
+    check(t[2, 3, 4], a[2, 3, 4])
+    check(t[:], a[:])
+    check(t[np.int64(1)], a[1])  # anything with __index__, e.g. an argmax result
+
+
+def test_iteration_and_unpacking_walk_dim_0():
+    a = randf(3, 4)
+    t = Tensor(a)
+    q, k, v = t
+    check(q, a[0])
+    check(k, a[1])
+    check(v, a[2])
+    assert len(list(t)) == 3
+    with pytest.raises(IndexError, match="out of range"):
+        _ = t[3]
+    with pytest.raises(TypeError, match="0-d"):
+        iter(t[0, 0])
+
+
+def test_getitem_backward_pads_the_gradient():
+    x = Tensor(np.arange(12, dtype=np.float32).reshape(3, 4), requires_grad=True)
+    (x[1, 1:3] * Tensor(np.array([2.0, 3.0], dtype=np.float32))).sum().backward()
+    assert x.grad is not None
+    expected = np.zeros((3, 4), dtype=np.float32)
+    expected[1, 1:3] = (2.0, 3.0)
+    check(x.grad, expected)
+
+
+def test_getitem_rejects_what_views_cannot_express():
+    t = Tensor(randf(4, 5))
+    with pytest.raises(ValueError, match="step-1"):
+        _ = t[::2]
+    with pytest.raises(ValueError, match="empty slice"):
+        _ = t[2:2]
+    with pytest.raises(IndexError, match="out of range"):
+        _ = t[4]
+    with pytest.raises(IndexError, match="too many indices"):
+        _ = t[0, 0, 0]
+    with pytest.raises(ValueError, match="one Ellipsis"):
+        _ = t[..., ...]
+    with pytest.raises(ValueError, match="Tensor index"):
+        _ = t[Tensor(np.array([0], dtype=np.int32)), 0]
+    with pytest.raises(ValueError, match="bool"):
+        _ = t[True]
+
+
 def test_gather_rows_picks_table_rows():
     table = randf(5, 3)
     indices = np.array([[4, 0], [2, 2]], dtype=np.int32)
     got = Tensor(table).gather_rows(Tensor(indices))
     assert got.shape == (2, 2, 3)
     check(got, table[indices])
+    check(Tensor(table)[Tensor(indices)], table[indices])  # a Tensor index routes here
+    check(Tensor(table)[Tensor(indices),], table[indices])  # as does the 1-tuple numpy also accepts
 
 
 def test_gather_rows_backward_sums_repeated_indices():

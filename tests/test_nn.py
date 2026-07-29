@@ -31,10 +31,7 @@ class Attention:
         head_dim = dim // self.heads
         qkv = self.qkv(x)
         q, k, v = (
-            qkv.shrink(((0, batch), (0, seq), (i * dim, (i + 1) * dim)))
-            .reshape(batch, seq, self.heads, head_dim)
-            .permute(0, 2, 1, 3)
-            for i in range(3)
+            qkv[:, :, i * dim : (i + 1) * dim].reshape(batch, seq, self.heads, head_dim).permute(0, 2, 1, 3) for i in range(3)
         )
         scores = (q @ k.transpose()) * head_dim**-0.5
         rows, cols = Tensor.arange(seq).reshape(seq, 1), Tensor.arange(seq).reshape(1, seq)
