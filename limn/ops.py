@@ -25,17 +25,23 @@ class DType:
 float32 = DType("float32", 4)
 float16 = DType("float16", 2)  # a storage width: half the bytes to move, and every backend widens it to compute
 int32 = DType("int32", 4)
-DTYPES = (float32, float16, int32)
+int16 = DType("int16", 2)  # the narrow ints are exact storage: arithmetic wraps modulo 2**width, the same on every device
+int8 = DType("int8", 1)
+DTYPES = (float32, float16, int32, int16, int8)
 FLOATS = (float32, float16)
+INTS = (int32, int16, int8)
 
 
 def promote(a: DType, b: DType) -> DType:
-    """The dtype an op on these two produces. Ints join the floats; the wider float wins."""
+    """The dtype an op on these two produces. Within a family the wider side wins; an int meeting
+    a float joins the floats, at float32 or wider, since ints never carry gradients and an int32
+    does not fit in a float16."""
     if a == b:
         return a
-    if a in FLOATS and b in FLOATS:
+    if (a in FLOATS) == (b in FLOATS):
         return max(a, b, key=lambda dtype: dtype.itemsize)
-    return float32  # one side is int32, and ints never carry gradients
+    wider = a if a in FLOATS else b
+    return max(wider, float32, key=lambda dtype: dtype.itemsize)
 
 
 def accumulate_in(dtype: DType) -> DType:
@@ -43,6 +49,8 @@ def accumulate_in(dtype: DType) -> DType:
 
     A float16 total loses its low bits within a few hundred elements. The answer rounds back to
     float16 once at the end, and every device owes this rule, the numpy reference included.
+    The int dtypes stay at their own width: addition wraps modulo 2**width, so a wider total
+    truncated at the end would land on the same bits anyway.
     """
     return float32 if dtype == float16 else dtype
 

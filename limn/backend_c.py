@@ -22,9 +22,9 @@ import numpy as np
 from limn.codegen import Instr, LoopNest, Opcode, Valid
 from limn.device import Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
-from limn.ops import DType, FLOATS, Op, float16, float32, int32
+from limn.ops import DType, FLOATS, Op, float16, float32, int8, int16, int32
 
-C_TYPE = {float32: "float", int32: "int32_t"}
+C_TYPE = {float32: "float", int32: "int32_t", int16: "int16_t", int8: "int8_t"}
 
 cache: dict[str, ctypes.CDLL] = {}
 tmpdirs: list[Path] = []

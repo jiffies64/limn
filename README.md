@@ -90,13 +90,16 @@ Three rules hold it together:
 | indexed | `GATHER`, `SCATTER` |
 | barriers | `CONTIGUOUS`, `ASSIGN` |
 
-Three dtypes: `float32`, `float16`, and `int32`. `float16` is a storage width, not a working
-precision: it halves the bytes a kernel moves, and every device widens it to compute, so a
-reduce keeps its running total in `float32` and rounds back once at the end. Mixing it with
-`float32` promotes, and casting between the two carries gradients, which is what makes a
-`float32` master weight met by `float16` activations train. The `c` device has no `float16` and
-says so; on `cuda` a `float16` scatter is the one gap, since its atomic add needs an
-architecture the emitter cannot see.
+Five dtypes: `float32`, `float16`, `int32`, `int16`, and `int8`. `float16` is a storage width,
+not a working precision: it halves the bytes a kernel moves, and every device widens it to
+compute, so a reduce keeps its running total in `float32` and rounds back once at the end.
+Mixing it with `float32` promotes, and casting between the two carries gradients, which is what
+makes a `float32` master weight met by `float16` activations train. The narrow ints are exact
+storage: arithmetic wraps modulo 2**width, the same on every device, a python scalar takes the
+tensor's dtype rather than widening it, and an int meeting a float joins the floats at
+`float32` or wider. The `c` device has no `float16` and says so; on `cuda` a `float16` scatter
+is the one `float32`-family gap, since its atomic add needs an architecture the emitter cannot
+see, and a narrow-int scatter declines because `atomicAdd` has no 8- or 16-bit overload.
 
 ## Reading the schedule
 
@@ -217,6 +220,7 @@ Every layer answers to an oracle above it:
 | `cuda` backend | the numpy device | the same corpus, plus grid-stride coverage past one launch's thread count, atomic scatter collisions on a single row, tiled matmuls across every tile width and tail, and a training loop on the device |
 | cuda emission | its own invariants | no GPU needed: the tiling decision is checked for covering every output cell and for staging whole slabs, since a tile the block cannot fill in whole passes would fold shared memory nobody wrote |
 | `float16` | the numpy device | the corpus and the matmuls again at half width, diffed at float16's own rounding, plus the dtype rules and that a cast between float dtypes still carries gradients |
+| `int8`, `int16` | the numpy device | an integer corpus (wraparound, compares, reduces, matmul, gather) on the `c` and `cuda` devices, diffed for exact equality since modular arithmetic leaves nothing to rounding |
 
 ## Layout
 

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 from limn.backend_c import C_TYPE, c_literal, fold_c, value_c
 from limn.codegen import REDUCES, Index, Instr, LoopNest, Opcode
-from limn.ops import DType, Op, accumulate_in, float16, float32
+from limn.ops import DType, Op, accumulate_in, float16, float32, int8, int16
 
 BLOCK = 256  # threads per block; a tiled kernel needs exactly LANES * LANES of them
 
@@ -49,6 +49,8 @@ VECTOR = {float32: "float4", float16: "half4_t"}  # the four-wide load type, for
 
 PRELUDE = """\
 typedef int int32_t;
+typedef short int16_t;
+typedef signed char int8_t;
 #ifndef INFINITY
 #define INFINITY (__int_as_float(0x7f800000))
 #endif
@@ -298,7 +300,7 @@ def emit_split(nest: LoopNest, partials: int) -> str:
     loads stay coalesced and the grouping is fixed, which is what makes the result
     deterministic; it is grouped differently from the sequential nest, so it agrees with the
     host backends to rounding rather than bit for bit (int folds stay exact, addition being
-    associative modulo 2**32).
+    associative modulo 2**width).
 
     The partials are running totals, so they move at the accumulator's width, not the output's;
     split_scratch sizes the buffer backend_cuda allocates for them.
@@ -685,6 +687,9 @@ def write_line(instr: Instr, indent: str) -> str:
             return f"{indent}{buf}[{index.render()}] = {instr.srcs[0]};"
         case Opcode.SCATTER:
             buf, index = instr.arg  # threads collide wherever indices repeat a row
+            if instr.value_type in (int8, int16):
+                # atomicAdd has no 8- or 16-bit overload on any architecture
+                raise NotImplementedError(f"the cuda device cannot scatter {instr.value_type}; cast the table to int32")
             if instr.value_type == float16:
                 # a float16 atomic add needs either cuda_fp16.h or a PTX instruction that only thank you claude
                 # sm_70 and later have, and emission does not know the architecture
