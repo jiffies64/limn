@@ -220,7 +220,7 @@ class Tensor:
     # ---- elementwise ops ----
 
     def cast(self, dtype: DType) -> Tensor:
-        """Convert dtype. Between float dtypes this carries gradients; to or from int32 it detaches.
+        """Convert dtype. Between float dtypes this carries gradients; to or from an int it detaches.
 
         broadcast_pair inserts these itself wherever a float16 meets a float32, so detaching would
         strip requires_grad off a parameter and leave the optimizer skipping it. An int carries no
@@ -600,7 +600,9 @@ def canon_axes(axis: int | Sequence[int] | None, ndim: int) -> tuple[int, ...]:
 def as_tensor(x: Tensor | float | int, like: Tensor) -> Tensor:
     if isinstance(x, Tensor):
         return x
-    dtype = like.dtype if like.dtype in FLOATS else (float32 if isinstance(x, float) else int32)
+    # a python scalar takes the tensor's dtype rather than widening it; only a float scalar
+    # against an int tensor brings its own, and joins the floats where the int cannot follow
+    dtype = like.dtype if like.dtype in FLOATS or isinstance(x, int) else float32
     return Tensor.const(x, dtype)
 
 
