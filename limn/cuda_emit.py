@@ -58,6 +58,20 @@ typedef signed char int8_t;
 #define NAN (__int_as_float(0x7fc00000))
 #endif
 
+// atomicAdd on double arrives at sm_60; below that, the CAS loop the programming guide gives,
+// which adds in double all the same and only retries when another thread got there first.
+#if __CUDA_ARCH__ < 600
+__device__ double atomicAdd(double* address, double val) {
+  unsigned long long* cell = (unsigned long long*)address;
+  unsigned long long old = *cell, seen;
+  do {
+    seen = old;
+    old = atomicCAS(cell, seen, __double_as_longlong(val + __longlong_as_double(seen)));
+  } while (seen != old);
+  return __longlong_as_double(old);
+}
+#endif
+
 // float16 without cuda_fp16.h, which NVRTC has no include path for and which would put a
 // toolkit back in the requirements. Both conversions are single PTX instructions every
 // architecture has. The default constructor stays trivial, so __shared__ arrays need no

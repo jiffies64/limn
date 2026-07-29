@@ -4,9 +4,10 @@ step() builds every parameter's update expression against the pre-step values (t
 defers ASSIGN writes until the whole batch is computed), so update order can't matter.
 Semantics match torch.optim exactly; test_optim.py holds them to it.
 
-State is float32 whatever the parameter is, since a moment accumulated in float16 loses the
-small updates it exists to carry. The update promotes with it, so a narrower parameter rounds
-once on the way back into its own dtype.
+State is the parameter's dtype, never narrower than float32: a moment accumulated in float16
+loses the small updates it exists to carry, and a float64 parameter would forfeit its width
+to float32 state. The update promotes with the state, so a narrower parameter rounds once on
+the way back into its own dtype.
 """
 
 from __future__ import annotations
@@ -15,7 +16,13 @@ from collections.abc import Iterable
 
 import numpy as np
 
+from limn.device import NUMPY_DTYPES
+from limn.ops import DType, float32, promote
 from limn.tensor import Tensor, no_grad, realize
+
+
+def state_like(p: Tensor) -> Tensor:
+    return Tensor.zeros(p.shape, dtype=promote(p.dtype, float32))
 
 
 class Optimizer:
@@ -42,7 +49,7 @@ class SGD(Optimizer):
         super().__init__(params)
         self.lr = lr
         self.momentum = momentum
-        self.velocity = [Tensor.zeros(p.shape) for p in self.params] if momentum else [None] * len(self.params)
+        self.velocity = [state_like(p) for p in self.params] if momentum else [None] * len(self.params)
 
     def updates(self) -> list[Tensor]:
         updated: list[Tensor] = []
@@ -71,8 +78,8 @@ class AdamW(Optimizer):
         self.beta1, self.beta2 = betas
         self.eps = eps
         self.weight_decay = weight_decay
-        self.m = [Tensor.zeros(p.shape) for p in self.params]
-        self.v = [Tensor.zeros(p.shape) for p in self.params]
+        self.m = [state_like(p) for p in self.params]
+        self.v = [state_like(p) for p in self.params]
         self.t = 0
 
     def step(self) -> None:
@@ -80,26 +87,30 @@ class AdamW(Optimizer):
         self.t += 1
         super().step()
 
-    def bias_correction(self, beta: float) -> Tensor:
-        """1 - beta**t, as a buffer rather than a literal.
+    def bias_correction(self, beta: float, dtype: DType) -> Tensor:
+        """1 - beta**t, as a buffer rather than a literal, at the state's width.
 
         This is the one number in the update that changes every step. A literal would change the
         emitted source with it, so every step would hash differently and pay a full compile; as
-        bytes the source is identical and compiles once.
+        bytes the source is identical and compiles once. It matches the state's dtype so a
+        float64 step is not scaled through a float32 rounding.
         """
-        return Tensor(np.array([1 - beta**self.t], dtype=np.float32))
+        return Tensor(np.array([1 - beta**self.t], dtype=NUMPY_DTYPES[dtype]))
 
     def updates(self) -> list[Tensor]:
         updated: list[Tensor] = []
-        corrections = (self.bias_correction(self.beta1), self.bias_correction(self.beta2))
+        corrections: dict[DType, tuple[Tensor, Tensor]] = {}
         for p, m, v in zip(self.params, self.m, self.v):
             if p.grad is None:
                 continue
+            key = m.dtype
+            if key not in corrections:
+                corrections[key] = (self.bias_correction(self.beta1, key), self.bias_correction(self.beta2, key))
             g = p.grad
             new_m = self.beta1 * m + (1 - self.beta1) * g
             new_v = self.beta2 * v + (1 - self.beta2) * g * g
-            m_hat = new_m / corrections[0]
-            v_hat = new_v / corrections[1]
+            m_hat = new_m / corrections[key][0]
+            v_hat = new_v / corrections[key][1]
             update = m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * p  # decoupled decay, torch AdamW
             updated += [m.assign(new_m), v.assign(new_v), p.assign((p - self.lr * update).cast(p.dtype))]
         return updated

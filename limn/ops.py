@@ -22,13 +22,14 @@ class DType:
         return self.name
 
 
+float64 = DType("float64", 8)  # a working precision above float32: every backend computes it natively, at its own width
 float32 = DType("float32", 4)
 float16 = DType("float16", 2)  # a storage width: half the bytes to move, and every backend widens it to compute
 int32 = DType("int32", 4)
 int16 = DType("int16", 2)  # the narrow ints are exact storage: arithmetic wraps modulo 2**width, the same on every device
 int8 = DType("int8", 1)
-DTYPES = (float32, float16, int32, int16, int8)
-FLOATS = (float32, float16)
+DTYPES = (float64, float32, float16, int32, int16, int8)
+FLOATS = (float64, float32, float16)
 INTS = (int32, int16, int8)
 
 

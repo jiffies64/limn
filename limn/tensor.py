@@ -21,7 +21,7 @@ from typing import SupportsIndex
 import numpy as np
 
 from limn import device
-from limn.ops import DTYPES, FLOATS, DType, Node, Op, float16, float32, int32, promote, topological
+from limn.ops import DTYPES, FLOATS, DType, Node, Op, float16, float32, float64, int32, promote, topological
 from limn.view import View
 
 grad_enabled: bool = True
@@ -244,6 +244,9 @@ class Tensor:
 
     def half(self) -> Tensor:
         return self.cast(float16)
+
+    def double(self) -> Tensor:
+        return self.cast(float64)
 
     def unary(self, op: Op, grad_fn: BackwardFn) -> Tensor:
         if op in (Op.EXP, Op.LOG, Op.SQRT, Op.RECIP) and self.dtype not in FLOATS:

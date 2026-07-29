@@ -22,9 +22,9 @@ import numpy as np
 from limn.codegen import Instr, LoopNest, Opcode, Valid
 from limn.device import Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
-from limn.ops import DType, FLOATS, Op, float16, float32, int8, int16, int32
+from limn.ops import DType, FLOATS, Op, float16, float32, float64, int8, int16, int32
 
-C_TYPE = {float32: "float", int32: "int32_t", int16: "int16_t", int8: "int8_t"}
+C_TYPE = {float64: "double", float32: "float", int32: "int32_t", int16: "int16_t", int8: "int8_t"}
 
 cache: dict[str, ctypes.CDLL] = {}
 tmpdirs: list[Path] = []
@@ -64,7 +64,7 @@ def c_literal(value: float | int, dtype: DType) -> str:
             return "INFINITY" if value > 0 else "-INFINITY"
         if math.isnan(value):
             return "NAN"
-        return f"{value}f"
+        return str(value) if dtype == float64 else f"{value}f"  # a bare float literal is already C's double
     return "(-2147483647 - 1)" if value == -(2**31) else str(value)
 
 
@@ -92,17 +92,18 @@ def fold_c(op: Op, dest: str, src: str) -> str:
 
 
 def arith_c(op: Op, srcs: list[str], dtype: DType, types: dict[DType, str]) -> str:
+    suffix = "" if dtype == float64 else "f"  # the unsuffixed math functions are C's double ones
     match op:
         case Op.NEG:
             return f"-{srcs[0]}"
         case Op.EXP:
-            return f"expf({srcs[0]})"
+            return f"exp{suffix}({srcs[0]})"
         case Op.LOG:
-            return f"logf({srcs[0]})"
+            return f"log{suffix}({srcs[0]})"
         case Op.SQRT:
-            return f"sqrtf({srcs[0]})"
+            return f"sqrt{suffix}({srcs[0]})"
         case Op.RECIP:
-            return f"1.0f / {srcs[0]}"
+            return f"1.0{suffix} / {srcs[0]}"
         case Op.ADD:
             return f"{srcs[0]} + {srcs[1]}"
         case Op.MUL:
