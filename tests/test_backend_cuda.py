@@ -2,15 +2,13 @@
 
 import numpy as np
 import pytest
-from conftest import GRAPHS, randf
+from conftest import GRAPHS, check, cudev, randf
 
 from limn import Tensor, set_device
 from limn.backend_cuda import BLOCK, GRID, CudaDevice, cache, has_cuda
 from limn.device import NUMPY_DTYPES
 
 pytestmark = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
-
-cudev = CudaDevice() if has_cuda() else None
 
 
 def check_cuda(t: Tensor, dev: CudaDevice | None = None, tol: float = 1e-5) -> None:
@@ -21,11 +19,7 @@ def check_cuda(t: Tensor, dev: CudaDevice | None = None, tol: float = 1e-5) -> N
     is nothing; over a couple of hundred elements it is not, and a cell that lands near zero by
     cancellation shows it as a large relative difference over a tiny absolute one.
     """
-    dev = dev or cudev
-    expected = t.numpy()
-    bufs = dev.execute([t.node])
-    got = dev.copyout(bufs[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
-    np.testing.assert_allclose(got, expected, atol=tol, rtol=tol)
+    check(dev or cudev, t, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("name", list(GRAPHS))

@@ -6,18 +6,11 @@ same on every device, so everything here is diffed for equality rather than to a
 
 import numpy as np
 import pytest
+from conftest import cdev, check, cudev, needs_cc, needs_cuda
 
 from limn import Tensor
-from limn.backend_c import CDevice, has_cc
-from limn.backend_cuda import CudaDevice, has_cuda
-from limn.device import NUMPY_DTYPES
 from limn.ops import DType, float16, float32, int8, int16, int32, promote
 from limn.tensor import scatter_rows
-
-cdev = CDevice() if has_cc() else None
-cudev = CudaDevice() if has_cuda() else None
-needs_cc = pytest.mark.skipif(not has_cc(), reason="no C compiler found")
-needs_cuda = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
 
 NARROW = {int8: np.int8, int16: np.int16}
 
@@ -25,13 +18,6 @@ NARROW = {int8: np.int8, int16: np.int16}
 def ints(*shape: int, dtype: DType = int8, seed: int = 0) -> np.ndarray:
     """Values wide enough that sums and products actually wrap, drawn per (seed, shape)."""
     return np.random.default_rng((seed, *shape)).integers(-100, 100, shape, dtype=NARROW[dtype])
-
-
-def check(dev, t: Tensor) -> None:
-    expected = t.numpy()
-    bufs = dev.execute([t.node])
-    got = dev.copyout(bufs[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
-    np.testing.assert_array_equal(got, expected)
 
 
 GRAPHS = {
@@ -124,14 +110,14 @@ def test_gather_reads_a_narrow_table_and_scatter_sums_into_one():
 @pytest.mark.parametrize("name", list(GRAPHS))
 def test_c_narrow_matches_numpy_device(name, dtype):
     a, b = Tensor(ints(3, 4, dtype=dtype), dtype=dtype), Tensor(ints(3, 4, dtype=dtype, seed=1), dtype=dtype)
-    check(cdev, GRAPHS[name](a, b))
+    check(cdev, GRAPHS[name](a, b), exact=True)
 
 
 @needs_cc
 def test_c_narrow_scatter_matches_numpy_device():
     values = Tensor(ints(2, 3, 4), dtype=int8)
     indices = Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32))
-    check(cdev, scatter_rows(values, indices, (6, 4)))
+    check(cdev, scatter_rows(values, indices, (6, 4)), exact=True)
 
 
 @needs_cuda
@@ -139,13 +125,13 @@ def test_c_narrow_scatter_matches_numpy_device():
 @pytest.mark.parametrize("name", list(GRAPHS))
 def test_cuda_narrow_matches_numpy_device(name, dtype):
     a, b = Tensor(ints(3, 4, dtype=dtype), dtype=dtype), Tensor(ints(3, 4, dtype=dtype, seed=1), dtype=dtype)
-    check(cudev, GRAPHS[name](a, b))
+    check(cudev, GRAPHS[name](a, b), exact=True)
 
 
 @needs_cuda
 def test_cuda_narrow_split_reduce_matches_numpy_device():
     """Few cells over a long reduce runs as two kernels; modulo addition makes it exact anyway."""
-    check(cudev, Tensor(ints(1 << 18), dtype=int8).sum())
+    check(cudev, Tensor(ints(1 << 18), dtype=int8).sum(), exact=True)
 
 
 @needs_cuda
@@ -154,7 +140,7 @@ def test_cuda_narrow_matmul_is_exact_where_it_tiles():
     for m, k, n in [(64, 96, 128), (129, 40, 65)]:
         a = Tensor(ints(m, k, dtype=int16), dtype=int16)
         b = Tensor(ints(k, n, dtype=int16, seed=1), dtype=int16)
-        check(cudev, a @ b)
+        check(cudev, a @ b, exact=True)
 
 
 @needs_cuda

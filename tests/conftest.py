@@ -1,8 +1,37 @@
-"""Shared test helpers: the graph corpus every backend and the lowered IR are diffed against."""
+"""Shared test helpers: the devices, the check that diffs them against the numpy reference,
+and the graph corpus every backend and the lowered IR are run through."""
 
 import numpy as np
+import pytest
+
+from limn.backend_c import CDevice, has_cc
+from limn.backend_cuda import CudaDevice, has_cuda
+from limn.device import NUMPY_DTYPES
+from limn.tensor import Tensor
 
 rng = np.random.default_rng(7)
+
+cdev = CDevice() if has_cc() else None
+cudev = CudaDevice() if has_cuda() else None
+needs_cc = pytest.mark.skipif(not has_cc(), reason="no C compiler found")
+needs_cuda = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
+
+
+def check(dev, t: Tensor, rtol: float = 1e-5, atol: float = 1e-5, exact: bool = False) -> None:
+    """One tensor realized on `dev`, diffed against the numpy reference.
+
+    exact is for the dtypes whose arithmetic is bit-defined on every device, like the ints
+    wrapping modulo 2**width. float16 results are compared as float32, since comparing in half
+    rounds the comparison itself.
+    """
+    expected = t.numpy()
+    got = dev.copyout(dev.execute([t.node])[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
+    if exact:
+        np.testing.assert_array_equal(got, expected)
+        return
+    if got.dtype == np.float16:
+        got, expected = got.astype(np.float32), expected.astype(np.float32)
+    np.testing.assert_allclose(got, expected, rtol=rtol, atol=atol)
 
 
 def randf(*shape: int) -> np.ndarray:

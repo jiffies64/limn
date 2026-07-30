@@ -7,16 +7,12 @@ than the 1e-5 the float32 corpus is diffed at.
 
 import numpy as np
 import pytest
-from conftest import GRAPHS, randf
+from conftest import GRAPHS, check, cudev, needs_cc, needs_cuda, randf
 
 from limn import Tensor, set_device
-from limn.backend_c import CDevice, has_cc
-from limn.backend_cuda import CudaDevice, has_cuda
+from limn.backend_c import CDevice
 from limn.device import NUMPY_DTYPES
 from limn.ops import float16, float32, int32, promote
-
-cudev = CudaDevice() if has_cuda() else None
-needs_cuda = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
 
 
 def halves(*shape: int, scale: float = 1.0, seed: int = 0) -> np.ndarray:
@@ -29,10 +25,7 @@ def halves(*shape: int, scale: float = 1.0, seed: int = 0) -> np.ndarray:
 
 
 def check_cuda(t: Tensor, rtol: float = 2e-3) -> None:
-    expected = np.asarray(t.numpy(), dtype=np.float32)
-    bufs = cudev.execute([t.node])
-    got = cudev.copyout(bufs[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
-    np.testing.assert_allclose(np.asarray(got, dtype=np.float32), expected, rtol=rtol, atol=1e-3)
+    check(cudev, t, rtol=rtol, atol=1e-3)
 
 
 # ---- dtype rules, which hold on every device ----
@@ -123,14 +116,14 @@ def test_an_optimizer_does_not_silently_skip_a_half_parameter():
     assert not np.array_equal(p.numpy(), before), "the parameter never moved"
 
 
-@pytest.mark.skipif(not has_cc(), reason="no C compiler found")
+@needs_cc
 def test_the_c_device_says_it_has_no_half_rather_than_emitting_nonsense():
     a = Tensor(halves(4, 3), dtype=float16)
     with pytest.raises(NotImplementedError, match="float16"):
         CDevice().execute([(a + a).node])
 
 
-@pytest.mark.skipif(not has_cc(), reason="no C compiler found")
+@needs_cc
 def test_the_c_device_catches_a_half_it_only_computes_in():
     """A CAST fuses, so this nest reads and writes float32 and is float16 in the middle."""
     x, y = Tensor(randf(4, 3)), Tensor(randf(4, 3))
