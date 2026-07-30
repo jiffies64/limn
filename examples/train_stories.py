@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from limn import Tensor, no_grad, realize, set_device, set_seed
+from limn import Tensor, capture, no_grad, realize, set_device, set_seed
 from limn.nn import Embedding, LayerNorm, Linear, parameters
 from limn.optim import AdamW
 
@@ -132,25 +132,30 @@ def main() -> None:
         load_checkpoint(checkpoint, params)
         print(f"resumed from {checkpoint}")
     opt = AdamW(params, lr=args.lr)
-    mask = causal_mask()
+    mask = causal_mask().realize()  # realized once; unrealized it would be recomputed inside every step
 
     budget = args.tokens if args.tokens is not None else (500_000_000 if args.full else 50_000_000)
     tokens_per_step = args.batch * CTX
     steps = max(1, budget // tokens_per_step)
     print(f"{sum(p.numel for p in params) / 1e6:.2f}M params, {steps} steps of {tokens_per_step} tokens on {args.device}")
 
+    @capture
+    def train_step(x: Tensor, y: Tensor) -> Tensor:
+        opt.zero_grad()
+        loss = cross_entropy(model(x, mask), y)
+        loss.backward()
+        opt.step(loss)  # the loss realizes with the updates, so logging it costs no second forward
+        return loss
+
     start = time.perf_counter()
     for step in range(1, steps + 1):
         x, y = batch_of(data, args.batch, rng)
-        opt.zero_grad()
-        loss = cross_entropy(model(x, mask), y)
+        loss = train_step(x, y)
         if step % args.log_every == 0 or step == steps:
             done = step * tokens_per_step
             rate = done / (time.perf_counter() - start)
             eta = (steps - step) * tokens_per_step / rate
             print(f"step {step:6d}/{steps}  loss {loss.item():.4f}  {rate:8.0f} tok/s  eta {eta / 3600:.2f}h", flush=True)
-        loss.backward()
-        opt.step()
         if step % args.checkpoint_every == 0 or step == steps:
             save_checkpoint(checkpoint, params)
 

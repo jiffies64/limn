@@ -193,8 +193,11 @@ operands are read from changes.
 
 Both compiled devices cache twice: programs by source hash, execution plans by graph
 structure. A training loop at fixed shapes schedules, emits, and compiles on the first step;
-every step after goes straight to the compiled kernels. Selecting a device whose toolchain is
-missing fails at `set_device` with the reason, not later inside a subprocess.
+every step after goes straight to the compiled kernels. `limn.capture` sits above both: it
+wraps a step function, records the kernel calls of one call, and replays them against each
+new batch's buffers, so later steps skip the Python graph building too. Selecting a device
+whose toolchain is missing fails at `set_device` with the reason, not later inside a
+subprocess.
 
 The cuda device binds libcuda and NVRTC through ctypes at runtime, so nothing is pinned to a
 CUDA version: kernels compile to PTX for the newest architecture the loaded NVRTC supports
@@ -217,9 +220,12 @@ in `cuda_emit.py` and the hooks in `backend_cuda.py`.
 `limn.nn` holds `Linear`, `LayerNorm`, `Embedding`, and a `parameters()` walker that collects
 every trainable tensor reachable from a module's attributes. `limn.optim` holds `SGD` (with
 momentum) and `AdamW`. An optimizer step is a batch of `ASSIGN` graphs committed in one
-`realize()`, so every update expression reads pre-step values and update order cannot matter.
-Semantics match `torch.nn` and `torch.optim` down to weight layouts, LayerNorm's biased
-variance, and AdamW's decoupled weight decay; the tests hold them to it step for step.
+`realize()`, so every update expression reads pre-step values and update order cannot matter;
+`step()` also takes extra tensors to realize in that same batch, which is how a logged loss
+shares the forward pass with the gradients. Everything a step changes lives on the device,
+AdamW's `beta**t` included, so a captured step replays whole. Semantics match `torch.nn` and
+`torch.optim` down to weight layouts, LayerNorm's biased variance, and AdamW's decoupled
+weight decay; the tests hold them to it step for step.
 
 ## Correctness
 
@@ -246,7 +252,7 @@ limn/
   device.py      the device protocol and the numpy reference interpreter
   schedule.py    cuts the graph into fused kernels
   codegen.py     lowers kernels to the printable loop-nest IR
-  jit.py         the shared executor: plan caching and the assign transaction
+  jit.py         the shared executor: plan caching, the assign transaction, capture
   backend_c.py   renders the IR as C, compiles it, calls it through ctypes
   cuda_emit.py   renders the IR as CUDA C: one thread per cell, split reduces, tiled matmuls
   backend_cuda.py  binds the driver and NVRTC, compiles, owns device memory and launching
