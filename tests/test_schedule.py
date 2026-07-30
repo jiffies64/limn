@@ -15,9 +15,23 @@ import pytest
 from conftest import GRAPHS, randf
 
 from limn import Tensor
-from limn.codegen import Instr, LoopNest, Opcode, Valid, ir, lower_all
+from limn.codegen import (
+    MAX_PIECES,
+    Index,
+    Instr,
+    LoopNest,
+    Opcode,
+    Valid,
+    cut,
+    ir,
+    loop_range,
+    lower_all,
+    mask_of,
+    matching_end,
+    split_masked,
+)
 from limn.device import NUMPY_DTYPES
-from limn.ops import DType, Node, Op, int32
+from limn.ops import DType, Node, Op, float32, int32
 from limn.schedule import Kernel, is_alias, realized, schedule
 
 # ---- an interpreter for the IR, so the lowering can be checked against the numpy device ----
@@ -51,15 +65,6 @@ def arith(op: Op, srcs: list[Any]) -> Any:
             raise AssertionError(f"{op} should not appear as an arithmetic instruction")
 
 
-def matching_end(instrs: Sequence[Instr], start: int) -> int:
-    depth = 0
-    for j in range(start, len(instrs)):
-        depth += (instrs[j].opcode is Opcode.LOOP) - (instrs[j].opcode is Opcode.ENDLOOP)
-        if depth == 0:
-            return j
-    raise AssertionError("unbalanced loops in the nest")
-
-
 def run_block(
     instrs: Sequence[Instr], start: int, loops: dict[str, int], bufs: dict[str, np.ndarray], env: dict[str, Any]
 ) -> None:
@@ -71,7 +76,7 @@ def run_block(
                 return
             case Opcode.LOOP:
                 end = matching_end(instrs, i)
-                for value in range(instr.arg):
+                for value in range(*loop_range(instr)):
                     loops[instr.dest] = value
                     run_block(instrs, i + 1, loops, bufs, env)
                 i = end + 1
@@ -116,14 +121,18 @@ def blank(kernel: Kernel) -> np.ndarray:
     return np.full(math.prod(kernel.target.shape), fill, dtype=dtype)
 
 
-def run_ir(nests: Sequence[LoopNest]) -> dict[Node, np.ndarray]:
-    """Interpret a whole schedule, returning the flat buffer each nest wrote."""
+def run_ir(nests: Sequence[LoopNest], rewrite: Any = tuple) -> dict[Node, np.ndarray]:
+    """Interpret a whole schedule, returning the flat buffer each nest wrote.
+
+    rewrite is applied to each nest's instructions first, so a transform meant for a backend can be
+    run through the same interpreter as the stream it came from and the two diffed.
+    """
     produced: dict[Node, np.ndarray] = {}
     for nest in nests:
         kernel = nest.kernel
         bufs = {f"in{k}": flat_buffer(node, produced) for k, node in enumerate(kernel.inputs)}
         bufs["out"] = blank(kernel)
-        run_block(nest.instrs, 0, {}, bufs, {})
+        run_block(rewrite(nest.instrs), 0, {}, bufs, {})
         produced[kernel.target] = bufs["out"]
     return produced
 
@@ -366,6 +375,97 @@ def test_load_index_matches_view_materialize(name):
         if valid.at(loops):
             got[position] = flat[index.at(loops)]
     np.testing.assert_array_equal(got, view.materialize(flat))
+
+
+# ---- splitting the innermost loop where a mask cuts it ----
+
+
+def innermost(instrs: Sequence[Instr]) -> list[tuple[Instr, list[Instr]]]:
+    """Every loop with no loop inside it, paired with its body."""
+    found = []
+    for i, instr in enumerate(instrs):
+        if instr.opcode is not Opcode.LOOP:
+            continue
+        body = list(instrs[i + 1 : matching_end(instrs, i)])
+        if not any(inner.opcode is Opcode.LOOP for inner in body):
+            found.append((instr, body))
+    return found
+
+
+def checks_on(instr: Instr, var: str) -> list[tuple[int, int]]:
+    return [(lo, hi) for v, lo, hi, _ in mask_of(instr).bounds if v == var]
+
+
+# (how to pad, whether that lands a check on the dim the reduce leaves innermost)
+PADS = {
+    "before the innermost dim": (lambda t: t.pad(((0, 0), (1, 0))), True),
+    "after the innermost dim": (lambda t: t.pad(((0, 0), (0, 2))), True),
+    "both sides of the innermost dim": (lambda t: t.pad(((0, 0), (2, 3))), True),
+    "an outer dim only": (lambda t: t.pad(((1, 1), (0, 0))), False),
+    "both dims": (lambda t: t.pad(((1, 2), (2, 1))), True),
+}
+
+
+def padded_nests(name: str) -> list[LoopNest]:
+    pad, _ = PADS[name]
+    return lower_all([(pad(Tensor(randf(3, 4))) * 2.0).sum(axis=1).node])
+
+
+@pytest.mark.parametrize("name", list(PADS))
+def test_splitting_leaves_no_mask_on_the_innermost_loop(name):
+    """The whole point: after the split nothing inside an innermost loop tests that loop's variable."""
+    nests = padded_nests(name)
+    masked = [loop.dest for nest in nests for loop, body in innermost(nest.instrs) if any(checks_on(i, loop.dest) for i in body)]
+    assert bool(masked) is PADS[name][1], f"expected a check on the innermost variable: {PADS[name][1]}"
+    for nest in nests:
+        for loop, body in innermost(split_masked(nest.instrs)):
+            assert all(not checks_on(instr, loop.dest) for instr in body), f"{loop.dest} is still tested inside itself"
+
+
+@pytest.mark.parametrize("name", list(PADS))
+def test_splitting_an_innermost_loop_changes_nothing_it_computes(name):
+    """Same iterations in the same order, so the interpreter cannot tell the two streams apart."""
+    nests = padded_nests(name)
+    before, after = run_ir(nests), run_ir(nests, split_masked)
+    assert list(before) == list(after)
+    for node, expected in before.items():
+        np.testing.assert_array_equal(after[node], expected)  # exactly equal, not merely close
+
+
+def test_a_nest_with_nothing_to_split_is_left_alone():
+    """No mask on the innermost variable means no pieces, so an unpadded nest emits what it always did."""
+    a, b = Tensor(randf(4, 5)), Tensor(randf(5, 3))
+    for build in (lambda: a @ b, lambda: (a * 2.0).sum(axis=1), lambda: a.pad(((1, 1), (0, 0))).sum(axis=1)):
+        for nest in lower_all([build().node]):
+            assert split_masked(nest.instrs) == nest.instrs
+
+
+def test_a_split_piece_keeps_the_checks_that_are_not_its_own():
+    """A mask over two dims only loses the half the split settles; the outer dim's check stays."""
+    padded = Tensor(randf(3, 4)).pad(((1, 2), (2, 1)))
+    nest = lower_all([padded.sum(axis=1).node])[0]
+    loops = innermost(split_masked(nest.instrs))
+    outer = {var for _, body in loops for instr in body for var, *_ in mask_of(instr).bounds}
+    assert outer and all(var != loop.dest for loop, _ in loops for var in outer)
+
+
+def masked_load(dest: str, lo: int, hi: int, size: int) -> Instr:
+    return Instr(Opcode.LOAD, dest, float32, arg=("in0", Index(0, (("i0", 1),)), Valid((("i0", lo, hi, size),))))
+
+
+def test_a_mask_cut_finely_enough_is_split_into_a_loop_per_piece():
+    loop = [Instr(Opcode.LOOP, "i0", arg=10), masked_load("v0", 2, 8, 10), Instr(Opcode.ENDLOOP, arg="i0")]
+    pieces = [loop_range(i) for i in split_masked(loop) if i.opcode is Opcode.LOOP]
+    assert pieces == [(0, 2), (2, 8), (8, 10)]  # out, in, out: the edges of the one check
+
+
+def test_a_mask_cut_too_finely_is_not_split():
+    """Every piece costs a copy of the body, so past MAX_PIECES the loop is left as it was."""
+    edges = [(k, k + 1) for k in range(MAX_PIECES + 1)]  # one check each, so a piece per check and then some
+    body = [masked_load(f"v{k}", lo, hi, 20) for k, (lo, hi) in enumerate(edges)]
+    loop = [Instr(Opcode.LOOP, "i0", arg=20), *body, Instr(Opcode.ENDLOOP, arg="i0")]
+    assert len(cut(body, "i0", 0, 20)) > MAX_PIECES
+    assert split_masked(loop) == tuple(loop)
 
 
 # ---- what the lowering means, against the numpy device ----

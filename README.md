@@ -153,6 +153,16 @@ Two things the dump shows:
   a register, so this nest fills the output with the reduce identity first and folds into it
   with `ACCUM`.
 
+A pad is the other thing that decides what the innermost loop costs, and it does not show
+above because a matmul has nothing masked. A padded read lowers to a range check on a loop
+variable; on the *innermost* variable that guards a load per element, which `cc` turns into a
+masked load and then declines to vectorise the loop around. So the C backend cuts that loop at
+the mask's edges before emitting it, leaving every piece wholly inside the pad or wholly
+outside it, where the check folds away to nothing or to a literal zero. The iterations and
+their order are unchanged, so the answer is bit-identical. It is worth about 2x on a padded
+conv, landing it beside its unpadded twin, and nothing at all on a nest with no mask
+innermost, which emits the source it always did.
+
 ## Backends
 
 `set_device` picks the executor. The host devices share bytes, so tensors move freely
