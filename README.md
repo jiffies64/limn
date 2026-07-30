@@ -252,7 +252,8 @@ limn/
   device.py      the device protocol and the numpy reference interpreter
   schedule.py    cuts the graph into fused kernels
   codegen.py     lowers kernels to the printable loop-nest IR
-  jit.py         the shared executor: plan caching, the assign transaction, capture
+  jit.py         the shared executor: plan caching and the assign transaction
+  capture.py     records a step's kernel calls once, replays them on new batches
   backend_c.py   renders the IR as C, compiles it, calls it through ctypes
   cuda_emit.py   renders the IR as CUDA C: one thread per cell, split reduces, tiled matmuls
   backend_cuda.py  binds the driver and NVRTC, compiles, owns device memory and launching

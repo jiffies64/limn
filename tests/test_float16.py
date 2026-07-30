@@ -181,14 +181,11 @@ def test_cuda_half_gradients_match_numpy_device():
 def test_cuda_half_scatter_says_it_is_unsupported():
     """A float16 atomic add needs an architecture emission cannot see, so it must not guess."""
     set_device("cuda")
-    try:
-        table = Tensor(halves(6, 4), dtype=float16, requires_grad=True)
-        indices = Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32))
-        (table.gather_rows(indices) * Tensor(halves(2, 3, 4, seed=1), dtype=float16)).sum().backward()
-        with pytest.raises(NotImplementedError, match="float16"):
-            table.grad.realize()
-    finally:
-        set_device("numpy")
+    table = Tensor(halves(6, 4), dtype=float16, requires_grad=True)
+    indices = Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32))
+    (table.gather_rows(indices) * Tensor(halves(2, 3, 4, seed=1), dtype=float16)).sum().backward()
+    with pytest.raises(NotImplementedError, match="float16"):
+        table.grad.realize()
 
 
 @needs_cuda
