@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from limn import Tensor, device, realize, set_device
+from limn import Tensor, device, realize, set_device, set_seed
 from limn.backend_c import has_cc
 
 
@@ -72,6 +72,7 @@ def test_an_optimizer_step_runs_on_the_c_device():
     from limn.optim import SGD
 
     set_device("c")
+    set_seed(3)  # whether five momentum steps end below the start depends on the init, so own it
     layer = Linear(4, 3)
     x = Tensor(np.random.default_rng(3).random((8, 4)).astype(np.float32))
     losses = []

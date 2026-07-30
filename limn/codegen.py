@@ -18,6 +18,12 @@ source buffer is affine in the loop variables (offset + sum(i_d * stride_d)) and
 conjunction of range checks on those same variables, so both are exact, both render, and both
 evaluate: Index.at and Valid.at are what the tests check against View.materialize.
 
+Masks are the one thing a backend may want restructured rather than rendered. A check on the
+innermost loop's own variable guards a load per element, which is what stops a C compiler
+vectorising; split_masked turns those checks into loop bounds instead, leaving the iterations and
+their order alone. It is a transform on the instruction stream, not part of the lowering, because
+whether it helps is a property of the backend: cc wants it, a GPU thread does not.
+
 A loop nest is a plan. Nothing executes it, so nothing here allocates, compiles, or runs.
 """
 
@@ -25,7 +31,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -105,6 +111,24 @@ class Valid:
     def at(self, loops: Mapping[str, int]) -> bool:
         return all(lo <= loops[var] < hi for var, lo, hi, _ in self.bounds)
 
+    def given(self, var: str, lo: int, hi: int) -> Valid:
+        """This mask, knowing `var` only takes values in [lo, hi).
+
+        A check that range satisfies outright is dropped, which is the point: what is left says
+        nothing about `var`. A check it fails outright leaves an empty bound, so `never` holds and
+        the whole read is a constant zero. A check it straddles has to stay.
+        """
+        bounds: list[tuple[str, int, int, int]] = []
+        for bound in self.bounds:
+            other, blo, bhi, size = bound
+            if other != var:
+                bounds.append(bound)
+            elif bhi <= lo or hi <= blo:
+                return Valid(((var, 0, 0, size),))
+            elif not (blo <= lo and hi <= bhi):
+                bounds.append(bound)
+        return Valid(tuple(bounds))
+
 
 def index_of(view: View, loop_vars: Sequence[str]) -> tuple[Index, Valid]:
     """A view's read, as index arithmetic over the loop variables: one variable per dim."""
@@ -123,7 +147,7 @@ def contiguous_index(shape: tuple[int, ...], loop_vars: Sequence[str]) -> Index:
 
 
 class Opcode(Enum):
-    LOOP = auto()  # dest is the loop variable, arg its bound
+    LOOP = auto()  # dest is the loop variable, arg its bound, or the (lo, hi) a split left behind
     ENDLOOP = auto()  # arg is the loop variable it closes
     CONST = auto()  # arg is (value, Valid); zero wherever the check fails
     LOAD = auto()  # arg is (buffer, Index, Valid); zero wherever the check fails
@@ -331,6 +355,94 @@ def lower_all(sinks: list[Node], order: list[Node] | None = None) -> list[LoopNe
     return [lower(kernel, f"k{k}") for k, kernel in enumerate(schedule(sinks, order))]
 
 
+MAX_PIECES = 4  # a mask cut finer than this is not worth a copy of the body per piece
+
+
+def mask_of(instr: Instr) -> Valid:
+    """The mask this instruction reads under; the ones that carry none read under an empty mask."""
+    return instr.arg[-1] if instr.opcode in (Opcode.CONST, Opcode.LOAD) else Valid()
+
+
+def loop_range(instr: Instr) -> tuple[int, int]:
+    """A LOOP's half-open range: arg is a plain bound, or the (lo, hi) a split left behind."""
+    return instr.arg if isinstance(instr.arg, tuple) else (0, instr.arg)
+
+
+def matching_end(instrs: Sequence[Instr], start: int) -> int:
+    """Where the LOOP opened at `start` is closed."""
+    depth = 0
+    for j in range(start, len(instrs)):
+        depth += (instrs[j].opcode is Opcode.LOOP) - (instrs[j].opcode is Opcode.ENDLOOP)
+        if depth == 0:
+            return j
+    raise AssertionError("unbalanced loops in the nest")
+
+
+def resolved(instr: Instr, var: str, lo: int, hi: int) -> Instr:
+    """This instruction with its mask settled against `var` in [lo, hi)."""
+    valid = mask_of(instr).given(var, lo, hi)
+    if valid.never:  # no value in this range is in bounds, so the read is a literal zero
+        return Instr(Opcode.CONST, instr.dest, instr.dtype, arg=(0, Valid()))
+    if instr.opcode in (Opcode.CONST, Opcode.LOAD):  # both keep their Valid last in arg
+        return replace(instr, arg=(*instr.arg[:-1], valid))
+    return instr
+
+
+def cut(body: Sequence[Instr], var: str, lo: int, hi: int) -> list[tuple[int, int]]:
+    """[lo, hi) cut wherever the body's checks on `var` begin or end, so each piece settles them all."""
+    edges = {lo, hi}
+    edges |= {edge for instr in body for v, blo, bhi, _ in mask_of(instr).bounds if v == var for edge in (blo, bhi)}
+    ordered = sorted(edge for edge in edges if lo <= edge <= hi)
+    return list(zip(ordered, ordered[1:]))
+
+
+def split_innermost(loop: Instr, body: Sequence[Instr], endloop: Instr) -> list[Instr]:
+    """One innermost loop as the pieces its body's checks cut it into; one piece means nothing to split."""
+    pieces = cut(body, loop.dest, *loop_range(loop))
+    if not 2 <= len(pieces) <= MAX_PIECES:
+        return [loop, *body, endloop]
+    out: list[Instr] = []
+    for lo, hi in pieces:
+        piece = Instr(Opcode.LOOP, loop.dest, arg=(lo, hi))
+        out += [piece, *(resolved(instr, loop.dest, lo, hi) for instr in body), endloop]
+    return out
+
+
+def split_masked(instrs: Sequence[Instr]) -> tuple[Instr, ...]:
+    """Peel the innermost loop apart where a mask cuts it, so no check rides on that variable.
+
+    A pad's mask is a range check on a loop variable, and the innermost loop re-tests it once per
+    element. On a guarded *load* that is expensive out of proportion to the check: a C compiler
+    turns it into a masked load and then gives up vectorising the loop around it, so the six taps
+    of a padded 3x3 conv whose mask touches the innermost dim run scalar while the three whose
+    mask does not run on vectors.
+
+    But the check is loop structure, not data. Cutting the loop at the mask's edges leaves every
+    piece wholly inside it or wholly outside it, so the check folds away in all of them: inside it
+    is nothing, outside it the read is a literal zero. Same iterations, in the same order, so this
+    is bit-identical rather than merely close.
+
+    Only the innermost loop is worth this. It is the one that decides whether the nest vectorises,
+    and splitting an outer loop would copy its whole subtree per piece to buy a few percent.
+    """
+    out: list[Instr] = []
+    i = 0
+    while i < len(instrs):
+        instr = instrs[i]
+        if instr.opcode is not Opcode.LOOP:
+            out.append(instr)
+            i += 1
+            continue
+        end = matching_end(instrs, i)
+        body, endloop = instrs[i + 1 : end], instrs[end]
+        if any(inner.opcode is Opcode.LOOP for inner in body):
+            out += [instr, *split_masked(body), endloop]
+        else:
+            out += split_innermost(instr, body, endloop)
+        i = end + 1
+    return tuple(out)
+
+
 def guard(valid: Valid) -> str:
     return f" if {valid.render()} else 0" if valid.bounds else ""
 
@@ -338,7 +450,8 @@ def guard(valid: Valid) -> str:
 def render_instr(instr: Instr) -> str:
     match instr.opcode:
         case Opcode.LOOP:
-            return f"LOOP    {instr.dest} < {instr.arg}"
+            lo, hi = loop_range(instr)
+            return f"LOOP    {instr.dest} < {hi}" if lo == 0 else f"LOOP    {lo} <= {instr.dest} < {hi}"
         case Opcode.ENDLOOP:
             return f"ENDLOOP {instr.arg}"
         case Opcode.ACC:

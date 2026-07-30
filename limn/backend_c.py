@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from limn.codegen import Instr, LoopNest, Opcode, Valid
+from limn.codegen import Instr, LoopNest, Opcode, Valid, loop_range, split_masked
 from limn.device import Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
 from limn.ops import DType, FLOATS, Op, float16, float32, float64, int8, int16, int32
@@ -161,11 +161,14 @@ def emit_function(nest: LoopNest) -> str:
     out_type = C_TYPE[kernel.target.dtype]
     lines.append(f"  {out_type}* restrict _out = ({out_type}*)out;")
     depth = 1
-    for instr in nest.instrs:
+    # cc vectorises the innermost loop or it vectorises nothing, and a pad's mask left riding on that
+    # loop's variable is what stops it; split_masked turns those checks into loop bounds instead
+    for instr in split_masked(nest.instrs):
         indent = "  " * (depth + 1)
         match instr.opcode:
             case Opcode.LOOP:
-                lines.append(f"{indent}for (int {instr.dest} = 0; {instr.dest} < {instr.arg}; {instr.dest}++) {{")
+                lo, hi = loop_range(instr)
+                lines.append(f"{indent}for (int {instr.dest} = {lo}; {instr.dest} < {hi}; {instr.dest}++) {{")
                 depth += 1
             case Opcode.ENDLOOP:
                 depth -= 1
