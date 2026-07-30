@@ -8,8 +8,9 @@
 
 A deep learning framework built to be read. The whole stack is here: lazy tensors over a
 closed set of 19 primitive ops, reverse-mode autograd, a scheduler that fuses the graph into
-kernels, an IR you can print, and C and CUDA backends that JIT-compile it, in about 3,200
-lines of Python with numpy as the only runtime dependency. In spirit it sits between
+kernels, an IR you can print, conv layers, dtypes from int8 to float64, and C and CUDA
+backends that JIT-compile it, in about 3,600 lines of Python with numpy as the only runtime
+dependency. In spirit it sits between
 micrograd and tinygrad: small enough to read in one sitting, real enough that a matmul comes
 out the other end as one fused loop nest with the stride-1 dim innermost.
 
@@ -28,7 +29,7 @@ print(x.grad.numpy())    # nothing computes until here
 git clone https://github.com/jiffies64/limn.git
 cd limn
 uv sync
-uv run pytest                            # the whole suite, about ten seconds
+uv run pytest                            # the whole suite, under a minute
 uv run python examples/train_mlp.py      # AdamW on a toy regression; loss must drop 20x
 uv run python examples/train_stories.py  # byte-level GPT on TinyStories; --full for the long run
 ```
