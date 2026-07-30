@@ -4,6 +4,7 @@ and the graph corpus every backend and the lowered IR are run through."""
 import numpy as np
 import pytest
 
+from limn import set_device
 from limn.backend_c import CDevice, has_cc
 from limn.backend_cuda import CudaDevice, has_cuda
 from limn.device import NUMPY_DTYPES
@@ -15,6 +16,14 @@ cdev = CDevice() if has_cc() else None
 cudev = CudaDevice() if has_cuda() else None
 needs_cc = pytest.mark.skipif(not has_cc(), reason="no C compiler found")
 needs_cuda = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
+
+
+@pytest.fixture(autouse=True)
+def on_the_numpy_device():
+    """Any test may switch devices; none may leak that to the next one."""
+    set_device("numpy")
+    yield
+    set_device("numpy")
 
 
 def check(dev, t: Tensor, rtol: float = 1e-5, atol: float = 1e-5, exact: bool = False) -> None:

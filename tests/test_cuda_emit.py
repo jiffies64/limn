@@ -9,17 +9,9 @@ import re
 
 import pytest
 
-from limn import Tensor, set_device
+from limn import Tensor
 from limn.codegen import LoopNest, lower_all
 from limn.cuda_emit import BLOCK, TILE_K, emit_one, split_partials, stages_whole, tile_count, tiled
-
-
-@pytest.fixture(autouse=True)
-def on_the_numpy_device():
-    """Nothing here runs a kernel, so the buffers behind these shapes may as well stay on the host."""
-    set_device("numpy")
-    yield
-    set_device("numpy")
 
 
 def matmul_nest(m: int, k: int, n: int, transposed: bool = False) -> LoopNest:
