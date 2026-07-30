@@ -275,33 +275,27 @@ def test_a_repeated_assign_commits_through_the_cached_plan():
     from limn import device
 
     set_device("cuda")
-    try:
-        active = device.active()
-        assert isinstance(active, CudaDevice)
-        p = Tensor(np.ones(4, dtype=np.float32))
-        for _ in range(3):
-            p.assign(p * 2.0)
-            p.realize()
-        np.testing.assert_allclose(p.numpy(), np.full(4, 8.0, dtype=np.float32))
-        assert len(active.plans) == 2  # one plan for the assign step, one for numpy()'s read
-    finally:
-        set_device("numpy")
+    active = device.active()
+    assert isinstance(active, CudaDevice)
+    p = Tensor(np.ones(4, dtype=np.float32))
+    for _ in range(3):
+        p.assign(p * 2.0)
+        p.realize()
+    np.testing.assert_allclose(p.numpy(), np.full(4, 8.0, dtype=np.float32))
+    assert len(active.plans) == 2  # one plan for the assign step, one for numpy()'s read
 
 
 def test_adamw_compiles_one_program_for_all_steps():
     from limn.optim import AdamW
 
     set_device("cuda")
-    try:
-        p = Tensor(np.ones((4, 4), dtype=np.float32), requires_grad=True)
-        opt = AdamW([p], lr=0.1)
-        cache.clear()
-        for _ in range(3):
-            p.grad = Tensor(np.ones((4, 4), dtype=np.float32))
-            opt.step()
-        assert len(cache) == 1, f"{len(cache)} programs compiled for 3 steps"
-    finally:
-        set_device("numpy")
+    p = Tensor(np.ones((4, 4), dtype=np.float32), requires_grad=True)
+    opt = AdamW([p], lr=0.1)
+    cache.clear()
+    for _ in range(3):
+        p.grad = Tensor(np.ones((4, 4), dtype=np.float32))
+        opt.step()
+    assert len(cache) == 1, f"{len(cache)} programs compiled for 3 steps"
 
 
 def test_an_optimizer_step_trains_on_cuda():
@@ -309,17 +303,14 @@ def test_an_optimizer_step_trains_on_cuda():
     from limn.optim import SGD
 
     set_device("cuda")
-    try:
-        layer = Linear(4, 3)
-        x = Tensor(np.random.default_rng(3).random((8, 4)).astype(np.float32))
-        losses = []
-        opt = SGD(parameters(layer), lr=0.05, momentum=0.9)
-        for _ in range(5):
-            opt.zero_grad()
-            loss = (layer(x) ** 2).sum()
-            loss.backward()
-            losses.append(loss.item())
-            opt.step()
-        assert losses[-1] < losses[0]
-    finally:
-        set_device("numpy")
+    layer = Linear(4, 3)
+    x = Tensor(np.random.default_rng(3).random((8, 4)).astype(np.float32))
+    losses = []
+    opt = SGD(parameters(layer), lr=0.05, momentum=0.9)
+    for _ in range(5):
+        opt.zero_grad()
+        loss = (layer(x) ** 2).sum()
+        loss.backward()
+        losses.append(loss.item())
+        opt.step()
+    assert losses[-1] < losses[0]

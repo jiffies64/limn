@@ -141,13 +141,10 @@ def test_cuda_double_scatter_adds_atomically():
     indices_data = np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32)
     weights_data = doubles(2, 3, 4, seed=1)
     set_device("cuda")
-    try:
-        table = Tensor(doubles(6, 4), dtype=float64, requires_grad=True)
-        indices = Tensor(indices_data)
-        (table.gather_rows(indices) * Tensor(weights_data, dtype=float64)).sum().backward()
-        got = table.grad.numpy()
-    finally:
-        set_device("numpy")
+    table = Tensor(doubles(6, 4), dtype=float64, requires_grad=True)
+    indices = Tensor(indices_data)
+    (table.gather_rows(indices) * Tensor(weights_data, dtype=float64)).sum().backward()
+    got = table.grad.numpy()
     expected = np.zeros((6, 4))
     np.add.at(expected, indices_data, weights_data)
     np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
