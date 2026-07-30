@@ -79,17 +79,30 @@ def test_optimizer_requires_grad_params():
         SGD([Tensor(np.ones((2, 2), dtype=np.float32))], lr=0.1)
 
 
-def test_adamw_updates_does_not_advance_the_step_count():
-    """Bias correction advances in step(); building the expressions must leave t alone."""
-    inspected, _ = make_params((3, 2))
-    inspected[0].grad = Tensor(np.ones((3, 2), dtype=np.float32))
-    opt = AdamW(inspected, lr=0.1)
+def test_adamw_updates_builds_without_committing():
+    """updates() is inspection: nothing lands on the device until step(), which still matches torch."""
+    lparams, tparams = make_params((4, 3), (3,))
+    lopt, topt = AdamW(lparams, lr=1e-2), torch.optim.AdamW(tparams, lr=1e-2)
+    x = rng.standard_normal((6, 4)).astype(np.float32)
+    lloss, tloss = loss_pair(lparams, tparams, x)
+    lloss.backward()
+    tloss.backward()
     with no_grad():
-        opt.updates()
-    assert opt.t == 0
+        lopt.updates()  # built and discarded; beta**t and the moments must not move
+    lopt.step()
+    topt.step()
+    for lp, tp in zip(lparams, tparams):
+        np.testing.assert_allclose(lp.numpy(), tp.detach().numpy(), atol=1e-6, rtol=1e-6)
 
-    stepped, _ = make_params((3, 2))
-    stepped[0].grad = Tensor(np.ones((3, 2), dtype=np.float32))
-    other = AdamW(stepped, lr=0.1)
-    other.step()
-    assert other.t == 1
+
+def test_step_realizes_extras_in_the_same_batch():
+    """A loss passed to step() reads the pre-step parameters, like everything in the batch."""
+    lparams, _ = make_params((4, 3), (3,))
+    before = [p.numpy().copy() for p in lparams]
+    opt = SGD(lparams, lr=0.5)
+    loss = (lparams[0] * lparams[1].reshape(1, 3)).sum()
+    loss.backward()
+    opt.step(loss)
+    expected = (before[0] * before[1].reshape(1, 3)).sum()
+    np.testing.assert_allclose(loss.item(), expected, rtol=1e-6)
+    assert not np.allclose(lparams[0].numpy(), before[0])  # the updates themselves still committed
