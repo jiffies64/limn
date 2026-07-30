@@ -17,6 +17,7 @@ from limn import device
 from limn.device import Buffer
 from limn.jit import CompiledDevice, Plan, Recording
 from limn.ops import Node, Op
+from limn.schedule import realized
 from limn.tensor import Tensor
 
 
@@ -45,10 +46,12 @@ class capture:
     parameter itself, as it is on a plain call.
 
     Everything else is baked in at record time. A python value that varies between calls (a
-    learning rate schedule, a step counter) freezes at its recorded value; keep such state in
-    tensors the graph advances, as AdamW keeps beta**t. The function must realize whatever it
-    returns (pass a loss to Optimizer.step, or call realize()), and takes only tensor
-    arguments, all of the recorded shapes and dtypes.
+    learning rate schedule, a step counter) freezes at its recorded value, and so does a buffer
+    the function creates fresh each call; keep such state in tensors the graph advances, as
+    AdamW keeps beta**t. The function must realize whatever it returns (pass a loss to
+    Optimizer.step, or call realize()), and takes only tensor arguments, all of the recorded
+    shapes and dtypes. The recording binds to the active device: replays refuse another one,
+    since they would hand its kernels a stranger's buffers.
 
     Because the function never runs again, whatever its last real call left behind stays put.
     Gradients are the case that matters: end a training step with zero_grad() so the recorded
@@ -60,6 +63,7 @@ class capture:
 
     def __init__(self, fn: Callable[..., Any]):
         self.fn = fn
+        self.dev: CompiledDevice | None = None  # the device the recording is bound to
         self.first: tuple | None = None  # the first call's wiring, held until the second confirms it
         self.steps: list[Step] | None = None
         self.argspec: tuple = ()
@@ -100,12 +104,13 @@ class capture:
         tensors = self.returned(out)
         # a returned tensor whose buffer no recording produced is an in-place target (an
         # assign's), refreshed by every replay's commits; it is handed back as itself
-        self.result_at = {id(t): spot for t in tensors if (spot := produced.get(id(t.node.arg))) is not None}
+        self.result_at = {id(t): spot for t in tensors if (spot := produced.get(id(realized(t.node).arg))) is not None}
         for t in tensors:
-            # replays only read shape and dtype off these; the autograd record would pin the
-            # observed call's whole graph (every intermediate tensor and closure) for the
-            # capture's life
-            t.requires_grad, t.parents, t.grad_fn = False, (), None
+            # severing parents and grad_fn unpins the observed call's whole graph (every
+            # intermediate tensor and closure). requires_grad stays: a returned in-place
+            # target is a live parameter that must keep taking gradients
+            t.parents, t.grad_fn = (), None
+        self.dev = dev
         self.steps = steps
         self.argspec = tuple((t.shape, t.dtype) for t in args)
         self.result = out
@@ -140,12 +145,16 @@ class capture:
         for t in tensors:
             if not isinstance(t, Tensor):
                 raise ValueError(f"a captured function may return tensors only, got {type(t).__name__}")
-            if t.node.op is not Op.BUFFER:
+            if realized(t.node).op is not Op.BUFFER:
                 raise ValueError("a captured function must realize what it returns; pass it to Optimizer.step or realize()")
         return tensors
 
     def replay(self, dev: CompiledDevice, args: tuple) -> Any:
         assert self.steps is not None
+        if dev is not self.dev:
+            raise ValueError("a capture replays only on the device that recorded it; set_device has replaced that one")
+        if dev.record is not None:
+            raise ValueError("capture does not nest")
         spec = tuple((t.shape, t.dtype) for t in args)
         if spec != self.argspec:
             raise ValueError(f"capture recorded arguments {self.argspec}, this call passed {spec}")

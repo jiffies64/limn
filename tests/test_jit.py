@@ -6,7 +6,7 @@ from conftest import needs_cc, randf
 
 from limn import Tensor, capture, set_device, set_seed
 from limn.nn import Linear, parameters
-from limn.optim import AdamW
+from limn.optim import SGD, AdamW
 
 
 def batches(n: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -131,6 +131,71 @@ def test_a_returned_tensor_must_be_realized():
     fn = capture(step)
     fn(Tensor(randf(4)))
     with pytest.raises(ValueError, match="must realize what it returns"):
+        fn(Tensor(randf(4)))
+
+
+@needs_cc
+def test_a_recorded_capture_refuses_to_replay_inside_an_observation():
+    """Replaying skips execute(), so an observing outer capture would freeze the inner result
+    as held bytes; refusing loudly beats replaying a constant."""
+    set_device("c")
+    inner = capture(lambda x: (x * 2.0).sum().realize())
+    inner(Tensor(randf(4)))
+    inner(Tensor(randf(4)))
+
+    outer = capture(lambda x: (inner(x) + 1.0).realize())
+    with pytest.raises(ValueError, match="does not nest"):
+        outer(Tensor(randf(4)))
+
+
+@needs_cc
+def test_a_returned_parameter_keeps_its_grad_requirement():
+    set_device("c")
+    w = Tensor(randf(3), requires_grad=True)
+    opt = SGD([w], lr=0.1)
+
+    def step(x: Tensor) -> tuple[Tensor, Tensor]:
+        opt.zero_grad()
+        loss = (x * w).sum()
+        loss.backward()
+        opt.step(loss)
+        opt.zero_grad()
+        return loss, w
+
+    fn = capture(step)
+    fn(Tensor(randf(3)))
+    _, back = fn(Tensor(randf(3)))  # the recorded call severs the returned tensors' graphs
+    assert back is w
+    assert w.requires_grad  # a returned in-place target is a live parameter, not a reading
+
+
+@needs_cc
+def test_a_returned_realized_alias_is_accepted():
+    """realize() keeps a full alias as a VIEW; returning one is still a realized return."""
+    set_device("c")
+
+    def step(x: Tensor) -> Tensor:
+        return (x * 2.0).realize().reshape(2, 2).realize()
+
+    fn = capture(step)
+    fn(Tensor(randf(4)))
+    fn(Tensor(randf(4)))
+    d = randf(4)
+    np.testing.assert_array_equal(fn(Tensor(d)).numpy(), (d * 2.0).reshape(2, 2))
+
+
+@needs_cc
+def test_replay_is_bound_to_the_device_that_recorded_it():
+    set_device("c")
+
+    def step(x: Tensor) -> Tensor:
+        return (x * 2.0).sum().realize()
+
+    fn = capture(step)
+    fn(Tensor(randf(4)))
+    fn(Tensor(randf(4)))
+    set_device("c")  # a fresh instance of the same backend, not the recording's device
+    with pytest.raises(ValueError, match="device that recorded"):
         fn(Tensor(randf(4)))
 
 
