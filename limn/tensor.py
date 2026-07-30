@@ -22,6 +22,7 @@ import numpy as np
 
 from limn import device
 from limn.ops import DTYPES, FLOATS, DType, Node, Op, float16, float32, float64, int32, promote, topological
+from limn.schedule import realized
 from limn.view import View
 
 grad_enabled: bool = True
@@ -538,7 +539,13 @@ class Tensor:
 
 
 def realize(*tensors: Tensor) -> list[device.Buffer]:
-    """Execute the graphs of all given tensors in one batch (shared subgraphs compute once)."""
+    """Execute the graphs of all given tensors in one batch (shared subgraphs compute once).
+
+    Afterwards a computed sink *is* its bytes: the node becomes a BUFFER holding the result, so
+    reading it again, or a later graph that includes it, loads instead of recomputing. A sink
+    that merely aliases another node's buffer keeps its VIEW, so realizing a reshape never
+    creates a second buffer node over the same bytes.
+    """
     sinks = [t.node for t in tensors]
     buffers = device.active().execute(sinks)
     # every reachable ASSIGN has committed, so each one becomes the buffer it just wrote. Retiring
@@ -547,6 +554,9 @@ def realize(*tensors: Tensor) -> list[device.Buffer]:
     for node in topological(sinks):
         if node.op is Op.ASSIGN:
             node.op, node.srcs, node.arg = Op.BUFFER, (), node.srcs[0].arg
+    for node, buf in zip(sinks, buffers):
+        if realized(node).op is not Op.BUFFER:
+            node.op, node.srcs, node.arg = Op.BUFFER, (), buf
     return buffers
 
 

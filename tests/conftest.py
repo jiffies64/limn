@@ -23,9 +23,12 @@ def check(dev, t: Tensor, rtol: float = 1e-5, atol: float = 1e-5, exact: bool = 
     exact is for the dtypes whose arithmetic is bit-defined on every device, like the ints
     wrapping modulo 2**width. float16 results are compared as float32, since comparing in half
     rounds the comparison itself.
+
+    The device under test runs first: .numpy() realizes, and realize retires the sink to a
+    buffer, so the other order would hand `dev` the reference's bytes and diff nothing.
     """
-    expected = t.numpy()
     got = dev.copyout(dev.execute([t.node])[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
+    expected = t.numpy()
     if exact:
         np.testing.assert_array_equal(got, expected)
         return
