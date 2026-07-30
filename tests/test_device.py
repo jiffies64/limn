@@ -8,14 +8,6 @@ from limn.backend_c import has_cc
 from limn.ops import Op
 
 
-@pytest.fixture(autouse=True)
-def numpy_device():
-    """Every test here may switch devices; none of them may leak that to the next file."""
-    set_device("numpy")
-    yield
-    set_device("numpy")
-
-
 def test_assign_invalidates_results_cached_before_it():
     """An interior value the interpreter cached must not survive an assign to what it read.
 

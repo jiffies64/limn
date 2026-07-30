@@ -145,6 +145,7 @@ def main() -> None:
         loss = cross_entropy(model(x, mask), y)
         loss.backward()
         opt.step(loss)  # the loss realizes with the updates, so logging it costs no second forward
+        opt.zero_grad()  # once recorded the function never runs again; leave no gradient graphs behind
         return loss
 
     start = time.perf_counter()
