@@ -19,6 +19,10 @@ Plans, and the compiled programs behind them, live for the process and are never
 the intended workload is fixed shapes, where the caches converge after the first step. A
 workload with unboundedly many distinct graph structures (say, ragged sequence lengths)
 grows them without bound; bucket or pad shapes instead.
+
+capture sits on top: plan caching removes the compile from steps after the first, but every
+step still rebuilds its graph in Python and walks it to find the cached plan. A captured
+step skips that too, replaying the recorded kernel calls against fresh argument buffers.
 """
 
 from __future__ import annotations
@@ -26,7 +30,9 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
+from limn import device
 from limn.codegen import LoopNest, lower_all
 from limn.device import Buffer
 from limn.ops import Node, Op, topological
@@ -74,11 +80,27 @@ class Plan:
     sinks: tuple[int, ...]  # realized() resolved to positions, so alias chains are walked once
 
 
+@dataclass(frozen=True, slots=True)
+class Recording:
+    """One execute() as a replay needs it: the plan, its position count, and the live buffers.
+
+    `bound` holds each BUFFER position's bytes as the node carried them, before prepare() may
+    have migrated a copy; that is the same buffer a commit would target. `outs` is what the
+    call handed back for its sinks, which is how capture ties a returned tensor to a position.
+    """
+
+    plan: Plan
+    positions: int
+    bound: tuple[Buffer, ...]  # one per plan.buffers entry
+    outs: tuple[Buffer, ...]  # one per plan.sinks entry
+
+
 class CompiledDevice:
     """Plan-cached execution over backend hooks; alloc/copyin/copyout still come from Device."""
 
     def __init__(self) -> None:
         self.plans: dict[tuple, Plan] = {}
+        self.record: list[Recording] | None = None  # set by capture while it observes a call
 
     # ---- what a backend implements ----
 
@@ -130,7 +152,10 @@ class CompiledDevice:
             self.commit(order[p].arg, value)
             bufs[p] = value
         self.finish()
-        return [bufs[p] for p in plan.sinks]
+        outs = [bufs[p] for p in plan.sinks]
+        if self.record is not None:
+            self.record.append(Recording(plan, len(order), tuple(order[p].arg for p in plan.buffers), tuple(outs)))
+        return outs
 
     def plan_of(self, order: list[Node], position: dict[Node, int], sinks: list[Node]) -> Plan:
         """Lower, compile and wire up these sinks' kernels by position instead of by node."""
@@ -152,3 +177,152 @@ class CompiledDevice:
             tuple(p for p, node in enumerate(order) if node.op is Op.BUFFER),
             tuple(position[realized(sink)] for sink in sinks),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Step:
+    """One recorded execute(), rewired for replay: where every buffer comes from, what to repoint."""
+
+    plan: Plan
+    positions: int
+    args_at: tuple[tuple[int, int], ...]  # (position, index into the call's arguments)
+    held_at: tuple[tuple[int, Buffer], ...]  # (position, the buffer captured there)
+    rebinds: tuple[tuple[Node, int], ...]  # (a returned tensor's node, its index into plan.sinks)
+
+
+class capture:
+    """Record what a step function makes the device do, then replay that without running it.
+
+    Wraps a function whose tensor arguments are the only thing that changes call to call (the
+    data batch of a training step), while everything else it touches lives in buffers updated
+    in place (parameters, optimizer state). The first two calls run the function normally and
+    must build the same graph; the second one is recorded. Every later call skips the function,
+    and with it all graph building, autograd bookkeeping and plan lookup: the recorded kernels
+    run against the new arguments' buffers, assigns commit to the same state buffers, and the
+    recorded return tensors are repointed at the fresh results.
+
+    Everything else is baked in at record time. A python value that varies between calls (a
+    learning rate schedule, a step counter) freezes at its recorded value; keep such state in
+    tensors the graph advances, as AdamW keeps beta**t. The function must realize whatever it
+    returns (pass a loss to Optimizer.step, or call realize()), and takes only tensor
+    arguments, all of the recorded shapes and dtypes.
+
+    On a device that interprets graphs instead of compiling plans (numpy), there is nothing to
+    replay and the function simply runs every call.
+    """
+
+    def __init__(self, fn: Callable[..., Any]):
+        self.fn = fn
+        self.first: tuple | None = None  # the first call's wiring, held until the second confirms it
+        self.steps: list[Step] | None = None
+        self.argspec: tuple = ()
+        self.result: Any = None
+
+    def __call__(self, *args: Any) -> Any:
+        dev = device.active()
+        if not isinstance(dev, CompiledDevice):
+            return self.fn(*args)
+        if self.steps is not None:
+            return self.replay(dev, self.checked(args))
+        return self.observe(dev, args)
+
+    def observe(self, dev: CompiledDevice, args: tuple) -> Any:
+        from limn.tensor import Tensor
+
+        for t in args:
+            if not isinstance(t, Tensor) or t.node.op is not Op.BUFFER:
+                raise ValueError("capture takes realized, buffer-backed tensors as arguments")
+        if dev.record is not None:
+            raise ValueError("capture does not nest")
+        record: list[Recording] = []
+        dev.record = record
+        try:
+            out = self.fn(*args)
+        finally:
+            dev.record = None
+        if not record:
+            raise ValueError("the captured function realized nothing, so there is no work to replay")
+        wired = self.wired(record, args)
+        signature = tuple((id(rec.plan), args_at, tuple(p for p, _ in held_at)) for rec, args_at, held_at in wired)
+        if self.first is None:
+            # the first call settles one-time work (first realizes, lazy state); the second is
+            # compared against it, so a graph that changes call to call is refused, not replayed
+            self.first = signature
+            return out
+        if signature != self.first:
+            raise ValueError("the captured function built a different graph on its second call; capture needs a fixed graph")
+        rebinds = self.rebinds_of(out, record)
+        self.steps = [
+            Step(rec.plan, rec.positions, args_at, held_at, rebind) for (rec, args_at, held_at), rebind in zip(wired, rebinds)
+        ]
+        self.argspec = tuple((t.shape, t.dtype) for t in args)
+        self.result = out
+        return out
+
+    def wired(self, record: list[Recording], args: tuple) -> list[tuple[Recording, tuple, tuple]]:
+        """Split each recording's buffers into argument slots and captured ones, by identity."""
+        owner: dict[int, int] = {}
+        for i, t in enumerate(args):
+            owner.setdefault(id(t.node.arg), i)
+        wired = []
+        for rec in record:
+            args_at, held_at = [], []
+            for p, buf in zip(rec.plan.buffers, rec.bound):
+                if id(buf) in owner:
+                    args_at.append((p, owner[id(buf)]))
+                else:
+                    held_at.append((p, buf))
+            wired.append((rec, tuple(args_at), tuple(held_at)))
+        return wired
+
+    def rebinds_of(self, out: Any, record: list[Recording]) -> list[tuple[tuple[Node, int], ...]]:
+        """Where each returned tensor's bytes came from, so replays can point it at fresh ones.
+
+        A returned tensor whose buffer is not among any recording's outs is an in-place target
+        (an assign's), which every replay refreshes anyway; it needs no repointing.
+        """
+        from limn.tensor import Tensor
+
+        tensors = [out] if out is not None and not isinstance(out, (tuple, list)) else list(out or [])
+        rebinds: list[list[tuple[Node, int]]] = [[] for _ in record]
+        for t in tensors:
+            if not isinstance(t, Tensor):
+                raise ValueError(f"a captured function may return tensors only, got {type(t).__name__}")
+            if t.node.op is not Op.BUFFER:
+                raise ValueError("a captured function must realize what it returns; pass it to Optimizer.step or realize()")
+            for j in reversed(range(len(record))):
+                hits = [i for i, b in enumerate(record[j].outs) if b is t.node.arg]
+                if hits:
+                    rebinds[j].append((t.node, hits[-1]))
+                    break
+        return [tuple(r) for r in rebinds]
+
+    def checked(self, args: tuple) -> tuple:
+        spec = tuple((getattr(t, "shape", None), getattr(t, "dtype", None)) for t in args)
+        if spec != self.argspec:
+            raise ValueError(f"capture recorded arguments {self.argspec}, this call passed {spec}")
+        return args
+
+    def replay(self, dev: CompiledDevice, args: tuple) -> Any:
+        assert self.steps is not None
+        for step in self.steps:
+            plan = step.plan
+            originals: dict[int, Buffer] = {p: args[i].node.arg for p, i in step.args_at}
+            originals.update(step.held_at)
+            bufs: list[Buffer] = [None] * step.positions
+            for p, buf in originals.items():
+                bufs[p] = dev.prepare(buf)
+            deferred: list[tuple[int, Buffer]] = []
+            for call in plan.calls:
+                out = dev.out_alloc(call.out_nbytes, call.zero_fill)
+                call.fn([bufs[p] for p in call.inputs], out)
+                bufs[call.output] = out
+                if call.assign_target is not None:
+                    deferred.append((call.assign_target, out))
+            for p, value in deferred:
+                dev.commit(originals[p], value)
+                bufs[p] = value
+            dev.finish()
+            for node, i in step.rebinds:
+                node.arg = bufs[plan.sinks[i]]
+        return self.result
