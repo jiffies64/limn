@@ -7,30 +7,19 @@ gradients and optimizer state instead of rounding through float32 somewhere on t
 
 import numpy as np
 import pytest
-from conftest import GRAPHS
+from conftest import GRAPHS, cdev, check, cudev, needs_cc, needs_cuda
 
 from limn import Tensor, set_device
-from limn.backend_c import CDevice, has_cc
-from limn.backend_cuda import CudaDevice, has_cuda
-from limn.device import NUMPY_DTYPES
 from limn.ops import float16, float32, float64, int8, int32, promote
 from limn.optim import AdamW
-
-cdev = CDevice() if has_cc() else None
-cudev = CudaDevice() if has_cuda() else None
-needs_cc = pytest.mark.skipif(not has_cc(), reason="no C compiler found")
-needs_cuda = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
 
 
 def doubles(*shape: int, seed: int = 0) -> np.ndarray:
     return np.random.default_rng((seed, *shape)).uniform(-2, 2, shape)
 
 
-def check(dev, t: Tensor, rtol: float = 1e-12) -> None:
-    expected = t.numpy()
-    bufs = dev.execute([t.node])
-    got = dev.copyout(bufs[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
-    np.testing.assert_allclose(got, expected, rtol=rtol, atol=1e-12)
+def check64(dev, t: Tensor) -> None:
+    check(dev, t, rtol=1e-12, atol=1e-12)
 
 
 # ---- dtype rules, which hold on every device ----
@@ -120,14 +109,14 @@ def test_double_round_trips_and_is_eight_bytes():
 @pytest.mark.parametrize("name", list(GRAPHS))
 def test_c_double_matches_numpy_device(name):
     a, b = Tensor(doubles(3, 4), dtype=float64), Tensor(doubles(3, 4, seed=1), dtype=float64)
-    check(cdev, GRAPHS[name](a, b))
+    check64(cdev, GRAPHS[name](a, b))
 
 
 @needs_cuda
 @pytest.mark.parametrize("name", list(GRAPHS))
 def test_cuda_double_matches_numpy_device(name):
     a, b = Tensor(doubles(3, 4), dtype=float64), Tensor(doubles(3, 4, seed=1), dtype=float64)
-    check(cudev, GRAPHS[name](a, b))
+    check64(cudev, GRAPHS[name](a, b))
 
 
 @needs_cuda
@@ -136,14 +125,14 @@ def test_cuda_double_matmul_matches_numpy_device(shape):
     """Big enough to be tiled, and one shape no tile divides, so the tails are covered too."""
     m, k, n = shape
     a, b = Tensor(doubles(m, k), dtype=float64), Tensor(doubles(k, n, seed=1), dtype=float64)
-    check(cudev, a @ b)
-    check(cudev, a @ Tensor(doubles(n, k, seed=2), dtype=float64).transpose())
+    check64(cudev, a @ b)
+    check64(cudev, a @ Tensor(doubles(n, k, seed=2), dtype=float64).transpose())
 
 
 @needs_cuda
 def test_cuda_double_split_reduce_matches_numpy_device():
     """Few cells over a long reduce runs as two kernels; the partials stay double throughout."""
-    check(cudev, Tensor(doubles(1 << 18), dtype=float64).sum(), rtol=1e-12)
+    check64(cudev, Tensor(doubles(1 << 18), dtype=float64).sum())
 
 
 @needs_cuda

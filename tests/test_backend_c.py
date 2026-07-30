@@ -5,7 +5,7 @@ from unittest import mock
 
 import numpy as np
 import pytest
-from conftest import GRAPHS, randf
+from conftest import GRAPHS, cdev, check, randf
 
 import limn.backend_c as backend_c
 from limn import Tensor, set_device, set_seed
@@ -17,14 +17,9 @@ from limn.ops import Op
 
 pytestmark = pytest.mark.skipif(not has_cc(), reason="no C compiler found")
 
-cdev = CDevice()
 
-
-def check_c(t: Tensor, dev: CDevice = cdev) -> None:
-    expected = t.numpy()
-    bufs = dev.execute([t.node])
-    got = bufs[0].view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
-    np.testing.assert_allclose(got, expected, atol=1e-5, rtol=1e-5)
+def check_c(t: Tensor, dev: CDevice | None = None) -> None:
+    check(dev or cdev, t)
 
 
 @pytest.mark.parametrize("name", list(GRAPHS))
@@ -53,7 +48,7 @@ def test_assign_deferred():
     p = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
     expected = p.numpy() * 2.0 + 1.0
     p.assign(p * 2.0 + 1.0)
-    bufs = cdev.execute([p.node])
+    bufs = CDevice().execute([p.node])
     got = bufs[0].view(NUMPY_DTYPES[p.dtype]).reshape(p.shape)
     np.testing.assert_allclose(got, expected, atol=1e-6)
 
@@ -63,7 +58,7 @@ def test_assign_deferral_reads_pre_assign_bytes():
     p = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
     old_value = p * 10.0
     p.assign(p + 100.0)
-    bufs = cdev.execute([old_value.node, p.node])
+    bufs = CDevice().execute([old_value.node, p.node])
     got_old = bufs[0].view(NUMPY_DTYPES[old_value.dtype]).reshape(old_value.shape)
     got_new = bufs[1].view(NUMPY_DTYPES[p.dtype]).reshape(p.shape)
     np.testing.assert_allclose(got_old, np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32))
@@ -75,7 +70,7 @@ def test_assign_consumed_as_value():
     p = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
     p.assign(p * 2.0)
     consumer = p + 1.0
-    bufs = cdev.execute([consumer.node])
+    bufs = CDevice().execute([consumer.node])
     got = bufs[0].view(NUMPY_DTYPES[consumer.dtype]).reshape(consumer.shape)
     np.testing.assert_allclose(got, np.array([[3.0, 5.0], [7.0, 9.0]], dtype=np.float32))
 
@@ -84,6 +79,7 @@ def test_sgd_momentum_step():
     """SGD with momentum builds assign-then-read-through graphs (optim.py's v.assign, g = v)."""
     from limn.optim import SGD
 
+    dev = CDevice()
     p = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32), requires_grad=True)
     p.grad = Tensor(np.ones((2, 2), dtype=np.float32))
     opt = SGD([p], lr=0.1, momentum=0.9)
@@ -91,14 +87,14 @@ def test_sgd_momentum_step():
     expected_p = p.numpy() - 0.1 * np.ones((2, 2), dtype=np.float32)
     opt.step()
 
-    bufs = cdev.execute([p.node])
+    bufs = dev.execute([p.node])
     got = bufs[0].view(NUMPY_DTYPES[p.dtype]).reshape(p.shape)
     np.testing.assert_allclose(got, expected_p, atol=1e-6)
 
     p.grad = Tensor(np.ones((2, 2), dtype=np.float32))
     expected_p2 = p.numpy() - 0.1 * (0.9 * np.ones((2, 2)) + np.ones((2, 2)))
     opt.step()
-    bufs = cdev.execute([p.node])
+    bufs = dev.execute([p.node])
     got2 = bufs[0].view(NUMPY_DTYPES[p.dtype]).reshape(p.shape)
     np.testing.assert_allclose(got2, expected_p2, atol=1e-6)
 
