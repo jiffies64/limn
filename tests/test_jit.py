@@ -44,6 +44,53 @@ def test_captured_steps_match_plain_steps_bit_for_bit():
 
 
 @needs_cc
+def test_a_mid_call_realize_feeds_later_kernels_fresh_bytes():
+    """A value realized partway through the call re-enters later plans as a buffer input; a
+    replay must serve that replay's bytes there, not the recorded call's."""
+    set_device("c")
+    w = Tensor(randf(4))
+
+    def step(x: Tensor) -> Tensor:
+        h = (x * 2.0).realize()
+        return (h + w).sum().realize()
+
+    data = [randf(4) for _ in range(5)]
+    plain = [step(Tensor(d)).item() for d in data]
+    fn = capture(step)
+    assert [fn(Tensor(d)).item() for d in data] == plain
+
+
+@needs_cc
+def test_each_replay_returns_its_own_tensor():
+    set_device("c")
+
+    def step(x: Tensor) -> Tensor:
+        return (x + 1.0).sum().realize()
+
+    fn = capture(step)
+    fn(Tensor(randf(4)))
+    fn(Tensor(randf(4)))
+    third = fn(Tensor(np.full(4, 1.0, dtype=np.float32)))
+    fourth = fn(Tensor(np.full(4, 2.0, dtype=np.float32)))
+    assert third is not fourth
+    assert (third.item(), fourth.item()) == (8.0, 12.0)  # the earlier reading survives the later replay
+
+
+@needs_cc
+def test_replay_rejects_an_unrealized_argument():
+    set_device("c")
+
+    def step(x: Tensor) -> Tensor:
+        return (x * 2.0).sum().realize()
+
+    fn = capture(step)
+    fn(Tensor(randf(4)))
+    fn(Tensor(randf(4)))
+    with pytest.raises(ValueError, match="buffer-backed"):
+        fn(Tensor(randf(4)) + 1.0)
+
+
+@needs_cc
 def test_replay_rejects_arguments_of_another_shape():
     set_device("c")
 

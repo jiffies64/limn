@@ -188,12 +188,12 @@ class CompiledDevice:
 
 @dataclass(frozen=True, slots=True)
 class Step:
-    """One recorded execute(), rewired for replay: where every buffer comes from, what to repoint."""
+    """One recorded execute(), rewired for replay: where every one of its buffers comes from."""
 
     plan: Plan
     args_at: tuple[tuple[int, int], ...]  # (position, index into the call's arguments)
+    outs_at: tuple[tuple[int, int, int], ...]  # (position, earlier step, index into that step's outs)
     held_at: tuple[tuple[int, Buffer], ...]  # (position, the buffer captured there)
-    rebinds: tuple[tuple[Node, int], ...]  # (a returned tensor's node, its index into the run's outs)
 
 
 class capture:
@@ -204,8 +204,11 @@ class capture:
     in place (parameters, optimizer state). The first two calls run the function normally and
     must build the same graph; the second one is recorded. Every later call skips the function,
     and with it all graph building, autograd bookkeeping and plan lookup: the recorded kernels
-    run against the new arguments' buffers, assigns commit to the same state buffers, and the
-    recorded return tensors are repointed at the fresh results.
+    run against the new arguments' buffers, assigns commit to the same state buffers, and a
+    value the function realized mid-call and computed on feeds the later kernels that replay's
+    fresh bytes. Each replay returns its own tensors over its own results, so readings kept
+    from different replays do not alias; a returned in-place target (a parameter) is the
+    parameter itself, as it is on a plain call.
 
     Everything else is baked in at record time. A python value that varies between calls (a
     learning rate schedule, a step counter) freezes at its recorded value; keep such state in
@@ -226,7 +229,8 @@ class capture:
         self.first: tuple | None = None  # the first call's wiring, held until the second confirms it
         self.steps: list[Step] | None = None
         self.argspec: tuple = ()
-        self.result: Any = None
+        self.result: Any = None  # the recorded return structure; replays rebuild it over their own outs
+        self.result_at: dict[int, tuple[int, int]] = {}  # id of a returned tensor -> (step, out index)
 
     def __call__(self, *args: Any) -> Any:
         dev = device.active()
@@ -252,8 +256,8 @@ class capture:
             dev.record = None
         if not record:
             raise ValueError("the captured function realized nothing, so there is no work to replay")
-        wired = self.wired(record, args)
-        signature = tuple((id(rec.plan), args_at) for rec, (args_at, _) in zip(record, wired))
+        wired, produced = self.wired(record, args)
+        signature = tuple((id(rec.plan), args_at, outs_at) for rec, (args_at, outs_at, _) in zip(record, wired))
         if self.first is None:
             # the first call settles one-time work (first realizes, lazy state); the second is
             # compared against it, so a graph that changes call to call is refused, not replayed
@@ -262,36 +266,44 @@ class capture:
         if signature != self.first:
             raise ValueError("the captured function built a different graph on its second call; capture needs a fixed graph")
         tensors = self.returned(out)
-        self.steps = [
-            Step(rec.plan, args_at, held_at, rebind)
-            for rec, (args_at, held_at), rebind in zip(record, wired, self.rebinds_of(tensors, record))
-        ]
+        self.steps = [Step(rec.plan, *wiring) for rec, wiring in zip(record, wired)]
         self.argspec = tuple((t.shape, t.dtype) for t in args)
+        # a returned tensor whose buffer no recording produced is an in-place target (an
+        # assign's), refreshed by every replay's commits; it is handed back as itself
+        self.result_at = {id(t): spot for t in tensors if (spot := produced.get(id(t.node.arg))) is not None}
         for t in tensors:
-            # replay touches only node.arg; the autograd record would pin the observed call's
-            # whole graph (every intermediate tensor and its closure) for the capture's life
+            # replays only read shape and dtype off these; the autograd record would pin the
+            # observed call's whole graph (every intermediate tensor and closure) for the
+            # capture's life
             t.requires_grad, t.parents, t.grad_fn = False, (), None
         self.result = out
         return out
 
-    def wired(self, record: list[Recording], args: tuple) -> list[tuple[tuple, tuple]]:
-        """Split each recording's buffers into (argument slots, captured ones), by identity."""
+    def wired(self, record: list[Recording], args: tuple) -> tuple[list[tuple], dict[int, tuple[int, int]]]:
+        """Where each recording's buffers come from, by identity: the call's arguments, an
+        earlier recording's outs (a value the function realized mid-call and computed on), or
+        bytes that only update in place and can be captured as they are. Also returns the
+        finished producer map, which is how returned tensors find their outs."""
         owner: dict[int, int] = {}
         for i, t in enumerate(args):
             owner.setdefault(id(t.node.arg), i)
+        produced: dict[int, tuple[int, int]] = {}
         wired = []
-        for rec in record:
-            args_at, held_at = [], []
+        for k, rec in enumerate(record):
+            args_at, outs_at, held_at = [], [], []
             for p, buf in zip(rec.plan.buffers, rec.bound):
                 if id(buf) in owner:
                     args_at.append((p, owner[id(buf)]))
+                elif id(buf) in produced:
+                    outs_at.append((p, *produced[id(buf)]))
                 else:
                     held_at.append((p, buf))
-            wired.append((tuple(args_at), tuple(held_at)))
-        return wired
+            wired.append((tuple(args_at), tuple(outs_at), tuple(held_at)))
+            produced.update({id(b): (k, i) for i, b in enumerate(rec.outs)})  # a later producer wins
+        return wired, produced
 
     def returned(self, out: Any) -> list:
-        """The tensors the function handed back, each realized so replays have bytes to repoint."""
+        """The tensors the function handed back, each realized so replays have bytes to serve."""
         from limn.tensor import Tensor
 
         tensors = [out] if out is not None and not isinstance(out, (tuple, list)) else list(out or [])
@@ -302,30 +314,30 @@ class capture:
                 raise ValueError("a captured function must realize what it returns; pass it to Optimizer.step or realize()")
         return tensors
 
-    def rebinds_of(self, tensors: list, record: list[Recording]) -> list[tuple[tuple[Node, int], ...]]:
-        """Where each returned tensor's bytes came from, so replays can point it at fresh ones.
-
-        A returned tensor whose buffer is not among any recording's outs is an in-place target
-        (an assign's), which every replay refreshes anyway; it needs no repointing.
-        """
-        where = {id(b): (j, i) for j, rec in enumerate(record) for i, b in enumerate(rec.outs)}  # later writes win
-        rebinds: list[list[tuple[Node, int]]] = [[] for _ in record]
-        for t in tensors:
-            spot = where.get(id(t.node.arg))
-            if spot is not None:
-                j, i = spot
-                rebinds[j].append((t.node, i))
-        return [tuple(r) for r in rebinds]
-
     def replay(self, dev: CompiledDevice, args: tuple) -> Any:
+        from limn.tensor import Tensor
+
         assert self.steps is not None
-        spec = tuple((getattr(t, "shape", None), getattr(t, "dtype", None)) for t in args)
+        for t in args:
+            if not isinstance(t, Tensor) or t.node.op is not Op.BUFFER:
+                raise ValueError("capture takes realized, buffer-backed tensors as arguments")
+        spec = tuple((t.shape, t.dtype) for t in args)
         if spec != self.argspec:
             raise ValueError(f"capture recorded arguments {self.argspec}, this call passed {spec}")
+        history: list[list[Buffer]] = []
         for step in self.steps:
             sources: dict[int, Buffer] = {p: args[i].node.arg for p, i in step.args_at}
+            sources.update((p, history[j][i]) for p, j, i in step.outs_at)
             sources.update(step.held_at)
-            outs = dev.run(step.plan, sources)
-            for node, i in step.rebinds:
-                node.arg = outs[i]
-        return self.result
+            history.append(dev.run(step.plan, sources))
+
+        def remade(t: Any) -> Any:
+            spot = self.result_at.get(id(t))
+            if spot is None:
+                return t
+            j, i = spot
+            return Tensor.from_node(Node(Op.BUFFER, (), t.node.dtype, t.node.shape, history[j][i]))
+
+        if isinstance(self.result, (tuple, list)):
+            return type(self.result)(remade(t) for t in self.result)
+        return remade(self.result)
