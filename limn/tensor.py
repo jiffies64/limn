@@ -5,8 +5,9 @@ hands the graph to the active device. Autograd lives at this layer: each op-crea
 remembers its parent Tensors (`parents`) and a closure (`grad_fn`) that turns the output
 gradient into parent gradients, themselves lazy Tensors. backward() walks that record in
 reverse topological order. Composed ops (matmul, softmax, ...) get their gradients for free
-from the pieces. Everything in this module is fair game for the rest of limn; the public
-surface is whatever __init__.py re-exports.
+from the pieces, and since the closures build ordinary recorded Tensors, a gradient built
+with create_graph=True can be differentiated again (grad() below). Everything in this module
+is fair game for the rest of limn; the public surface is whatever __init__.py re-exports.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import math
 import operator
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import EllipsisType
 from typing import SupportsIndex
 
@@ -503,30 +504,63 @@ class Tensor:
 
     # ---- autograd ----
 
-    def backward(self) -> None:
-        if self.numel != 1:
-            raise ValueError(f"backward() needs a scalar, got shape {self.shape}")
-        if self.dtype not in FLOATS or not self.requires_grad:
-            raise ValueError("backward() needs a float tensor with requires_grad=True")
-        sinks: list[Tensor] = [self]
-        order = topological(sinks, lambda t: [p for p in t.parents if p.requires_grad])
-        grads: dict[int, Tensor] = {id(self): Tensor.const(1.0, self.dtype).reshape(*self.shape)}
-        with no_grad():
-            for t in reversed(order):
-                g = grads.pop(id(t), None)
-                if g is None:
-                    continue
-                if t.grad_fn is None:  # a leaf: accumulate into .grad
-                    t.grad = g if t.grad is None else t.grad + g
-                    continue
-                for parent, pg in zip(t.parents, t.grad_fn(g), strict=True):
-                    if pg is None or not parent.requires_grad:
-                        continue
-                    prior = grads.get(id(parent))
-                    grads[id(parent)] = pg if prior is None else prior + pg
+    def backward(self, create_graph: bool = False) -> None:
+        """Accumulate this scalar's gradient into .grad of every leaf it reaches.
+
+        create_graph keeps the gradient arithmetic on the autograd record, so what lands in
+        .grad can be differentiated again. Second derivatives usually want grad() instead: a
+        second backward() would fold them into the same .grad fields as the first.
+        """
+        for t, g in gradients(self, create_graph):
+            if t.grad_fn is None:  # a leaf: accumulate into .grad
+                t.grad = g if t.grad is None else t.grad + g
 
 
 # ---- module-level helpers ----
+
+
+def gradients(output: Tensor, create_graph: bool) -> list[tuple[Tensor, Tensor]]:
+    """Reverse-mode walk from a scalar: every reachable (tensor, gradient) pair, consumers first.
+
+    A pair is final when it appears; reverse topological order means every consumer has already
+    contributed by then. The gradients are built under no_grad unless create_graph asks for them
+    to carry autograd records of their own.
+    """
+    if output.numel != 1:
+        raise ValueError(f"gradients need a scalar, got shape {output.shape}")
+    if output.dtype not in FLOATS or not output.requires_grad:
+        raise ValueError("gradients need a float tensor with requires_grad=True")
+    order = topological([output], lambda t: [p for p in t.parents if p.requires_grad])
+    grads: dict[int, Tensor] = {id(output): Tensor.const(1.0, output.dtype).reshape(*output.shape)}
+    results: list[tuple[Tensor, Tensor]] = []
+    with nullcontext() if create_graph else no_grad():
+        for t in reversed(order):
+            g = grads.pop(id(t), None)
+            if g is None:
+                continue
+            results.append((t, g))
+            if t.grad_fn is None:
+                continue
+            for parent, pg in zip(t.parents, t.grad_fn(g), strict=True):
+                if pg is None or not parent.requires_grad:
+                    continue
+                prior = grads.get(id(parent))
+                grads[id(parent)] = pg if prior is None else prior + pg
+    return results
+
+
+def grad(output: Tensor, inputs: Sequence[Tensor], create_graph: bool = False) -> list[Tensor]:
+    """d output / d input for each input, as lazy Tensors; no .grad field is touched anywhere.
+
+    create_graph keeps the results differentiable, which is how second derivatives compose:
+    grad(grad(loss, [w], create_graph=True)[0].sum(), [w]). An input the output never used has
+    no gradient, not a zero one, and raises.
+    """
+    got = {id(t): g for t, g in gradients(output, create_graph)}
+    for i, t in enumerate(inputs):
+        if id(t) not in got:
+            raise ValueError(f"grad: output does not depend on inputs[{i}]")
+    return [got[id(t)] for t in inputs]
 
 
 def realize(*tensors: Tensor) -> list[device.Buffer]:
@@ -557,14 +591,11 @@ def scatter_rows(values: Tensor, indices: Tensor, shape: tuple[int, ...]) -> Ten
     Module-level rather than a Tensor method because the result's shape comes from an argument
     instead of a receiver. A public scatter-add wants the opposite (rows added into a table that
     already exists), and composes as `table + scatter_rows(...)` rather than exposing this.
-
-    It carries no autograd record, like every gradient limn builds: backward() runs under no_grad,
-    so there is no grad-of-grad here or anywhere else. Turning that on would give this parents of
-    (values,) and a gradient of gather_rows(g, indices).
     """
     if values.shape != indices.shape + shape[1:]:
         raise ValueError(f"scatter_rows: values {values.shape} do not match indices {indices.shape} into {shape}")
-    return Tensor.from_node(Node(Op.SCATTER, (indices.node, values.node), values.dtype, shape))
+    node = Node(Op.SCATTER, (indices.node, values.node), values.dtype, shape)
+    return Tensor.from_node(node, (values,), lambda g: (g.gather_rows(indices),))
 
 
 def as_ints(shape: Sequence[int] | tuple) -> tuple[int, ...]:

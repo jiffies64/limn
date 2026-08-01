@@ -7,8 +7,8 @@
 ![Backends: numpy, c and cuda](https://img.shields.io/badge/backends-numpy%20%C2%B7%20c%20%C2%B7%20cuda-555555)
 
 A deep learning framework built to be read. The whole stack is here: lazy tensors over a
-closed set of 19 primitive ops, reverse-mode autograd, a scheduler that fuses the graph into
-kernels, an IR you can print, conv layers, dtypes from int8 to float64, and C and CUDA
+closed set of 19 primitive ops, reverse-mode autograd that can differentiate its own
+gradients, a scheduler that fuses the graph into kernels, an IR you can print, conv layers, dtypes from int8 to float64, and C and CUDA
 backends that JIT-compile it, in about 3,600 lines of Python with numpy as the only runtime
 dependency. In spirit it sits between
 micrograd and tinygrad: small enough to read in one sitting, real enough that a matmul comes
