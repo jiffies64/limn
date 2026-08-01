@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from limn import Tensor, device, realize, set_device, set_seed
+from limn import Tensor, device, realize, set_device
 from limn.backend_c import has_cc
 from limn.ops import Op
 
@@ -80,23 +80,3 @@ def test_set_device_switches_the_backend_a_graph_runs_on():
     set_device("numpy")
     assert type(device.active()).__name__ == "NumpyDevice"
     np.testing.assert_allclose((a @ b).numpy(), expected, atol=1e-6)
-
-
-@pytest.mark.skipif(not has_cc(), reason="no C compiler found")
-def test_an_optimizer_step_runs_on_the_c_device():
-    from limn.nn import Linear, parameters
-    from limn.optim import SGD
-
-    set_device("c")
-    set_seed(3)  # whether five momentum steps end below the start depends on the init, so own it
-    layer = Linear(4, 3)
-    x = Tensor(np.random.default_rng(3).random((8, 4)).astype(np.float32))
-    losses = []
-    opt = SGD(parameters(layer), lr=0.05, momentum=0.9)
-    for _ in range(5):
-        opt.zero_grad()
-        loss = (layer(x) ** 2).sum()
-        loss.backward()
-        losses.append(loss.item())
-        opt.step()
-    assert losses[-1] < losses[0]

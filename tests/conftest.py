@@ -1,21 +1,43 @@
 """Shared test helpers: the devices, the check that diffs them against the numpy reference,
 and the graph corpus every backend and the lowered IR are run through."""
 
+from typing import Any, Callable, NamedTuple
+
 import numpy as np
 import pytest
 
-from limn import set_device
-from limn.backend_c import CDevice, has_cc
-from limn.backend_cuda import CudaDevice, has_cuda
+from limn import backend_c, backend_cuda, set_device
 from limn.device import NUMPY_DTYPES
 from limn.tensor import Tensor
 
 rng = np.random.default_rng(7)
 
-cdev = CDevice() if has_cc() else None
-cudev = CudaDevice() if has_cuda() else None
-needs_cc = pytest.mark.skipif(not has_cc(), reason="no C compiler found")
-needs_cuda = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
+cdev = backend_c.CDevice() if backend_c.has_cc() else None
+cudev = backend_cuda.CudaDevice() if backend_cuda.has_cuda() else None
+needs_cc = pytest.mark.skipif(not backend_c.has_cc(), reason="no C compiler found")
+needs_cuda = pytest.mark.skipif(not backend_cuda.has_cuda(), reason="no CUDA driver, device, or NVRTC found")
+
+
+class Backend(NamedTuple):
+    """One compiled backend, as test_compiled_devices.py and test_dtypes.py need it."""
+
+    name: str  # what set_device takes
+    make: Callable[[], Any]  # a fresh device, for the tests that count how many plans it built
+    shared: Any  # one device for everything else, so a kernel compiles once for the whole session
+    cache: dict  # the backend's compiled-program cache, keyed by source
+    mark: Any  # the skip that says whether this backend can run here
+
+
+BACKENDS = {
+    "c": Backend("c", backend_c.CDevice, cdev, backend_c.cache, needs_cc),
+    "cuda": Backend("cuda", backend_cuda.CudaDevice, cudev, backend_cuda.cache, needs_cuda),
+}
+COMPILED = [pytest.param(backend, id=name, marks=backend.mark) for name, backend in BACKENDS.items()]
+
+
+def read(dev, buf, t: Tensor) -> np.ndarray:
+    """One result buffer as an array of the tensor's dtype and shape."""
+    return dev.copyout(buf).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +58,7 @@ def check(dev, t: Tensor, rtol: float = 1e-5, atol: float = 1e-5, exact: bool = 
     The device under test runs first: .numpy() realizes, and realize retires the sink to a
     buffer, so the other order would hand `dev` the reference's bytes and diff nothing.
     """
-    got = dev.copyout(dev.execute([t.node])[0]).view(NUMPY_DTYPES[t.dtype]).reshape(t.shape)
+    got = read(dev, dev.execute([t.node])[0], t)
     expected = t.numpy()
     if exact:
         np.testing.assert_array_equal(got, expected)
