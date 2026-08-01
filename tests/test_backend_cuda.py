@@ -1,17 +1,19 @@
-"""CUDA backend tests: every graph the numpy device can run, the cuda device must match."""
+"""What is particular to the cuda device: the tiled matmul, the split reduce, the pool, atomics.
+
+Everything a compiled backend owes in general is in test_compiled_devices.py.
+"""
 
 import numpy as np
 import pytest
 from conftest import GRAPHS, check, cudev, randf
 
-from limn import Tensor, set_device
-from limn.backend_cuda import BLOCK, GRID, CudaDevice, cache, has_cuda
-from limn.device import NUMPY_DTYPES
+from limn import Tensor
+from limn.backend_cuda import BLOCK, GRID, CudaDevice, has_cuda
 
 pytestmark = pytest.mark.skipif(not has_cuda(), reason="no CUDA driver, device, or NVRTC found")
 
 
-def check_cuda(t: Tensor, dev: CudaDevice | None = None, tol: float = 1e-5) -> None:
+def check_cuda(t: Tensor, tol: float = 1e-5) -> None:
     """Diff against the numpy device. tol has to grow with how long the graph's reduces are.
 
     numpy sums pairwise and a kernel sums straight down its reduce axis, so the two drift apart
@@ -19,18 +21,7 @@ def check_cuda(t: Tensor, dev: CudaDevice | None = None, tol: float = 1e-5) -> N
     is nothing; over a couple of hundred elements it is not, and a cell that lands near zero by
     cancellation shows it as a large relative difference over a tiny absolute one.
     """
-    check(dev or cudev, t, rtol=tol, atol=tol)
-
-
-@pytest.mark.parametrize("name", list(GRAPHS))
-def test_cuda_matches_numpy_device(name):
-    a, b = Tensor(randf(3, 4)), Tensor(randf(3, 4))
-    check_cuda(GRAPHS[name](a, b))
-
-
-def test_matmul_4x5_5x3():
-    a, b = Tensor(randf(4, 5)), Tensor(randf(5, 3))
-    check_cuda(a @ b)
+    check(cudev, t, rtol=tol, atol=tol)
 
 
 @pytest.mark.parametrize("name", list(GRAPHS))
@@ -56,17 +47,6 @@ def test_batched_matmul_forward_and_backward():
     out.sum().backward()
     check_cuda(a.grad)
     check_cuda(b.grad)
-
-
-def test_backward_pass():
-    x = Tensor(randf(4, 5), requires_grad=True)
-    w = Tensor(randf(5, 3), requires_grad=True)
-    loss = (x @ w).relu().sum()
-    loss.backward()
-    assert x.grad is not None and w.grad is not None
-    check_cuda(loss)
-    check_cuda(w.grad)
-    check_cuda(x.grad)
 
 
 # ---- the tiled matmul: big enough shapes that emit_tiled takes them, unlike the corpus above ----
@@ -130,15 +110,6 @@ def test_int32_elementwise():
     check_cuda((a > 0).where(a, -a))
 
 
-def test_assign_deferred():
-    p = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
-    expected = p.numpy() * 2.0 + 1.0
-    p.assign(p * 2.0 + 1.0)
-    bufs = cudev.execute([p.node])
-    got = cudev.copyout(bufs[0]).view(NUMPY_DTYPES[p.dtype]).reshape(p.shape)
-    np.testing.assert_allclose(got, expected, atol=1e-6)
-
-
 def test_assign_to_a_host_tensor_writes_the_host_bytes_back():
     """These tensors live on the numpy device; the assign must land in their host buffer."""
     p = Tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
@@ -148,99 +119,35 @@ def test_assign_to_a_host_tensor_writes_the_host_bytes_back():
     np.testing.assert_allclose(host, np.array([10.0, 20.0, 30.0], dtype=np.float32))
 
 
-def test_assign_deferral_reads_pre_assign_bytes():
-    p = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
-    old_value = p * 10.0
-    p.assign(p + 100.0)
-    bufs = cudev.execute([old_value.node, p.node])
-    got_old = cudev.copyout(bufs[0]).view(NUMPY_DTYPES[old_value.dtype]).reshape(old_value.shape)
-    got_new = cudev.copyout(bufs[1]).view(NUMPY_DTYPES[p.dtype]).reshape(p.shape)
-    np.testing.assert_allclose(got_old, np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32))
-    np.testing.assert_allclose(got_new, np.array([[101.0, 102.0], [103.0, 104.0]], dtype=np.float32))
-
-
-def test_assign_consumed_as_value():
-    p = Tensor(np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
-    p.assign(p * 2.0)
-    consumer = p + 1.0
-    bufs = cudev.execute([consumer.node])
-    got = cudev.copyout(bufs[0]).view(NUMPY_DTYPES[consumer.dtype]).reshape(consumer.shape)
-    np.testing.assert_allclose(got, np.array([[3.0, 5.0], [7.0, 9.0]], dtype=np.float32))
-
-
-def test_multi_kernel_chain():
-    a, b = Tensor(randf(2, 3)), Tensor(randf(2, 3))
-    check_cuda((a + b).reshape(6) * 2.0)
-
-
-def test_contiguous_copy():
-    a = Tensor(randf(3, 4))
-    check_cuda(a.transpose().reshape(12))
-
-
-def test_shared_subgraph():
-    a, b = Tensor(randf(2, 3)), Tensor(randf(2, 3))
-    shared = (a + b).sum(axis=1, keepdim=True)
-    check_cuda(shared * 2.0)
-    check_cuda(shared * 3.0)
-
-
-def test_gather_rows_forward_and_backward():
-    table = Tensor(randf(6, 4), requires_grad=True)
-    indices = Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32))  # repeats, so the scatter accumulates
-    gathered = table.gather_rows(indices)
-    check_cuda(gathered)
-    (gathered * Tensor(randf(2, 3, 4))).sum().backward()
-    assert table.grad is not None
-    check_cuda(table.grad)
-
-
 def test_scatter_collisions_hit_one_row_atomically():
     """512 gathered rows all name row 2, so 512 threads add into the same cells."""
     table = Tensor(randf(4, 8), requires_grad=True)
     indices = Tensor(np.full(512, 2, dtype=np.int32))
     (table.gather_rows(indices) * Tensor(randf(512, 8))).sum().backward()
-    expected = table.grad.numpy()
-    bufs = cudev.execute([table.grad.node])
-    got = cudev.copyout(bufs[0]).view(np.float32).reshape(4, 8)
-    np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)  # adds land in atomic order, not loop order
+    check_cuda(table.grad, tol=1e-4)  # adds land in atomic order, not loop order
 
 
 def test_a_large_full_sum_splits_and_matches_numpy():
-    data = randf(1 << 22)
-    total = Tensor(data).sum()
-    expected = total.numpy()
-    got = cudev.copyout(cudev.execute([total.node])[0]).view(np.float32)
-    np.testing.assert_allclose(got, expected, rtol=1e-4)  # split grouping reassociates the float adds
+    check(cudev, Tensor(randf(1 << 22)).sum(), rtol=1e-4, atol=0)  # split grouping reassociates the float adds
 
 
 def test_a_large_full_max_is_exact():
-    biggest = Tensor(randf(1 << 22)).max()
-    expected = biggest.numpy()
-    got = cudev.copyout(cudev.execute([biggest.node])[0]).view(np.float32)
-    np.testing.assert_array_equal(got, expected)
+    check(cudev, Tensor(randf(1 << 22)).max(), exact=True)
 
 
 def test_a_large_int_sum_is_exact():
-    values = np.arange(1 << 20, dtype=np.int32)
-    total = Tensor(values).sum()
-    got = cudev.copyout(cudev.execute([total.node])[0]).view(np.int32)
-    np.testing.assert_array_equal(got, values.sum(dtype=np.int32))  # int folds associate modulo 2**32
+    check(cudev, Tensor(np.arange(1 << 20, dtype=np.int32)).sum(), exact=True)  # int folds associate modulo 2**32
 
 
 def test_a_split_reduce_is_deterministic():
     total = Tensor(randf(1 << 20)).sum()
     once = cudev.copyout(cudev.execute([total.node])[0])
-    again = cudev.copyout(cudev.execute([total.node])[0])
-    np.testing.assert_array_equal(once, again)
+    np.testing.assert_array_equal(once, cudev.copyout(cudev.execute([total.node])[0]))
 
 
 def test_a_split_reduce_with_a_fused_and_masked_body():
     x = Tensor(randf(100_000))
-    r = (x * 2.0 + 1.0).pad(((3, 5),)).sum()
-    expected = r.numpy()
-    got = cudev.copyout(cudev.execute([r.node])[0]).view(np.float32)
-    np.testing.assert_allclose(got, expected, rtol=1e-4)
+    check(cudev, (x * 2.0 + 1.0).pad(((3, 5),)).sum(), rtol=1e-4, atol=0)
 
 
 def test_the_pool_recycles_dropped_buffers():
@@ -254,63 +161,3 @@ def test_the_pool_recycles_dropped_buffers():
     dev.trim()
     assert not dev.pool
     assert dev._alloc(1024).ptr != 0
-
-
-def test_a_repeated_graph_reuses_the_plan_and_reads_fresh_bytes():
-    dev = CudaDevice()
-    for x in (randf(3, 4), randf(3, 4)):
-        check_cuda((Tensor(x) * 2.0).sum(axis=1), dev)
-    assert len(dev.plans) == 1
-
-
-def test_a_changed_constant_is_a_different_plan():
-    dev = CudaDevice()
-    x = randf(2, 3)
-    for scale in (2.0, 3.0):
-        check_cuda(Tensor(x) * scale, dev)
-    assert len(dev.plans) == 2
-
-
-def test_a_repeated_assign_commits_through_the_cached_plan():
-    from limn import device
-
-    set_device("cuda")
-    active = device.active()
-    assert isinstance(active, CudaDevice)
-    p = Tensor(np.ones(4, dtype=np.float32))
-    for _ in range(3):
-        p.assign(p * 2.0)
-        p.realize()
-    np.testing.assert_allclose(p.numpy(), np.full(4, 8.0, dtype=np.float32))
-    assert len(active.plans) == 2  # one plan for the assign step, one for numpy()'s read
-
-
-def test_adamw_compiles_one_program_for_all_steps():
-    from limn.optim import AdamW
-
-    set_device("cuda")
-    p = Tensor(np.ones((4, 4), dtype=np.float32), requires_grad=True)
-    opt = AdamW([p], lr=0.1)
-    cache.clear()
-    for _ in range(3):
-        p.grad = Tensor(np.ones((4, 4), dtype=np.float32))
-        opt.step()
-    assert len(cache) == 1, f"{len(cache)} programs compiled for 3 steps"
-
-
-def test_an_optimizer_step_trains_on_cuda():
-    from limn.nn import Linear, parameters
-    from limn.optim import SGD
-
-    set_device("cuda")
-    layer = Linear(4, 3)
-    x = Tensor(np.random.default_rng(3).random((8, 4)).astype(np.float32))
-    losses = []
-    opt = SGD(parameters(layer), lr=0.05, momentum=0.9)
-    for _ in range(5):
-        opt.zero_grad()
-        loss = (layer(x) ** 2).sum()
-        loss.backward()
-        losses.append(loss.item())
-        opt.step()
-    assert losses[-1] < losses[0]
