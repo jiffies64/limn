@@ -266,17 +266,21 @@ def nest_loops(nest: LoopNest) -> tuple[list[tuple[str, int]], list[tuple[str, i
     return outer, reduce_loops
 
 
-def bind_vars(loops: list[tuple[str, int]], flat: str, tmp: str, indent: str) -> list[str]:
-    """Recover loop variables from a flat index, the last one varying fastest."""
+def bind_vars(loops: Sequence[tuple[str, int]], flat: str, tmp: str, indent: str, wide: bool = True) -> list[str]:
+    """Recover loop variables from a flat index, the last one varying fastest.
+
+    wide is for an index that does not fit an int, which a grid-stride gid need not: the scratch
+    is long long and each variable is narrowed on the way out of it.
+    """
     if not loops:
         return []
+    cast, scratch = ("(int)", "long long") if wide else ("", "int")
     if len(loops) == 1:
-        return [f"{indent}const int {loops[0][0]} = (int)({flat});"]
-    lines = [f"{indent}long long {tmp} = {flat};"]
+        return [f"{indent}const int {loops[0][0]} = {cast}({flat});"]
+    lines = [f"{indent}{scratch} {tmp} = {flat};"]
     for var, bound in reversed(loops[1:]):
-        lines.append(f"{indent}const int {var} = (int)({tmp} % {bound}); {tmp} /= {bound};")
-    lines.append(f"{indent}const int {loops[0][0]} = (int)({tmp});")
-    return lines
+        lines.append(f"{indent}const int {var} = {cast}({tmp} % {bound}); {tmp} /= {bound};")
+    return lines + [f"{indent}const int {loops[0][0]} = {cast}({tmp});"]
 
 
 def grid_stride(extent: int) -> str:
@@ -326,33 +330,24 @@ def emit_split(nest: LoopNest, partials: int) -> str:
     ctype = CUDA_VALUE[wide]
     cells = outer_extent(nest)
 
-    lines = [kernel_sig(part_name(nest), [node.dtype for node in kernel.inputs], wide)]
-    lines.append(grid_stride(cells * partials))
+    start = f"    {ctype} acc = {c_literal(folded.identity, folded.dtype)};"
+
+    lines = [kernel_sig(part_name(nest), [node.dtype for node in kernel.inputs], wide), grid_stride(cells * partials)]
     # the cell is the fast half of gid, so neighbouring threads hold neighbouring cells and read
     # the same element of each: whatever stride-1 axis the cells span, a warp still walks it
     lines.append(f"    const int p = (int)(gid / {cells});")
     lines += bind_vars(outer, f"gid % {cells}", "t", "    ")
-    lines.append(f"    {ctype} acc = {c_literal(folded.identity, folded.dtype)};")
-    lines.append(f"    for (long long j = p; j < {reduce_extent(nest)}LL; j += {partials}) {{")
+    lines += [start, f"    for (long long j = p; j < {reduce_extent(nest)}LL; j += {partials}) {{"]
     lines += bind_vars(loops, "j", "u", "      ")
     lines += [value_cuda(instr, "      ") for instr in folded.body]
-    lines.append("      " + fold_c(folded.fold, "acc", folded.value))
-    lines.append("    }")
-    lines.append("    out[gid] = acc;")  # gid is p * cells + cell: the layout the fold kernel reads
-    lines.append("  }")
-    lines.append("}")
+    # gid is p * cells + cell, which is the layout the fold kernel below reads
+    lines += ["      " + fold_c(folded.fold, "acc", folded.value), "    }", "    out[gid] = acc;", "  }", "}"]
 
-    lines.append("")
-    lines.append(kernel_sig(nest.name, [wide], folded.dtype))
-    lines.append(grid_stride(cells))
+    lines += ["", kernel_sig(nest.name, [wide], folded.dtype), grid_stride(cells)]
     lines += bind_vars(outer, "gid", "t", "    ")
-    lines.append(f"    {ctype} acc = {c_literal(folded.identity, folded.dtype)};")
-    lines.append(f"    for (int p = 0; p < {partials}; p++) {{")
-    lines.append("      " + fold_c(folded.fold, "acc", f"in0[p * {cells} + gid]"))
-    lines.append("    }")
-    lines.append(f"    out[{folded.out.render()}] = acc;")
-    lines.append("  }")
-    lines.append("}")
+    lines += [start, f"    for (int p = 0; p < {partials}; p++) {{"]
+    lines += ["      " + fold_c(folded.fold, "acc", f"in0[p * {cells} + gid]"), "    }"]
+    lines += [f"    out[{folded.out.render()}] = acc;", "  }", "}"]
     return "\n".join(lines)
 
 
@@ -380,6 +375,10 @@ class Matmul:
 
     def extent(self, group: Sequence[str]) -> int:
         return math.prod(self.sizes[var] for var in group)
+
+    def loops(self, group: Sequence[str]) -> list[tuple[str, int]]:
+        """One side's variables as bind_vars takes them: (variable, extent), outermost first."""
+        return [(var, self.sizes[var]) for var in group]
 
     def on_cols(self, load: Instr) -> bool:
         return bool(index_vars(load) & set(self.cols))
@@ -496,18 +495,6 @@ def tile_count(mm: Matmul, spec: TileSpec) -> int:
     return mm.extent(mm.batch) * row_blocks * col_blocks
 
 
-def unpack(group: Sequence[str], sizes: Mapping[str, int], fused: str, indent: str, tmp: str) -> list[str]:
-    """Bind a side's loop variables from one fused index, its innermost dim varying fastest."""
-    if not group:
-        return []
-    if len(group) == 1:
-        return [f"{indent}const int {group[0]} = {fused};"]
-    lines = [f"{indent}int {tmp} = {fused};"]
-    for var in reversed(group[1:]):
-        lines.append(f"{indent}const int {var} = {tmp} % {sizes[var]}; {tmp} /= {sizes[var]};")
-    return lines + [f"{indent}const int {group[0]} = {tmp};"]
-
-
 def vector_width(load: Instr, fast: str, extent: int, width: int) -> int:
     """Four when a thread may take four cells of this operand as one read, else one.
 
@@ -543,17 +530,15 @@ def stage_lines(mm: Matmul, spec: TileSpec, load: Instr, indent: str) -> list[st
         fast, reach = "", 0
     wide = vector_width(load, fast, reach, width)
 
-    lines = [f"{indent}{{"]
-    lines.append(f"{indent}  #pragma unroll")
+    lines = [f"{indent}{{", f"{indent}  #pragma unroll"]
     lines.append(f"{indent}  for (int step = 0; step < {width * TILE_K // (BLOCK * wide)}; step++) {{")
     lines.append(f"{indent}    const int slot = (threadIdx.x + step * {BLOCK}) * {wide};")
     if depth_fastest:
         lines.append(f"{indent}    const int depth_at = slot % {TILE_K}, tile_at = slot / {TILE_K};")
     else:
         lines.append(f"{indent}    const int tile_at = slot % {width}, depth_at = slot / {width};")
-    lines.append(f"{indent}    const int {mm.depth} = k0 + depth_at;")
-    lines.append(f"{indent}    const int fused = {block} + tile_at;")
-    lines += unpack(group, mm.sizes, "fused", f"{indent}    ", "tile_left")
+    lines += [f"{indent}    const int {mm.depth} = k0 + depth_at;", f"{indent}    const int fused = {block} + tile_at;"]
+    lines += bind_vars(mm.loops(group), "fused", "tile_left", f"{indent}    ", wide=False)
     checks = ([f"fused < {extent}"] if extent % width else []) + ([f"{mm.depth} < {k}"] if k % TILE_K else [])
     checks += [valid.render()] if valid.bounds else []
     zero = f"({CUDA_TYPE[load.value_type]}){c_literal(0, load.value_type)}"  # same arm-type rule as guard()
@@ -575,9 +560,7 @@ def stage_lines(mm: Matmul, spec: TileSpec, load: Instr, indent: str) -> list[st
                 lines.append(f"{indent}    {load.dest}_s[(depth_at + {step}) * {pitch} + tile_at] = wide.{field};")
         else:
             lines.append(f"{indent}    *({vector}*)&{cell} = wide;")
-    lines.append(f"{indent}  }}")
-    lines.append(f"{indent}}}")
-    return lines
+    return lines + [f"{indent}  }}", f"{indent}}}"]
 
 
 def register_lines(mm: Matmul, spec: TileSpec, load: Instr, indent: str) -> list[str]:
@@ -594,8 +577,7 @@ def register_lines(mm: Matmul, spec: TileSpec, load: Instr, indent: str) -> list
         for at in range(regs // 4):
             lines.append(f"{indent}*(({vector}*){load.dest}_r + {at}) = *(const {vector}*)&{base} + {4 * at}];")
     else:
-        lines.append(f"{indent}#pragma unroll")
-        lines.append(f"{indent}for (int e = 0; e < {regs}; e++) {load.dest}_r[e] = {base} + e];")
+        lines += [f"{indent}#pragma unroll", f"{indent}for (int e = 0; e < {regs}; e++) {load.dest}_r[e] = {base} + e];"]
     return lines
 
 
@@ -621,15 +603,12 @@ def store_lines(mm: Matmul, spec: TileSpec, indent: str) -> list[str]:
     guard = f"if ({' && '.join(checks)}) " if checks else ""
     lines = [f"{indent}#pragma unroll", f"{indent}for (int i = 0; i < {tm}; i++) {{"]
     lines.append(f"{indent}  const int row = row_block + lane_m * {tm} + i;")
-    lines += unpack(mm.rows, mm.sizes, "row", f"{indent}  ", "row_left")
-    lines.append(f"{indent}  #pragma unroll")
-    lines.append(f"{indent}  for (int j = 0; j < {tn}; j++) {{")
+    lines += bind_vars(mm.loops(mm.rows), "row", "row_left", f"{indent}  ", wide=False)
+    lines += [f"{indent}  #pragma unroll", f"{indent}  for (int j = 0; j < {tn}; j++) {{"]
     lines.append(f"{indent}    const int col = col_block + lane_n * {tn} + j;")
-    lines += unpack(mm.cols, mm.sizes, "col", f"{indent}    ", "col_left")
+    lines += bind_vars(mm.loops(mm.cols), "col", "col_left", f"{indent}    ", wide=False)
     lines.append(f"{indent}    {guard}out[{mm.fold.out.render()}] = acc[i][j];")
-    lines.append(f"{indent}  }}")
-    lines.append(f"{indent}}}")
-    return lines
+    return lines + [f"{indent}  }}", f"{indent}}}"]
 
 
 def emit_tiled(nest: LoopNest, mm: Matmul, spec: TileSpec) -> str:
@@ -655,42 +634,33 @@ def emit_tiled(nest: LoopNest, mm: Matmul, spec: TileSpec) -> str:
         # aligned so a thread can take its four cells of a row as one vector read
         held = TILE_K * (spec.width(mm.on_cols(load)) + TILE_PAD)
         lines.append(f"  __shared__ __align__(16) {CUDA_TYPE[load.value_type]} {load.dest}_s[{held}];")
-    lines.append(f"  const int lane_m = threadIdx.x / {LANES};")
-    lines.append(f"  const int lane_n = threadIdx.x % {LANES};")
+    lines += [f"  const int lane_m = threadIdx.x / {LANES};", f"  const int lane_n = threadIdx.x % {LANES};"]
     lines.append(f"  for (long long tile = blockIdx.x; tile < {tile_count(mm, spec)}LL; tile += gridDim.x) {{")
     lines.append("    long long slab = tile;")
     lines.append(f"    const int col_block = (int)(slab % {col_blocks}) * {spec.cols}; slab /= {col_blocks};")
     lines.append(f"    const int row_block = (int)(slab % {row_blocks}) * {spec.rows}; slab /= {row_blocks};")
-    lines += unpack(mm.batch, mm.sizes, "(int)slab", "    ", "batch_left")
+    lines += bind_vars(mm.loops(mm.batch), "(int)slab", "batch_left", "    ", wide=False)
     lines.append(f"    {CUDA_VALUE[accumulate_in(folded.dtype)]} acc[{tm}][{tn}];")
-    lines.append("    #pragma unroll")
-    lines.append(f"    for (int i = 0; i < {tm}; i++)")
-    lines.append("      #pragma unroll")
+    lines += ["    #pragma unroll", f"    for (int i = 0; i < {tm}; i++)", "      #pragma unroll"]
     lines.append(f"      for (int j = 0; j < {tn}; j++) acc[i][j] = {c_literal(folded.identity, folded.dtype)};")
 
     lines.append(f"    for (int k0 = 0; k0 < {k}; k0 += {TILE_K}) {{")
     for load in mm.staged:
         lines += stage_lines(mm, spec, load, "      ")
-    lines.append("      __syncthreads();")
-    lines.append("      #pragma unroll")
+    lines += ["      __syncthreads();", "      #pragma unroll"]
     lines.append(f"      for (int kk = 0; kk < {reach}; kk++) {{")
     for load in mm.staged:
         lines += register_lines(mm, spec, load, "        ")
     lines.append("        #pragma unroll")
-    lines.append(f"        for (int i = 0; i < {tm}; i++) {{")
-    lines.append("          #pragma unroll")
-    lines.append(f"          for (int j = 0; j < {tn}; j++) {{")
+    lines += [
+        f"        for (int i = 0; i < {tm}; i++) {{",
+        "          #pragma unroll",
+        f"          for (int j = 0; j < {tn}; j++) {{",
+    ]
     lines += cell_lines(mm, "            ")
-    lines.append("          }")
-    lines.append("        }")
-    lines.append("      }")
-    lines.append("      __syncthreads();")
-    lines.append("    }")
-
+    lines += ["          }", "        }", "      }", "      __syncthreads();", "    }"]
     lines += store_lines(mm, spec, "    ")
-    lines.append("  }")
-    lines.append("}")
-    return "\n".join(lines)
+    return "\n".join(lines + ["  }", "}"])
 
 
 def write_line(instr: Instr, indent: str) -> str:
@@ -705,7 +675,7 @@ def write_line(instr: Instr, indent: str) -> str:
                 # atomicAdd has no 8- or 16-bit overload on any architecture
                 raise NotImplementedError(f"the cuda device cannot scatter {instr.value_type}; cast the table to int32")
             if instr.value_type == float16:
-                # a float16 atomic add needs either cuda_fp16.h or a PTX instruction that only thank you claude
+                # a float16 atomic add needs either cuda_fp16.h or a PTX instruction that only
                 # sm_70 and later have, and emission does not know the architecture
                 raise NotImplementedError("the cuda device cannot scatter float16; cast the table to float32")
             return f"{indent}atomicAdd(&{buf}[{index.render()}], {instr.srcs[0]});"
@@ -717,8 +687,7 @@ def emit_kernel(nest: LoopNest) -> str:
     kernel = nest.kernel
     outer, reduce_loops = nest_loops(nest)
 
-    lines = [kernel_sig(nest.name, [node.dtype for node in kernel.inputs], kernel.target.dtype)]
-    lines.append(grid_stride(outer_extent(nest)))
+    lines = [kernel_sig(nest.name, [node.dtype for node in kernel.inputs], kernel.target.dtype), grid_stride(outer_extent(nest))]
     # bind the non-reduce dims from gid, the innermost one varying fastest: neighbouring threads
     # then touch neighbouring elements of whatever loop_order found to be stride-1, and coalesce
     lines += bind_vars(outer, "gid", "t", "    ")
@@ -727,9 +696,7 @@ def emit_kernel(nest: LoopNest) -> str:
     else:
         control = (Opcode.LOOP, Opcode.ENDLOOP)  # every loop of an elementwise nest is a thread
         lines += [write_line(instr, "    ") for instr in nest.instrs if instr.opcode not in control]
-    lines.append("  }")
-    lines.append("}")
-    return "\n".join(lines)
+    return "\n".join(lines + ["  }", "}"])
 
 
 def emit_one(nest: LoopNest) -> str:
