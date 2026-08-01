@@ -103,18 +103,15 @@ class TorchTransformer(torch.nn.Module):
 
 def param_pairs(lmodel: Transformer, tmodel: TorchTransformer) -> list[tuple[str, Tensor, torch.Tensor]]:
     pairs = [("emb", lmodel.emb.weight, tmodel.emb.weight), ("pos", lmodel.pos.weight, tmodel.pos.weight)]
+    layers = []
     for i, (lb, tb) in enumerate(zip(lmodel.blocks, tmodel.blocks)):
         for name in ("ln1", "ln2", "qkv", "proj", "fc1", "fc2"):
             llayer = getattr(lb.attn, name) if name in ("qkv", "proj") else getattr(lb, name)
-            tlayer = getattr(tb, name)
-            pairs.append((f"block{i}.{name}.weight", llayer.weight, tlayer.weight))
-            pairs.append((f"block{i}.{name}.bias", llayer.bias, tlayer.bias))
-    pairs += [
-        ("ln_f.weight", lmodel.ln_f.weight, tmodel.ln_f.weight),
-        ("ln_f.bias", lmodel.ln_f.bias, tmodel.ln_f.bias),
-        ("head.weight", lmodel.head.weight, tmodel.head.weight),
-        ("head.bias", lmodel.head.bias, tmodel.head.bias),
-    ]
+            layers.append((f"block{i}.{name}", llayer, getattr(tb, name)))
+    layers += [("ln_f", lmodel.ln_f, tmodel.ln_f), ("head", lmodel.head, tmodel.head)]
+    for label, llayer, tlayer in layers:
+        pairs.append((f"{label}.weight", llayer.weight, tlayer.weight))
+        pairs.append((f"{label}.bias", llayer.bias, tlayer.bias))
     return pairs
 
 
