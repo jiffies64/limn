@@ -91,29 +91,25 @@ def fold_c(op: Op, dest: str, src: str) -> str:
     return f"{dest} = ({dest} > {src} || {dest} != {dest}) ? {dest} : {src};"
 
 
+# One arith op as C, over its operands ({0}, {1}, ...), the dtype spelled as a value ({t}), and
+# the suffix that picks the float-width math function ({f}); unsuffixed, those are C's double ones.
+ARITH_C = {
+    Op.NEG: "-{0}",
+    Op.EXP: "exp{f}({0})",
+    Op.LOG: "log{f}({0})",
+    Op.SQRT: "sqrt{f}({0})",
+    Op.RECIP: "1.0{f} / {0}",
+    Op.ADD: "{0} + {1}",
+    Op.MUL: "{0} * {1}",
+    Op.CMPLT: "({t})({0} < {1})",
+    Op.WHERE: "{0} != 0 ? {1} : {2}",
+}
+
+
 def arith_c(op: Op, srcs: list[str], dtype: DType, types: dict[DType, str]) -> str:
-    suffix = "" if dtype == float64 else "f"  # the unsuffixed math functions are C's double ones
-    match op:
-        case Op.NEG:
-            return f"-{srcs[0]}"
-        case Op.EXP:
-            return f"exp{suffix}({srcs[0]})"
-        case Op.LOG:
-            return f"log{suffix}({srcs[0]})"
-        case Op.SQRT:
-            return f"sqrt{suffix}({srcs[0]})"
-        case Op.RECIP:
-            return f"1.0{suffix} / {srcs[0]}"
-        case Op.ADD:
-            return f"{srcs[0]} + {srcs[1]}"
-        case Op.MUL:
-            return f"{srcs[0]} * {srcs[1]}"
-        case Op.CMPLT:
-            return f"({types[dtype]})({srcs[0]} < {srcs[1]})"
-        case Op.WHERE:
-            return f"{srcs[0]} != 0 ? {srcs[1]} : {srcs[2]}"
-        case _:
-            raise NotImplementedError(f"no C lowering for {op}")
+    if op not in ARITH_C:
+        raise NotImplementedError(f"no C lowering for {op}")
+    return ARITH_C[op].format(*srcs, f="" if dtype == float64 else "f", t=types[dtype])
 
 
 def value_c(instr: Instr, indent: str, prefix: str, types: dict[DType, str], store: dict[DType, str]) -> str:
