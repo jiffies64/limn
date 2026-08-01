@@ -8,6 +8,8 @@ from these in tensor.py, so a backend only ever has to implement what is listed 
 
 from __future__ import annotations
 
+import operator
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
@@ -98,11 +100,13 @@ class Node:
         return f"Node({self.op.name}, shape={self.shape}, dtype={self.dtype})"
 
 
-def topological(sinks: list[Node]) -> list[Node]:
-    """All nodes reachable from sinks, sources first. Iterative so deep graphs can't blow the stack."""
-    order: list[Node] = []
-    visited: set[Node] = set()
-    stack: list[tuple[Node, bool]] = [(n, False) for n in reversed(sinks)]
+def topological[T](sinks: Sequence[T], srcs: Callable[[T], Sequence[T]] = operator.attrgetter("srcs")) -> list[T]:
+    """Everything reachable from sinks, sources first; srcs is the edge to walk, Node.srcs unless
+    told otherwise (backward() walks Tensor parents with it). Iterative so deep graphs can't blow
+    the stack."""
+    order: list[T] = []
+    visited: set[T] = set()
+    stack: list[tuple[T, bool]] = [(n, False) for n in reversed(sinks)]
     while stack:
         node, children_done = stack.pop()
         if children_done:
@@ -110,5 +114,5 @@ def topological(sinks: list[Node]) -> list[Node]:
         elif node not in visited:
             visited.add(node)
             stack.append((node, True))
-            stack.extend((src, False) for src in reversed(node.srcs))
+            stack.extend((src, False) for src in reversed(srcs(node)))
     return order

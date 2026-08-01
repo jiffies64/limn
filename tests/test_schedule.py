@@ -41,28 +41,17 @@ def scalar(dtype: DType, value: Any) -> Any:
     return NUMPY_DTYPES[dtype].type(value)
 
 
-def arith(op: Op, srcs: list[Any]) -> Any:
-    match op:
-        case Op.NEG:
-            return -srcs[0]
-        case Op.EXP:
-            return np.exp(srcs[0])
-        case Op.LOG:
-            return np.log(srcs[0])
-        case Op.SQRT:
-            return np.sqrt(srcs[0])
-        case Op.RECIP:
-            return 1 / srcs[0]
-        case Op.ADD:
-            return srcs[0] + srcs[1]
-        case Op.MUL:
-            return srcs[0] * srcs[1]
-        case Op.CMPLT:
-            return srcs[0] < srcs[1]
-        case Op.WHERE:
-            return srcs[1] if srcs[0] != 0 else srcs[2]
-        case _:
-            raise AssertionError(f"{op} should not appear as an arithmetic instruction")
+ARITH = {  # an op that appears as an ARITH instruction without an arm here is a KeyError, loudly
+    Op.NEG: lambda s: -s[0],
+    Op.EXP: lambda s: np.exp(s[0]),
+    Op.LOG: lambda s: np.log(s[0]),
+    Op.SQRT: lambda s: np.sqrt(s[0]),
+    Op.RECIP: lambda s: 1 / s[0],
+    Op.ADD: lambda s: s[0] + s[1],
+    Op.MUL: lambda s: s[0] * s[1],
+    Op.CMPLT: lambda s: s[0] < s[1],
+    Op.WHERE: lambda s: s[1] if s[0] != 0 else s[2],
+}
 
 
 def run_block(
@@ -92,7 +81,7 @@ def run_block(
             case Opcode.CAST:
                 env[instr.dest] = scalar(instr.value_type, env[instr.srcs[0]])
             case Opcode.ARITH:
-                env[instr.dest] = scalar(instr.value_type, arith(instr.arg, [env[src] for src in instr.srcs]))
+                env[instr.dest] = scalar(instr.value_type, ARITH[instr.arg]([env[src] for src in instr.srcs]))
             case Opcode.UPDATE:
                 folded = env[instr.dest] + env[instr.srcs[0]] if instr.arg is Op.ADD else max(env[instr.dest], env[instr.srcs[0]])
                 env[instr.dest] = scalar(instr.value_type, folded)

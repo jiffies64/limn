@@ -2,15 +2,10 @@
 
 import numpy as np
 import pytest
+from conftest import randf
 
 from limn import Tensor, float32, int32
 from limn.ops import Op
-
-rng = np.random.default_rng(7)
-
-
-def randf(*shape: int) -> np.ndarray:
-    return rng.uniform(-2, 2, shape).astype(np.float32)
 
 
 def check(limn_out: Tensor, expected: np.ndarray) -> None:

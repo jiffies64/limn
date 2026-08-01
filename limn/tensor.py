@@ -508,17 +508,8 @@ class Tensor:
             raise ValueError(f"backward() needs a scalar, got shape {self.shape}")
         if self.dtype not in FLOATS or not self.requires_grad:
             raise ValueError("backward() needs a float tensor with requires_grad=True")
-        order: list[Tensor] = []
-        visited: set[int] = set()
-        stack: list[tuple[Tensor, bool]] = [(self, False)]
-        while stack:
-            t, parents_done = stack.pop()
-            if parents_done:
-                order.append(t)
-            elif id(t) not in visited:
-                visited.add(id(t))
-                stack.append((t, True))
-                stack.extend((p, False) for p in reversed(t.parents) if p.requires_grad)
+        sinks: list[Tensor] = [self]
+        order = topological(sinks, lambda t: [p for p in t.parents if p.requires_grad])
         grads: dict[int, Tensor] = {id(self): Tensor.const(1.0, self.dtype).reshape(*self.shape)}
         with no_grad():
             for t in reversed(order):
