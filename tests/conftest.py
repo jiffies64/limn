@@ -8,6 +8,7 @@ import pytest
 
 from limn import backend_c, backend_cuda, set_device
 from limn.device import NUMPY_DTYPES
+from limn.ops import HALF_FLOATS
 from limn.tensor import Tensor
 
 rng = np.random.default_rng(7)
@@ -52,8 +53,8 @@ def check(dev, t: Tensor, rtol: float = 1e-5, atol: float = 1e-5, exact: bool = 
     """One tensor realized on `dev`, diffed against the numpy reference.
 
     exact is for the dtypes whose arithmetic is bit-defined on every device, like the ints
-    wrapping modulo 2**width. float16 results are compared as float32, since comparing in half
-    rounds the comparison itself.
+    wrapping modulo 2**width. half-width results are compared as float32, since comparing
+    in a half width rounds the comparison itself.
 
     The device under test runs first: .numpy() realizes, and realize retires the sink to a
     buffer, so the other order would hand `dev` the reference's bytes and diff nothing.
@@ -63,7 +64,7 @@ def check(dev, t: Tensor, rtol: float = 1e-5, atol: float = 1e-5, exact: bool = 
     if exact:
         np.testing.assert_array_equal(got, expected)
         return
-    if got.dtype == np.float16:
+    if t.dtype in HALF_FLOATS:
         got, expected = got.astype(np.float32), expected.astype(np.float32)
     np.testing.assert_allclose(got, expected, rtol=rtol, atol=atol)
 

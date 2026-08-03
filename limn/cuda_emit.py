@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 from limn.backend_c import C_TYPE, c_literal, fold_c, value_c
 from limn.codegen import REDUCES, Index, Instr, LoopNest, Opcode
-from limn.ops import DType, Op, accumulate_in, float16, float32, int8, int16
+from limn.ops import HALF_FLOATS, DType, Op, accumulate_in, bfloat16, float16, float32, int8, int16
 
 BLOCK = 256  # threads per block; a tiled kernel needs exactly LANES * LANES of them
 
@@ -41,11 +41,11 @@ TILE_REGS = (8, 4, 2, 1)  # cells one thread may hold in each direction, widest 
 TILE_MIN = 1 << 16  # a matmul with fewer multiply-adds than this is not worth staging for
 TILE_PAD = 4  # slack on a staged row, so a column of it spreads over banks instead of piling on one
 UNROLL = 4  # vector steps of a reduce to unroll, so a thread has several loads in flight at once
-# How each dtype is spelled in memory, and while it is a value. Rounding every float16
+# How each dtype is spelled in memory, and while it is a value. Rounding every half-width
 # intermediate instead of just the stores costs two conversions per multiply-add in a matmul.
-CUDA_TYPE = C_TYPE | {float16: "half_t"}
-CUDA_VALUE = C_TYPE | {float16: "float"}
-VECTOR = {float32: "float4", float16: "half4_t"}  # the four-wide load type, for the dtypes that have one
+CUDA_TYPE = C_TYPE | {float16: "half_t", bfloat16: "bf16_t"}
+CUDA_VALUE = C_TYPE | {float16: "float", bfloat16: "float"}
+VECTOR = {float32: "float4", float16: "half4_t", bfloat16: "bf16x4_t"}  # four-wide loads
 
 PRELUDE = """\
 typedef int int32_t;
@@ -88,6 +88,22 @@ struct __align__(2) half_t {
 };
 struct __align__(8) half4_t {
   half_t x, y, z, w;
+};
+
+// bfloat16 without cuda_bf16.h: the top half of a float32, so widening is a shift and
+// rounding is one add on the float's own bits. The architecture's convert would do the
+// same but needs sm_80, and emission cannot see the architecture.
+struct __align__(2) bf16_t {
+  unsigned short bits;
+  bf16_t() = default;
+  __device__ bf16_t(float f) {
+    unsigned b = __float_as_uint(f);
+    bits = (unsigned short)((b + 0x7fff + ((b >> 16) & 1)) >> 16);
+  }
+  __device__ operator float() const { return __uint_as_float((unsigned)bits << 16); }
+};
+struct __align__(8) bf16x4_t {
+  bf16_t x, y, z, w;
 };
 """
 
@@ -674,10 +690,10 @@ def write_line(instr: Instr, indent: str) -> str:
             if instr.value_type in (int8, int16):
                 # atomicAdd has no 8- or 16-bit overload on any architecture
                 raise NotImplementedError(f"the cuda device cannot scatter {instr.value_type}; cast the table to int32")
-            if instr.value_type == float16:
-                # a float16 atomic add needs either cuda_fp16.h or a PTX instruction that only
-                # sm_70 and later have, and emission does not know the architecture
-                raise NotImplementedError("the cuda device cannot scatter float16; cast the table to float32")
+            if instr.value_type in HALF_FLOATS:
+                # a half-width atomic add needs either a header NVRTC cannot include or an
+                # instruction only later architectures have, and emission cannot see the architecture
+                raise NotImplementedError(f"the cuda device cannot scatter {instr.value_type}; cast the table to float32")
             return f"{indent}atomicAdd(&{buf}[{index.render()}], {instr.srcs[0]});"
         case _:
             return value_cuda(instr, indent)
