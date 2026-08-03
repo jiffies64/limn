@@ -33,10 +33,10 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from limn.codegen import LoopNest, lower_all
+from limn.codegen import LoopNest, lower
 from limn.device import Buffer
 from limn.ops import Node, Op, topological
-from limn.schedule import realized
+from limn.schedule import realized, schedule
 
 Runner = Callable[[list[Buffer], Buffer], None]
 
@@ -121,6 +121,11 @@ class CompiledDevice:
         back to composing the op from primitives when it does not."""
         return False
 
+    def custom_runner(self, node: Node) -> Runner:
+        """A callable for a CUSTOM kernel, which never reaches the loop-nest IR. Backends that
+        register the node's op name supply it; the rest refuse the node at plan time."""
+        raise NotImplementedError(f"{type(self).__name__} has no kernel for custom op {node.arg[0]!r}")
+
     def prepare(self, buf: Buffer) -> Buffer:
         """Admit a BUFFER node's bytes; a backend whose memory is elsewhere migrates them here."""
         return buf
@@ -169,19 +174,26 @@ class CompiledDevice:
         return [bufs[p] for p in plan.sinks]
 
     def plan_of(self, order: list[Node], position: dict[Node, int], sinks: list[Node]) -> Plan:
-        """Lower, compile and wire up these sinks' kernels by position instead of by node."""
-        nests = lower_all(sinks, order)
-        fns = self.runners(nests) if nests else []  # a graph of pure views schedules no kernels
+        """Lower, compile and wire up these sinks' kernels by position instead of by node.
+
+        A CUSTOM kernel is handed to the device whole and never touches the loop-nest IR; the
+        rest lower and compile together. Calls come back in kernel order either way, so a
+        custom kernel sits in the plan exactly where the schedule put it.
+        """
+        kernels = schedule(sinks, order)
+        lowerable = [kernel for kernel in kernels if kernel.ast.op is not Op.CUSTOM]
+        nests = [lower(kernel, f"k{i}") for i, kernel in enumerate(lowerable)]
+        fns = iter(self.runners(nests) if nests else [])  # a graph of pure views schedules no kernels
         calls = tuple(
             Call(
-                fn=fn,
-                inputs=tuple(position[node] for node in nest.kernel.inputs),
-                output=position[nest.kernel.ast],
-                out_nbytes=nbytes(nest.kernel.target),
-                zero_fill=nest.kernel.ast.op is Op.SCATTER,
-                assign_target=position[nest.kernel.target] if nest.kernel.ast.op is Op.ASSIGN else None,
+                fn=self.custom_runner(kernel.ast) if kernel.ast.op is Op.CUSTOM else next(fns),
+                inputs=tuple(position[node] for node in kernel.inputs),
+                output=position[kernel.ast],
+                out_nbytes=nbytes(kernel.target),
+                zero_fill=kernel.ast.op is Op.SCATTER,
+                assign_target=position[kernel.target] if kernel.ast.op is Op.ASSIGN else None,
             )
-            for nest, fn in zip(nests, fns, strict=True)
+            for kernel in kernels
         )
         return Plan(
             calls,

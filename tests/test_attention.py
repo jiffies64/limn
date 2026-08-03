@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import needs_cc
+from conftest import needs_cc, needs_cuda, read
 
 from limn import Tensor, grad, set_device, set_seed
 from limn.nn import Linear, parameters
@@ -139,6 +139,72 @@ def test_tiny_train_matches_composed():
         return losses
 
     np.testing.assert_allclose(run(True), run(False), rtol=1e-4, atol=1e-5)
+
+
+def _cuda_custom_graphs(causal: bool):
+    qd, kd, vd = (rng.standard_normal(s).astype(np.float32) for s in ((2, 3, 64, 16), (2, 3, 64, 16), (2, 3, 64, 24)))
+    q, k, v = (Tensor(d, requires_grad=True) for d in (qd, kd, vd))
+    return q.attention(k, v, causal=causal), (q, k, v), (qd, kd, vd)
+
+
+@needs_cuda
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_cuda_matches_the_numpy_custom(causal):
+    from limn import backend_cuda
+
+    dev = backend_cuda.CudaDevice()
+    out, _, _ = _cuda_custom_graphs(causal)
+    got = read(dev, dev.execute([out.node])[0], out)  # the device under test runs before .numpy() retires
+    np.testing.assert_allclose(got, out.numpy(), rtol=1e-5, atol=1e-5)
+
+
+@needs_cuda
+def test_cuda_custom_is_deterministic():
+    from limn import backend_cuda
+
+    dev = backend_cuda.CudaDevice()
+    out, _, _ = _cuda_custom_graphs(True)
+    first = dev.copyout(dev.execute([out.node])[0])
+    second = dev.copyout(dev.execute([out.node])[0])
+    np.testing.assert_array_equal(first, second)
+
+
+@needs_cuda
+def test_cuda_backward_runs_and_matches_numpy():
+    from limn import backend_cuda
+
+    dev = backend_cuda.CudaDevice()
+    out, leaves, (qd, kd, vd) = _cuda_custom_graphs(True)
+    (out * out).sum().backward()
+    q = Tensor(qd, requires_grad=True)
+    k = Tensor(kd, requires_grad=True)
+    v = Tensor(vd, requires_grad=True)
+    want_out = q.attention(k, v, causal=True)
+    (want_out * want_out).sum().backward()
+    for leaf, want in zip(leaves, (q, k, v), strict=True):
+        got = read(dev, dev.execute([leaf.grad.node])[0], leaf.grad)
+        np.testing.assert_allclose(got, want.grad.numpy(), rtol=1e-4, atol=1e-4)
+
+
+@needs_cuda
+def test_capture_replays_the_custom_step():
+    from limn import capture
+
+    set_device("cuda")
+    try:
+        qd, kd, vd = (rng.standard_normal(s).astype(np.float32) for s in ((2, 3, 32, 16),) * 2 + ((2, 3, 32, 24),))
+        q, k, v = (Tensor(d) for d in (qd, kd, vd))
+
+        def step(q, k, v):
+            return q.attention(k, v, causal=True).realize()
+
+        direct = step(q, k, v).numpy()
+        replayed = capture(step)
+        results = [replayed(q, k, v).numpy() for _ in range(3)]  # observe twice, then a real replay
+        for got in results:
+            np.testing.assert_array_equal(got, direct)
+    finally:
+        set_device("numpy")
 
 
 @needs_cc

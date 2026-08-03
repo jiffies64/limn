@@ -710,3 +710,65 @@ def emit_one(nest: LoopNest) -> str:
 
 def emit_cuda(nests: list[LoopNest]) -> str:
     return "\n".join([PRELUDE] + [emit_one(nest) + "\n" for nest in nests])
+
+
+# ---- fused attention: a CUSTOM kernel the schedule never lowers ----
+
+SDPA_KERNEL = "sdpa"
+
+
+def emit_sdpa(node) -> str:
+    """One hand-written kernel for a CUSTOM ("sdpa", causal, scale) node: one thread per query
+    row walks its keys with the online softmax recurrence, so no t_q by t_k buffer exists.
+
+    This is the deliberately plain form: each thread streams K and V from global memory and
+    holds its row of q and its running output in per-thread locals. Staging K and V through
+    shared memory is a later optimization, not part of getting the numbers right.
+    """
+    _, causal, scale = node.arg
+    q, k, v = node.srcs
+    dtype = node.dtype
+    comp = CUDA_VALUE[accumulate_in(dtype)]  # the width the recurrence runs at
+    mem = CUDA_TYPE[dtype]  # the width the buffers hold
+    exp = "expf" if comp == "float" else "exp"
+    fmax = "fmaxf" if comp == "float" else "fmax"
+    suf = "f" if comp == "float" else ""
+    zero = "0.0" + suf
+    hd, t_q, t_k, hd_v = q.shape[-1], q.shape[-2], k.shape[-2], v.shape[-1]
+    rows = math.prod(q.shape[:-2]) * t_q
+    keys_end = "i + 1" if causal else f"{t_k}LL"
+
+    lines = [
+        kernel_sig(SDPA_KERNEL, [q.dtype, k.dtype, v.dtype], dtype),
+        grid_stride(rows),
+        f"    long long b = gid / {t_q};",
+        f"    long long i = gid - b * {t_q};",
+        f"    const {mem}* q_row = in0 + gid * {hd};",
+        f"    const {mem}* k_base = in1 + b * {t_k} * {hd};",
+        f"    const {mem}* v_base = in2 + b * {t_k} * {hd_v};",
+        f"    {mem}* o_row = out + gid * {hd_v};",
+        f"    {comp} q_local[{hd}];",
+        f"    for (int d = 0; d < {hd}; d++) q_local[d] = ({comp})q_row[d];",
+        f"    {comp} m = -INFINITY;",
+        f"    {comp} l = {zero};",
+        f"    {comp} acc[{hd_v}];",
+        f"    for (int d = 0; d < {hd_v}; d++) acc[d] = {zero};",
+        f"    long long keys_end = {keys_end};",
+        "    for (long long j = 0; j < keys_end; j++) {",
+        f"      const {mem}* k_row = k_base + j * {hd};",
+        f"      {comp} s = {zero};",
+        f"      for (int d = 0; d < {hd}; d++) s += q_local[d] * ({comp})k_row[d];",
+        f"      s *= {c_literal(scale, accumulate_in(dtype))};",
+        f"      {comp} m_new = {fmax}(m, s);",
+        f"      {comp} p = {exp}(s - m_new);",
+        f"      {comp} alpha = {exp}(m - m_new);",
+        "      l = l * alpha + p;",
+        f"      const {mem}* v_row = v_base + j * {hd_v};",
+        f"      for (int d = 0; d < {hd_v}; d++) acc[d] = acc[d] * alpha + p * ({comp})v_row[d];",
+        "      m = m_new;",
+        "    }",
+        f"    for (int d = 0; d < {hd_v}; d++) o_row[d] = ({mem})(acc[d] / l);",
+        "  }",
+        "}",
+    ]
+    return PRELUDE + "\n" + "\n".join(lines) + "\n"
