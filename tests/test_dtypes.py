@@ -12,7 +12,6 @@ table below; the tests it feeds are shared.
 from functools import partial
 from typing import Any, Callable, NamedTuple
 
-import ml_dtypes
 import numpy as np
 import pytest
 from conftest import BACKENDS, GRAPHS, check, cdev, cudev, needs_cc, needs_cuda, randf
@@ -24,21 +23,16 @@ from limn.optim import AdamW
 from limn.tensor import scatter_rows
 
 NARROW = {int8: np.int8, int16: np.int16}
-BFLOAT16 = np.dtype(ml_dtypes.bfloat16)
+BFLOAT16 = NUMPY_DTYPES[bfloat16]
 
 
-def halves(*shape: int, scale: float = 1.0, seed: int = 0) -> np.ndarray:
-    """Values in [0, scale), which is where float16 keeps enough precision to diff at 2e-3.
+def halves(*shape: int, scale: float = 1.0, dtype: Any = np.float16, seed: int = 0) -> np.ndarray:
+    """Values in [0, scale), which is where a half-width float keeps enough precision to diff at its eps.
 
     Two operands of one test need different seeds. Drawn from the shape alone they come out
     identical, and a graph over a == b stops telling a + b from 2a.
     """
-    return (np.random.default_rng((seed, *shape)).random(shape).astype(np.float32) * scale).astype(np.float16)
-
-
-def bfloats(*shape: int, seed: int = 0) -> np.ndarray:
-    """Values in [0, 1): bfloat16's 7 mantissa bits resolve them, and its range never clips them."""
-    return np.random.default_rng((seed, *shape)).random(shape).astype(np.float32).astype(BFLOAT16)
+    return (np.random.default_rng((seed, *shape)).random(shape).astype(np.float32) * scale).astype(dtype)
 
 
 def doubles(*shape: int, seed: int = 0) -> np.ndarray:
@@ -79,9 +73,12 @@ SPECS = {
     float16: Spec(
         halves, GRAPHS, ("cuda",), {"rtol": 2e-3, "atol": 1e-3}, {"rtol": 2e-2, "atol": 1e-3}, partial(halves, scale=0.01)
     ),
-    # bfloat16's eps is 2**-8 where float16's is 2**-10, so both tolerances are eight times wider;
-    # the c device declines it as it declines float16, so cuda is its one compiled home
-    bfloat16: Spec(bfloats, GRAPHS, ("cuda",), {"rtol": 1e-2, "atol": 1e-2}, {"rtol": 4e-2, "atol": 1e-2}),
+    # bfloat16's eps is 2**-8 where float16's is 2**-10, so both tolerances are eight times wider,
+    # and [0, 1) values its 7 mantissa bits still resolve; the c device declines it as it declines
+    # float16, so cuda is its one compiled home
+    bfloat16: Spec(
+        partial(halves, dtype=BFLOAT16), GRAPHS, ("cuda",), {"rtol": 1e-2, "atol": 1e-2}, {"rtol": 4e-2, "atol": 1e-2}
+    ),
     float64: Spec(doubles, GRAPHS, BOTH, {"rtol": 1e-12, "atol": 1e-12}, {"rtol": 1e-12, "atol": 1e-12}),
     int8: Spec(partial(ints, dtype=int8), INT_GRAPHS, BOTH, EXACT, EXACT),
     int16: Spec(partial(ints, dtype=int16), INT_GRAPHS, BOTH, EXACT, EXACT),

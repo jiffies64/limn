@@ -154,12 +154,10 @@ def _cuda_custom_graphs(causal: bool, dtype: DType = float32):
 
 @needs_cuda
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize(
-    "dtype,tol", [(float32, {}), (bfloat16, {"rtol": 1e-2, "atol": 1e-2})], ids=[str(float32), str(bfloat16)]
-)
+@pytest.mark.parametrize("dtype,tol", [(float32, 1e-5), (float16, 2e-3), (bfloat16, 1e-2)], ids=str)
 def test_cuda_matches_the_numpy_custom(causal, dtype, tol):
     out, _, _ = _cuda_custom_graphs(causal, dtype)
-    check(cudev, out, **tol)
+    check(cudev, out, rtol=tol, atol=tol)
 
 
 @needs_cuda
