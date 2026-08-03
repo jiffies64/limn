@@ -290,6 +290,7 @@ class CudaDevice(CompiledDevice):
         context = ctypes.c_void_p()
         check(api.cuDevicePrimaryCtxRetain(ctypes.byref(context), dev), "retaining the primary context")
         check(api.cuCtxSetCurrent(context), "making the context current")
+        self.custom[SDPA_KERNEL] = self._sdpa_runner
 
     # ---- Device protocol: raw byte buffers ----
 
@@ -348,14 +349,9 @@ class CudaDevice(CompiledDevice):
     def finish(self) -> None:
         check(self.api.cuCtxSynchronize(), "waiting for the batch")
 
-    def has_custom(self, name: str) -> bool:
-        return name == "sdpa"
-
-    def custom_runner(self, node: Node) -> Runner:
+    def _sdpa_runner(self, node: Node) -> Runner:
         """The fused-attention kernel is compiled here and launched like any other, so a plan
         or a capture treats its call exactly like a lowered nest's."""
-        if node.arg[0] != "sdpa":
-            return super().custom_runner(node)
         functions = compile_cuda(emit_sdpa(node), self.arch, [SDPA_KERNEL])
         # one block per (batch, chunk of rows); the kernel decodes blockIdx the same way
         return self._launcher(functions[SDPA_KERNEL], sdpa_blocks(node), len(node.srcs) + 1)

@@ -101,6 +101,7 @@ class CompiledDevice:
     def __init__(self) -> None:
         self.plans: dict[tuple, Plan] = {}
         self.record: list[Recording] | None = None  # set by capture while it observes a call
+        self.custom: dict[str, Callable[[Node], Runner]] = {}  # CUSTOM kernel builders, by the name in node.arg
 
     # ---- what a backend implements ----
 
@@ -119,12 +120,14 @@ class CompiledDevice:
     def has_custom(self, name: str) -> bool:
         """Whether this device supplies a kernel for the named CUSTOM op; the frontend falls
         back to composing the op from primitives when it does not."""
-        return False
+        return name in self.custom
 
     def custom_runner(self, node: Node) -> Runner:
-        """A callable for a CUSTOM kernel, which never reaches the loop-nest IR. Backends that
-        register the node's op name supply it; the rest refuse the node at plan time."""
-        raise NotImplementedError(f"{type(self).__name__} has no kernel for custom op {node.arg[0]!r}")
+        """A callable for a CUSTOM kernel, which never reaches the loop-nest IR. A backend
+        registers a builder per name in self.custom; the rest refuse the node at plan time."""
+        if (build := self.custom.get(node.arg[0])) is None:
+            raise NotImplementedError(f"{type(self).__name__} has no kernel for custom op {node.arg[0]!r}")
+        return build(node)
 
     def prepare(self, buf: Buffer) -> Buffer:
         """Admit a BUFFER node's bytes; a backend whose memory is elsewhere migrates them here."""

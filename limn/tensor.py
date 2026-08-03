@@ -534,19 +534,13 @@ class Tensor:
             return composed_attention(q, k, v, causal=causal, scale=scale)
         q, k, v = _contiguous(q), _contiguous(k), _contiguous(v)
         node = Node(Op.CUSTOM, (q.node, k.node, v.node), wider, batch + (q.shape[-2], v.shape[-1]), ("sdpa", causal, scale))
-        mask = _causal_mask(q.shape[-2], k.shape[-2]) if causal else None
 
         def backward(g: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-            # the probabilities are recomputed, not saved: the forward kept no t_q by t_k
-            scores = (q @ k.transpose(-2, -1)) * scale
-            if mask is not None:
-                scores = mask.where(scores, -1e9)
-            p = scores.softmax(-1)
+            # the probabilities are recomputed, not saved: the forward kept no t_q by t_k.
+            # a masked p entry is exactly 0 (exp underflows the -1e9), so ds needs no re-mask.
+            p = _attention_probs(q, k, causal=causal, scale=scale)
             dp = g @ v.transpose(-2, -1)
-            ds = p * (dp - (dp * p).sum(axis=-1, keepdim=True))
-            if mask is not None:
-                ds = mask.where(ds, 0)
-            ds = ds * scale
+            ds = p * (dp - (dp * p).sum(axis=-1, keepdim=True)) * scale
             return ds @ k, ds.transpose(-2, -1) @ q, p.transpose(-2, -1) @ g
 
         return Tensor.from_node(node, (q, k, v), backward)
@@ -650,21 +644,28 @@ def scatter_rows(values: Tensor, indices: Tensor, shape: tuple[int, ...]) -> Ten
 def composed_attention(q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float) -> Tensor:
     """Attention from the primitives: what every device runs when no fused kernel is
     registered, and the form the fused kernel's grad_fn differentiates."""
+    return _attention_probs(q, k, causal=causal, scale=scale) @ v
+
+
+def _attention_probs(q: Tensor, k: Tensor, *, causal: bool, scale: float) -> Tensor:
+    """softmax of the masked, scaled scores; -1e9 stands in for -inf, and exp underflows it
+    to an exact zero, so masked probabilities are 0 and not merely small."""
     scores = (q @ k.transpose(-2, -1)) * scale
     if causal:
         scores = _causal_mask(q.shape[-2], k.shape[-2]).where(scores, -1e9)
-    return scores.softmax(-1) @ v
+    return scores.softmax(-1)
 
 
 def _causal_mask(t_q: int, t_k: int) -> Tensor:
     """1 on and below the diagonal, 0 past it: cols <= rows, as arange compares."""
-    rows = Tensor.arange(t_q).reshape(t_q, 1)
-    cols = Tensor.arange(t_k).reshape(1, t_k)
-    return cols <= rows
+    return Tensor.arange(t_k).reshape(1, t_k) <= Tensor.arange(t_q).reshape(t_q, 1)
 
 
 def _contiguous(t: Tensor) -> Tensor:
-    """A row-major copy of t, recorded: the gradient of a copy is the gradient."""
+    """A row-major copy of t, recorded (the gradient of a copy is the gradient); a realized
+    buffer already is one, so it passes through untouched."""
+    if t.node.op is Op.BUFFER:
+        return t
     node = Node(Op.CONTIGUOUS, (t.node,), t.dtype, t.shape)
     return Tensor.from_node(node, (t,), lambda g: (g,))
 
