@@ -14,7 +14,7 @@ from conftest import check, cudev, needs_cc, needs_cuda
 
 from limn import Tensor, grad, set_device, set_seed
 from limn.nn import Linear, parameters
-from limn.ops import Op, topological
+from limn.ops import DType, Op, bfloat16, float16, float32, topological
 from limn.optim import AdamW
 from limn.tensor import composed_attention
 
@@ -42,13 +42,14 @@ def test_forward_matches_composed():
         np.testing.assert_allclose(got.numpy(), want.numpy(), rtol=1e-5, atol=1e-5)
 
 
-def test_forward_matches_composed_float16():
-    q, k, v = rand(2, 3, 64, 16).half(), rand(2, 3, 64, 16).half(), rand(2, 3, 64, 24).half()
+@pytest.mark.parametrize("dtype,rtol", [(float16, 1e-2), (bfloat16, 4e-2)], ids=str)
+def test_forward_matches_composed_in_a_half_width(dtype, rtol):
+    q, k, v = rand(2, 3, 64, 16).cast(dtype), rand(2, 3, 64, 16).cast(dtype), rand(2, 3, 64, 24).cast(dtype)
     got = q.attention(k, v, causal=True)
     want = composed_attention(q, k, v, causal=True, scale=16**-0.5)
     assert got.dtype == q.dtype
     # compared widened: the fused recurrence accumulates in float32, the composed path in halves
-    np.testing.assert_allclose(got.numpy().astype(np.float32), want.numpy().astype(np.float32), rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(got.numpy().astype(np.float32), want.numpy().astype(np.float32), rtol=rtol, atol=rtol)
 
 
 def test_numpy_builds_a_custom_node():
@@ -145,17 +146,20 @@ def test_tiny_train_matches_composed():
     np.testing.assert_allclose(run(True), run(False), rtol=1e-4, atol=1e-5)
 
 
-def _cuda_custom_graphs(causal: bool):
+def _cuda_custom_graphs(causal: bool, dtype: DType = float32):
     qd, kd, vd = (rng.standard_normal(s).astype(np.float32) for s in ((2, 3, 64, 16), (2, 3, 64, 16), (2, 3, 64, 24)))
-    q, k, v = (Tensor(d, requires_grad=True) for d in (qd, kd, vd))
+    q, k, v = (Tensor(d, dtype=dtype, requires_grad=True) for d in (qd, kd, vd))
     return q.attention(k, v, causal=causal), (q, k, v), (qd, kd, vd)
 
 
 @needs_cuda
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_cuda_matches_the_numpy_custom(causal):
-    out, _, _ = _cuda_custom_graphs(causal)
-    check(cudev, out)
+@pytest.mark.parametrize(
+    "dtype,tol", [(float32, {}), (bfloat16, {"rtol": 1e-2, "atol": 1e-2})], ids=[str(float32), str(bfloat16)]
+)
+def test_cuda_matches_the_numpy_custom(causal, dtype, tol):
+    out, _, _ = _cuda_custom_graphs(causal, dtype)
+    check(cudev, out, **tol)
 
 
 @needs_cuda
