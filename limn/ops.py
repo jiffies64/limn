@@ -45,9 +45,7 @@ def promote(a: DType, b: DType) -> DType:
     if a == b:
         return a
     if (a in FLOATS) == (b in FLOATS):
-        if a.itemsize == b.itemsize:
-            return float32
-        return max(a, b, key=lambda dtype: dtype.itemsize)
+        return float32 if a in HALF_FLOATS and b in HALF_FLOATS else max(a, b, key=lambda dtype: dtype.itemsize)
     wider = a if a in FLOATS else b
     return max(wider, float32, key=lambda dtype: dtype.itemsize)
 

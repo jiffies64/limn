@@ -44,7 +44,7 @@ UNROLL = 4  # vector steps of a reduce to unroll, so a thread has several loads 
 # How each dtype is spelled in memory, and while it is a value. Rounding every half-width
 # intermediate instead of just the stores costs two conversions per multiply-add in a matmul.
 CUDA_TYPE = C_TYPE | {float16: "half_t", bfloat16: "bf16_t"}
-CUDA_VALUE = C_TYPE | {float16: "float", bfloat16: "float"}
+CUDA_VALUE = C_TYPE | dict.fromkeys(HALF_FLOATS, "float")
 VECTOR = {float32: "float4", float16: "half4_t", bfloat16: "bf16x4_t"}  # four-wide loads
 
 PRELUDE = """\

@@ -145,7 +145,7 @@ class NumpyDevice(HostDevice):
                 result = (srcs[0] < srcs[1]).astype(NUMPY_DTYPES[node.dtype])
             case Op.WHERE:
                 result = np.where(srcs[0] != 0, srcs[1], srcs[2])
-            case Op.SUM:  # the running total is wider than float16; the astype below rounds it back
+            case Op.SUM:  # the running total is wider than a half width; the astype below rounds it back
                 result = srcs[0].sum(axis=node.arg, keepdims=True, dtype=NUMPY_DTYPES[accumulate_in(node.dtype)])
             case Op.MAX:
                 result = srcs[0].max(axis=node.arg, keepdims=True)
