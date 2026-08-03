@@ -756,6 +756,10 @@ def emit_sdpa(node) -> str:
     simply skip the per-row work. A causal block also stops streaming tiles at its own last
     row's diagonal: every key past it is masked for every row the block holds, and the bound
     depends only on blockIdx, so the barriers stay uniform.
+
+    The tiles hold the compute width, not the storage width: every element is read once per
+    query row in the block, so a half width converted on the way in pays one conversion per
+    staged element instead of up to BLOCK of them in the dot products.
     """
     _, causal, scale = node.arg
     q, k, v = node.srcs
@@ -777,14 +781,14 @@ def emit_sdpa(node) -> str:
             f"    for (int idx = (int)threadIdx.x; idx < {tile} * {width}; idx += blockDim.x) {{",
             f"      int lj = idx / {width}, d = idx - lj * {width};",
             "      long long j = j0 + lj;",
-            f"      {name}[lj][d] = j < {t_k} ? {base}[j * {width} + d] : {mem}({zero});",
+            f"      {name}[lj][d] = j < {t_k} ? ({comp}){base}[j * {width} + d] : {zero};",
             "    }",
         ]
 
     lines = [
         kernel_sig(SDPA_KERNEL, [q.dtype, k.dtype, v.dtype], dtype),
-        f"  __shared__ {mem} K_tile[{tile}][{hd}];",
-        f"  __shared__ {mem} V_tile[{tile}][{hd_v}];",
+        f"  __shared__ {comp} K_tile[{tile}][{hd}];",
+        f"  __shared__ {comp} V_tile[{tile}][{hd_v}];",
         f"  long long b = blockIdx.x / {n_chunks};",
         f"  long long row_chunk = blockIdx.x - b * {n_chunks};",
         f"  int i = (int)(row_chunk * {BLOCK} + threadIdx.x);",
@@ -810,13 +814,13 @@ def emit_sdpa(node) -> str:
         "    for (long long j = j0; j < tile_end; j++) {",
         "      int lj = (int)(j - j0);",
         f"      {comp} s = {zero};",
-        f"      for (int d = 0; d < {hd}; d++) s += q_local[d] * ({comp})K_tile[lj][d];",
+        f"      for (int d = 0; d < {hd}; d++) s += q_local[d] * K_tile[lj][d];",
         f"      s *= {scale_lit};",
         f"      {comp} m_new = {fmax}(m, s);",
         f"      {comp} p = {exp}(s - m_new);",
         f"      {comp} alpha = {exp}(m - m_new);",
         "      l = l * alpha + p;",
-        f"      for (int d = 0; d < {hd_v}; d++) acc[d] = acc[d] * alpha + p * ({comp})V_tile[lj][d];",
+        f"      for (int d = 0; d < {hd_v}; d++) acc[d] = acc[d] * alpha + p * V_tile[lj][d];",
         "      m = m_new;",
         "    }",
         "    __syncthreads();",
