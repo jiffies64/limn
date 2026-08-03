@@ -45,6 +45,7 @@ def test_batched_matmul_forward_and_backward():
     out = a @ b
     check_cuda(out)
     out.sum().backward()
+    assert a.grad is not None and b.grad is not None
     check_cuda(a.grad)
     check_cuda(b.grad)
 
@@ -94,6 +95,7 @@ def test_a_tiled_matmul_backward_matches_the_numpy_device():
     x = Tensor(randf(128, 96), requires_grad=True)
     w = Tensor(randf(96, 128), requires_grad=True)
     (x @ w).relu().sum().backward()
+    assert x.grad is not None and w.grad is not None
     check_cuda(x.grad, tol=1e-4)
     check_cuda(w.grad, tol=1e-4)
 
@@ -114,6 +116,7 @@ def test_assign_to_a_host_tensor_writes_the_host_bytes_back():
     """These tensors live on the numpy device; the assign must land in their host buffer."""
     p = Tensor(np.array([1.0, 2.0, 3.0], dtype=np.float32))
     p.assign(p * 10.0)
+    assert cudev is not None
     cudev.execute([p.node])
     host = p.node.srcs[0].arg.view(np.float32)
     np.testing.assert_allclose(host, np.array([10.0, 20.0, 30.0], dtype=np.float32))
@@ -124,6 +127,7 @@ def test_scatter_collisions_hit_one_row_atomically():
     table = Tensor(randf(4, 8), requires_grad=True)
     indices = Tensor(np.full(512, 2, dtype=np.int32))
     (table.gather_rows(indices) * Tensor(randf(512, 8))).sum().backward()
+    assert table.grad is not None
     check_cuda(table.grad, tol=1e-4)  # adds land in atomic order, not loop order
 
 
@@ -141,6 +145,7 @@ def test_a_large_int_sum_is_exact():
 
 def test_a_split_reduce_is_deterministic():
     total = Tensor(randf(1 << 20)).sum()
+    assert cudev is not None
     once = cudev.copyout(cudev.execute([total.node])[0])
     np.testing.assert_array_equal(once, cudev.copyout(cudev.execute([total.node])[0]))
 

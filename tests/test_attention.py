@@ -2,6 +2,9 @@
 device, the backward against the composed form and torch, and a device that registers no
 kernel gets the composed form back."""
 
+from functools import reduce
+from operator import add
+
 import numpy as np
 import pytest
 import torch
@@ -86,6 +89,7 @@ def _attention_case(causal: bool):
 def test_backward_matches_torch(causal):
     limn_tensors, torch_tensors = _attention_case(causal)
     for got, want in zip(limn_tensors, torch_tensors, strict=True):
+        assert got.grad is not None and want.grad is not None
         np.testing.assert_allclose(got.grad.numpy(), want.grad.numpy(), rtol=1e-4, atol=1e-4)
 
 
@@ -98,14 +102,14 @@ def test_grad_of_grad_matches_torch(causal):
     q, k, v = (Tensor(d, requires_grad=True) for d in (qd, kd, vd))
     loss = (q.attention(k, v, causal=causal) ** 2).sum()
     first = grad(loss, [q, k, v], create_graph=True)
-    second = grad(sum(g.sum() for g in first), [q, k, v])
+    second = grad(reduce(add, (g.sum() for g in first)), [q, k, v])
     tq = torch.tensor(qd, requires_grad=True)
     tk = torch.tensor(kd, requires_grad=True)
     tv = torch.tensor(vd, requires_grad=True)
     with sdpa_kernel(SDPBackend.MATH):
         tloss = (F.scaled_dot_product_attention(tq, tk, tv, is_causal=causal) ** 2).sum()
         tfirst = torch.autograd.grad(tloss, (tq, tk, tv), create_graph=True)
-        tsecond = torch.autograd.grad(sum(t.sum() for t in tfirst), (tq, tk, tv))
+        tsecond = torch.autograd.grad(reduce(add, (t.sum() for t in tfirst)), (tq, tk, tv))
     for got, want in zip(second, tsecond, strict=True):
         np.testing.assert_allclose(got.numpy(), want.detach().numpy(), rtol=1e-3, atol=1e-3)
 
@@ -157,6 +161,7 @@ def test_cuda_matches_the_numpy_custom(causal):
 @needs_cuda
 def test_cuda_custom_is_deterministic():
     out, _, _ = _cuda_custom_graphs(True)
+    assert cudev is not None
     first = cudev.copyout(cudev.execute([out.node])[0])
     second = cudev.copyout(cudev.execute([out.node])[0])
     np.testing.assert_array_equal(first, second)
@@ -167,6 +172,7 @@ def test_cuda_backward_runs_and_matches_numpy():
     out, leaves, _ = _cuda_custom_graphs(True)
     (out * out).sum().backward()
     for leaf in leaves:
+        assert leaf.grad is not None
         check(cudev, leaf.grad, rtol=1e-4, atol=1e-4)
 
 
