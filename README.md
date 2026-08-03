@@ -90,6 +90,13 @@ Three rules hold it together:
 | reduce | `SUM`, `MAX` |
 | indexed | `GATHER`, `SCATTER` |
 | barriers | `CONTIGUOUS`, `ASSIGN` |
+| escape hatch | `CUSTOM` |
+
+`CUSTOM` is the one door out of the composition: it names a kernel a device supplies whole
+instead of lowering a loop nest, and `sdpa`, the fused attention, is the one limn has. The
+numpy device interprets it as the reference every backend's kernel is diffed against, and a
+device that registers no kernel for the name never sees the node at all: the frontend
+composes the op from the primitives instead.
 
 Six dtypes: `float64`, `float32`, `float16`, `int32`, `int16`, and `int8`. `float16` is a
 storage width, not a working precision: it halves the bytes a kernel moves, and every device
