@@ -33,7 +33,7 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from limn.codegen import LoopNest, lower
+from limn.codegen import LoopNest, lower_all
 from limn.device import Buffer
 from limn.ops import Node, Op, topological
 from limn.schedule import realized, schedule
@@ -181,8 +181,7 @@ class CompiledDevice:
         custom kernel sits in the plan exactly where the schedule put it.
         """
         kernels = schedule(sinks, order)
-        lowerable = [kernel for kernel in kernels if kernel.ast.op is not Op.CUSTOM]
-        nests = [lower(kernel, f"k{i}") for i, kernel in enumerate(lowerable)]
+        nests = lower_all(sinks, order, kernels)
         fns = iter(self.runners(nests) if nests else [])  # a graph of pure views schedules no kernels
         calls = tuple(
             Call(

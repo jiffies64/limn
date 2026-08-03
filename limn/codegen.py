@@ -351,8 +351,11 @@ def lower(kernel: Kernel, name: str) -> LoopNest:
     return LoopNest(name, kernel, space, tuple(instrs))
 
 
-def lower_all(sinks: list[Node], order: list[Node] | None = None) -> list[LoopNest]:
-    return [lower(kernel, f"k{k}") for k, kernel in enumerate(schedule(sinks, order))]
+def lower_all(sinks: list[Node], order: list[Node] | None = None, kernels: list[Kernel] | None = None) -> list[LoopNest]:
+    """Lower every scheduled kernel except the CUSTOM ones, which the device supplies whole:
+    the skip lives here so ir() and every executor agree on what lowers."""
+    kernels = schedule(sinks, order) if kernels is None else kernels
+    return [lower(kernel, f"k{k}") for k, kernel in enumerate(k for k in kernels if k.ast.op is not Op.CUSTOM)]
 
 
 MAX_PIECES = 4  # a mask cut finer than this is not worth a copy of the body per piece
