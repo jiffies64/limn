@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from limn.ops import DType, Node, Op, float16, float32, float64, int8, int16, int32
+from limn.ops import DType, Node, Op, bfloat16, float16, float32, float64, int8, int16, int32
 from limn.schedule import Kernel, addressed, realized, schedule
 from limn.view import View, canonical_strides
 
@@ -51,13 +51,14 @@ class Reduce(NamedTuple):
 
 
 REDUCES = {
-    Op.SUM: Reduce(Op.ADD, {float64: 0.0, float32: 0.0, float16: 0.0, int32: 0, int16: 0, int8: 0}),
+    Op.SUM: Reduce(Op.ADD, {float64: 0.0, float32: 0.0, float16: 0.0, bfloat16: 0.0, int32: 0, int16: 0, int8: 0}),
     Op.MAX: Reduce(
         Op.MAX,
         {
             float64: float("-inf"),
             float32: float("-inf"),
             float16: float("-inf"),
+            bfloat16: float("-inf"),
             int32: -(2**31),
             int16: -(2**15),
             int8: -(2**7),

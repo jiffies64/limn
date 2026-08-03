@@ -79,8 +79,9 @@ SPECS = {
     float16: Spec(
         halves, GRAPHS, ("cuda",), {"rtol": 2e-3, "atol": 1e-3}, {"rtol": 2e-2, "atol": 1e-3}, partial(halves, scale=0.01)
     ),
-    # bfloat16's eps is 2**-8 where float16's is 2**-10, so both tolerances are eight times wider
-    bfloat16: Spec(bfloats, GRAPHS, (), {"rtol": 1e-2, "atol": 1e-2}, {"rtol": 4e-2, "atol": 1e-2}),
+    # bfloat16's eps is 2**-8 where float16's is 2**-10, so both tolerances are eight times wider;
+    # the c device declines it as it declines float16, so cuda is its one compiled home
+    bfloat16: Spec(bfloats, GRAPHS, ("cuda",), {"rtol": 1e-2, "atol": 1e-2}, {"rtol": 4e-2, "atol": 1e-2}),
     float64: Spec(doubles, GRAPHS, BOTH, {"rtol": 1e-12, "atol": 1e-12}, {"rtol": 1e-12, "atol": 1e-12}),
     int8: Spec(partial(ints, dtype=int8), INT_GRAPHS, BOTH, EXACT, EXACT),
     int16: Spec(partial(ints, dtype=int16), INT_GRAPHS, BOTH, EXACT, EXACT),
@@ -93,7 +94,7 @@ CORPUS = [
     for graph in spec.graphs
 ]
 ON_CUDA = [pytest.param(dtype, id=str(dtype), marks=needs_cuda) for dtype, spec in SPECS.items() if "cuda" in spec.devices]
-TILED = [pytest.param(dtype, id=str(dtype), marks=needs_cuda) for dtype in (float16, float64, int16)]
+TILED = [pytest.param(dtype, id=str(dtype), marks=needs_cuda) for dtype in (float16, bfloat16, float64, int16)]
 
 
 def tensor(dtype: DType, *shape: int, seed: int = 0, requires_grad: bool = False) -> Tensor:
@@ -306,20 +307,22 @@ def test_a_matmul_big_enough_to_tile_matches_the_numpy_device(dtype, m, k, n):
 
 
 @needs_cuda
-def test_a_half_reduce_reads_four_elements_at_a_time():
-    a = tensor(float16, 2048, 192)
+@pytest.mark.parametrize("dtype", [float16, bfloat16], ids=str)
+def test_a_half_width_reduce_reads_four_elements_at_a_time(dtype):
+    a = tensor(dtype, 2048, 192)
     for t in (a.sum(-1), a.max(-1), a.softmax(-1)):
-        check(cudev, t, **SPECS[float16].tol)
+        check(cudev, t, **SPECS[dtype].tol)
 
 
 @needs_cuda
-def test_cuda_half_gradients_match_numpy_device():
-    x = tensor(float16, 128, 64, requires_grad=True)
-    w = tensor(float16, 64, 32, seed=1, requires_grad=True)
+@pytest.mark.parametrize("dtype", [float16, bfloat16], ids=str)
+def test_cuda_half_width_gradients_match_numpy_device(dtype):
+    x = tensor(dtype, 128, 64, requires_grad=True)
+    w = tensor(dtype, 64, 32, seed=1, requires_grad=True)
     (x @ w).relu().sum().backward()
     assert x.grad is not None and w.grad is not None
-    check(cudev, x.grad, **SPECS[float16].big_tol)
-    check(cudev, w.grad, **SPECS[float16].big_tol)
+    check(cudev, x.grad, **SPECS[dtype].big_tol)
+    check(cudev, w.grad, **SPECS[dtype].big_tol)
 
 
 @needs_cuda
@@ -341,9 +344,9 @@ def test_cuda_scatter_adds_doubles_atomically():
 
 
 @needs_cuda
-@pytest.mark.parametrize("dtype", [float16, int8, int16], ids=str)
+@pytest.mark.parametrize("dtype", [float16, bfloat16, int8, int16], ids=str)
 def test_cuda_says_which_dtypes_it_cannot_scatter(dtype):
-    """atomicAdd has no 8- or 16-bit overload, and a float16 one needs an architecture emission cannot see."""
+    """atomicAdd has no 8- or 16-bit overload, and a half-width one needs an architecture emission cannot see."""
     values = tensor(dtype, 2, 3, 4)
     indices = Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32))
     assert cudev is not None
