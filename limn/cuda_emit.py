@@ -92,13 +92,14 @@ struct __align__(8) half4_t {
 
 // bfloat16 without cuda_bf16.h: the top half of a float32, so widening is a shift and
 // rounding is one add on the float's own bits. The architecture's convert would do the
-// same but needs sm_80, and emission cannot see the architecture.
+// same but needs sm_80, and emission cannot see the architecture. NaN skips the add:
+// the hardware's canonical NaN is all mantissa ones, which the carry would turn into -0.
 struct __align__(2) bf16_t {
   unsigned short bits;
   bf16_t() = default;
   __device__ bf16_t(float f) {
     unsigned b = __float_as_uint(f);
-    bits = (unsigned short)((b + 0x7fff + ((b >> 16) & 1)) >> 16);
+    bits = f != f ? (unsigned short)0x7fc0 : (unsigned short)((b + 0x7fff + ((b >> 16) & 1)) >> 16);
   }
   __device__ operator float() const { return __uint_as_float((unsigned)bits << 16); }
 };

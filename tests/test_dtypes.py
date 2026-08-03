@@ -326,6 +326,13 @@ def test_cuda_half_width_gradients_match_numpy_device(dtype):
 
 
 @needs_cuda
+def test_a_cuda_bfloat16_store_keeps_nan():
+    """The device's canonical NaN is all ones below the sign; rounding it would carry to -0."""
+    z = Tensor(np.zeros(3, dtype=np.float32), dtype=bfloat16)
+    check(cudev, z / z)
+
+
+@needs_cuda
 def test_cuda_scatter_adds_doubles_atomically():
     """GATHER's gradient collides threads on repeated rows, which lands on atomicAdd in double."""
     indices_data = np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32)
