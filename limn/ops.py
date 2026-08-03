@@ -27,35 +27,41 @@ class DType:
 float64 = DType("float64", 8)  # a working precision above float32: every backend computes it natively, at its own width
 float32 = DType("float32", 4)
 float16 = DType("float16", 2)  # a storage width: half the bytes to move, and every backend widens it to compute
+bfloat16 = DType("bfloat16", 2)  # the other storage width: float32's exponent in two bytes, 7 mantissa bits
 int32 = DType("int32", 4)
 int16 = DType("int16", 2)  # the narrow ints are exact storage: arithmetic wraps modulo 2**width, the same on every device
 int8 = DType("int8", 1)
-DTYPES = (float64, float32, float16, int32, int16, int8)
-FLOATS = (float64, float32, float16)
+DTYPES = (float64, float32, float16, bfloat16, int32, int16, int8)
+FLOATS = (float64, float32, float16, bfloat16)
 INTS = (int32, int16, int8)
+HALF_FLOATS = (float16, bfloat16)  # storage widths: computed widened, reduced in float32, rounded back on store
 
 
 def promote(a: DType, b: DType) -> DType:
-    """The dtype an op on these two produces. Within a family the wider side wins; an int meeting
-    a float joins the floats, at float32 or wider, since ints never carry gradients and an int32
-    does not fit in a float16."""
+    """The dtype an op on these two produces. Within a family the wider side wins, except the two
+    half-width floats meet at float32: one keeps its mantissa and the other keeps its range, so
+    neither holds the other's numbers. An int meeting a float joins the floats, at float32 or
+    wider, since ints never carry gradients and an int32 does not fit in a float16."""
     if a == b:
         return a
     if (a in FLOATS) == (b in FLOATS):
+        if a.itemsize == b.itemsize:
+            return float32
         return max(a, b, key=lambda dtype: dtype.itemsize)
     wider = a if a in FLOATS else b
     return max(wider, float32, key=lambda dtype: dtype.itemsize)
 
 
 def accumulate_in(dtype: DType) -> DType:
-    """What a reduce keeps its running total in: wider than float16, the dtype itself otherwise.
+    """What a reduce keeps its running total in: wider than the half-width floats, the dtype itself otherwise.
 
-    A float16 total loses its low bits within a few hundred elements. The answer rounds back to
-    float16 once at the end, and every device owes this rule, the numpy reference included.
-    The int dtypes stay at their own width: addition wraps modulo 2**width, so a wider total
-    truncated at the end would land on the same bits anyway.
+    A float16 total loses its low bits within a few hundred elements, and bfloat16's 7-bit
+    mantissa loses them sooner. The answer rounds back to the storage width once at the end,
+    and every device owes this rule, the numpy reference included. The int dtypes stay at their
+    own width: addition wraps modulo 2**width, so a wider total truncated at the end would land
+    on the same bits anyway.
     """
-    return float32 if dtype == float16 else dtype
+    return float32 if dtype in HALF_FLOATS else dtype
 
 
 class Op(Enum):

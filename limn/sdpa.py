@@ -16,7 +16,10 @@ numpy device uses is `kernel` at the bottom.
 
 from __future__ import annotations
 
+import ml_dtypes
 import numpy as np
+
+HALF_FLOATS = (np.float16, np.dtype(ml_dtypes.bfloat16))  # storage widths: the recurrence runs wider
 
 
 def sdpa(
@@ -32,8 +35,8 @@ def sdpa(
 
     The inputs share their leading dims; q is (..., t_q, hd), k is (..., t_k, hd),
     v is (..., t_k, hd_v). causal wants t_q == t_k and hides keys to the right of each
-    query row. float16 inputs widen to float32 for the recurrence and round back once at
-    the end, the same rule every reduce in limn owes.
+    query row. half-width float inputs widen to float32 for the recurrence and round back
+    once at the end, the same rule every reduce in limn owes.
     """
     if q.ndim < 2 or k.ndim != q.ndim or v.ndim != q.ndim:
         raise ValueError(f"sdpa wants 2D+ inputs of equal rank, got {q.shape}, {k.shape}, {v.shape}")
@@ -44,7 +47,7 @@ def sdpa(
     if causal and q.shape[-2] != k.shape[-2]:
         raise ValueError(f"causal sdpa needs square keys, got {q.shape[-2]} queries and {k.shape[-2]} keys")
 
-    work = np.dtype(np.float32) if q.dtype == np.float16 else q.dtype
+    work = np.dtype(np.float32) if q.dtype in HALF_FLOATS else q.dtype
     Q, K, V = q.astype(work, copy=False), k.astype(work, copy=False), v.astype(work, copy=False)
     batch, t_q, t_k = q.shape[:-2], q.shape[-2], k.shape[-2]
 
@@ -93,6 +96,7 @@ def check() -> None:
         return rng.standard_normal(shape).astype(dtype)
 
     f32, f64, f16 = np.float32, np.float64, np.float16
+    bf16 = np.dtype(ml_dtypes.bfloat16)
     q = rand(f32, 2, 3, 128, 32)
     k = rand(f32, 2, 3, 128, 32)
     v = rand(f32, 2, 3, 128, 48)
@@ -107,10 +111,11 @@ def check() -> None:
         (hot_q, rand(f32, 256, 64), rand(f32, 256, 64), True, 1e-4, "f32 causal, Q x 100"),
         (rand(f64, 2, 64, 32), rand(f64, 2, 64, 32), rand(f64, 2, 64, 16), True, 1e-12, "f64 causal"),
         (rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 48), True, 2e-3, "f16 causal batched"),
+        (rand(bf16, 2, 3, 128, 32), rand(bf16, 2, 3, 128, 32), rand(bf16, 2, 3, 128, 48), True, 2e-2, "bf16 causal batched"),
     ]
     for cq, ck, cv, causal, tol, name in cases:
-        # float16 is compared widened: the check is the recurrence, not the storage rounding
-        wide = np.float32 if cq.dtype == f16 else cq.dtype
+        # half-width floats are compared widened: the check is the recurrence, not the storage rounding
+        wide = np.float32 if cq.dtype in HALF_FLOATS else cq.dtype
         scale = cq.shape[-1] ** -0.5
         expected = _plain(cq.astype(wide), ck.astype(wide), cv.astype(wide), causal=causal, scale=scale)
         worst, worst_block = 0.0, 0

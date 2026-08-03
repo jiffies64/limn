@@ -2,25 +2,29 @@
 
 float16 is a storage width, so every device widens it to compute and a reduce totals in float32;
 its tolerances are float16's own rounding rather than the 1e-5 the float32 corpus is diffed at.
-float64 is a working precision every device computes natively, seven digits tighter. int8 and
-int16 are exact storage whose arithmetic wraps modulo 2**width identically everywhere, so they
-are diffed for equality. What differs per dtype is the table below; the tests it feeds are shared.
+bfloat16 is the other storage width: the same rules, float32's range, and a coarser mantissa, so
+its tolerances are eight times wider still. float64 is a working precision every device computes
+natively, seven digits tighter. int8 and int16 are exact storage whose arithmetic wraps modulo
+2**width identically everywhere, so they are diffed for equality. What differs per dtype is the
+table below; the tests it feeds are shared.
 """
 
 from functools import partial
 from typing import Any, Callable, NamedTuple
 
+import ml_dtypes
 import numpy as np
 import pytest
 from conftest import BACKENDS, GRAPHS, check, cdev, cudev, needs_cc, needs_cuda, randf
 
 from limn import Tensor, set_device
 from limn.device import NUMPY_DTYPES
-from limn.ops import DType, INTS, float16, float32, float64, int8, int16, int32, promote
+from limn.ops import DType, INTS, bfloat16, float16, float32, float64, int8, int16, int32, promote
 from limn.optim import AdamW
 from limn.tensor import scatter_rows
 
 NARROW = {int8: np.int8, int16: np.int16}
+BFLOAT16 = np.dtype(ml_dtypes.bfloat16)
 
 
 def halves(*shape: int, scale: float = 1.0, seed: int = 0) -> np.ndarray:
@@ -30,6 +34,11 @@ def halves(*shape: int, scale: float = 1.0, seed: int = 0) -> np.ndarray:
     identical, and a graph over a == b stops telling a + b from 2a.
     """
     return (np.random.default_rng((seed, *shape)).random(shape).astype(np.float32) * scale).astype(np.float16)
+
+
+def bfloats(*shape: int, seed: int = 0) -> np.ndarray:
+    """Values in [0, 1): bfloat16's 7 mantissa bits resolve them, and its range never clips them."""
+    return np.random.default_rng((seed, *shape)).random(shape).astype(np.float32).astype(BFLOAT16)
 
 
 def doubles(*shape: int, seed: int = 0) -> np.ndarray:
@@ -70,6 +79,8 @@ SPECS = {
     float16: Spec(
         halves, GRAPHS, ("cuda",), {"rtol": 2e-3, "atol": 1e-3}, {"rtol": 2e-2, "atol": 1e-3}, partial(halves, scale=0.01)
     ),
+    # bfloat16's eps is 2**-8 where float16's is 2**-10, so both tolerances are eight times wider
+    bfloat16: Spec(bfloats, GRAPHS, (), {"rtol": 1e-2, "atol": 1e-2}, {"rtol": 4e-2, "atol": 1e-2}),
     float64: Spec(doubles, GRAPHS, BOTH, {"rtol": 1e-12, "atol": 1e-12}, {"rtol": 1e-12, "atol": 1e-12}),
     int8: Spec(partial(ints, dtype=int8), INT_GRAPHS, BOTH, EXACT, EXACT),
     int16: Spec(partial(ints, dtype=int16), INT_GRAPHS, BOTH, EXACT, EXACT),
@@ -81,7 +92,7 @@ CORPUS = [
     for name in spec.devices
     for graph in spec.graphs
 ]
-ON_CUDA = [pytest.param(dtype, id=str(dtype), marks=needs_cuda) for dtype in SPECS]
+ON_CUDA = [pytest.param(dtype, id=str(dtype), marks=needs_cuda) for dtype, spec in SPECS.items() if "cuda" in spec.devices]
 TILED = [pytest.param(dtype, id=str(dtype), marks=needs_cuda) for dtype in (float16, float64, int16)]
 
 
@@ -93,11 +104,18 @@ def tensor(dtype: DType, *shape: int, seed: int = 0, requires_grad: bool = False
 
 
 def test_promotion_takes_the_wider_side_and_a_float_beats_an_int():
-    assert promote(float16, float16) == float16 and promote(int8, int8) == int8
+    assert promote(float16, float16) == float16 and promote(bfloat16, bfloat16) == bfloat16 and promote(int8, int8) == int8
     assert promote(float16, float32) == float32 and promote(int8, int16) == int16 and promote(int16, int32) == int32
     assert promote(float64, float32) == float64 and promote(float64, float16) == float64
     assert promote(float16, int32) == float32 and promote(int8, float16) == float32 and promote(int16, float32) == float32
     assert promote(float64, int32) == float64 and promote(float64, int8) == float64
+
+
+def test_the_two_half_width_floats_meet_at_float32():
+    """float16 keeps mantissa and bfloat16 keeps range, so neither can hold the other's numbers."""
+    assert promote(float16, bfloat16) == float32 and promote(bfloat16, float16) == float32
+    assert promote(bfloat16, float32) == float32 and promote(bfloat16, float64) == float64
+    assert promote(bfloat16, int8) == float32 and promote(int32, bfloat16) == float32
 
 
 @pytest.mark.parametrize("dtype", list(SPECS), ids=str)
@@ -131,13 +149,15 @@ def test_round_trips_through_the_numpy_device_at_its_own_width(dtype):
     assert t.numpy().nbytes == 5 * 7 * dtype.itemsize
 
 
-@pytest.mark.parametrize("dtype,default", [(float16, float32), (float64, float32), (int8, int32), (int16, int32)], ids=str)
+@pytest.mark.parametrize(
+    "dtype,default", [(float16, float32), (bfloat16, float32), (float64, float32), (int8, int32), (int16, int32)], ids=str
+)
 def test_a_numpy_array_of_this_dtype_still_defaults_to_the_working_width(dtype, default):
     """The other widths are opt-in: what the array holds does not change what Tensor picks."""
     assert Tensor(SPECS[dtype].gen(4, 3)).dtype == default
 
 
-@pytest.mark.parametrize("dtype,rtol", [(float16, 2e-3), (float64, 1e-15)], ids=str)
+@pytest.mark.parametrize("dtype,rtol", [(float16, 2e-3), (bfloat16, 2e-2), (float64, 1e-15)], ids=str)
 def test_a_float_dtype_carries_gradients_at_its_own_width(dtype, rtol):
     x = tensor(dtype, 4, 5, requires_grad=True)
     (x * x).sum().backward()
@@ -145,7 +165,7 @@ def test_a_float_dtype_carries_gradients_at_its_own_width(dtype, rtol):
     np.testing.assert_allclose(x.grad.numpy().astype(np.float64), 2 * x.numpy().astype(np.float64), rtol=rtol)
 
 
-@pytest.mark.parametrize("dtype", [float16, float64], ids=str)
+@pytest.mark.parametrize("dtype", [float16, bfloat16, float64], ids=str)
 def test_a_cast_between_float_dtypes_carries_gradients(dtype):
     """Mixed precision is float32 weights met by another width, so the cast between cannot detach."""
     w = Tensor(randf(4, 3), requires_grad=True)
@@ -154,13 +174,13 @@ def test_a_cast_between_float_dtypes_carries_gradients(dtype):
     assert w.grad.dtype == float32, "a gradient has to come back at the width of the leaf it lands on"
 
 
-@pytest.mark.parametrize("dtype", [float16, float64], ids=str)
+@pytest.mark.parametrize("dtype", [float16, bfloat16, float64], ids=str)
 def test_a_cast_through_an_int_still_detaches(dtype):
     """An int carries no gradient, so a graph that goes through one reaches no leaf."""
     assert not (tensor(dtype, 4, 3, requires_grad=True) * 4.0).int().cast(dtype).requires_grad
 
 
-@pytest.mark.parametrize("dtype", [float16, float64], ids=str)
+@pytest.mark.parametrize("dtype", [float16, bfloat16, float64], ids=str)
 def test_mixing_a_parameter_with_float32_leaves_it_trainable(dtype):
     """broadcast_pair inserts the widening cast itself, which is where the gradient used to stop."""
     p = tensor(dtype, 4, 3, requires_grad=True)
@@ -168,7 +188,7 @@ def test_mixing_a_parameter_with_float32_leaves_it_trainable(dtype):
     assert p.grad is not None and p.grad.dtype == dtype
 
 
-@pytest.mark.parametrize("dtype,state", [(float16, float32), (float64, float64)], ids=str)
+@pytest.mark.parametrize("dtype,state", [(float16, float32), (bfloat16, float32), (float64, float64)], ids=str)
 def test_an_optimizer_moves_a_parameter_of_this_dtype_and_keeps_its_state_wide(dtype, state):
     """State is promote(param, float32): a half does not shrink it, a double keeps its width. AdamW
     passes over a parameter whose grad is None, so a detached cast would freeze it in place."""
@@ -190,6 +210,12 @@ def test_a_half_reduce_totals_in_float32():
     """Summed in float16 the tail of this vector would vanish into the running total."""
     data = np.concatenate([np.array([2048.0], dtype=np.float16), np.ones(4096, dtype=np.float16)])
     assert float(Tensor(data, dtype=float16).sum().numpy()) == pytest.approx(2048.0 + 4096.0, rel=1e-3)
+
+
+def test_a_bfloat16_reduce_totals_in_float32():
+    """bf16's 7-bit mantissa stalls even sooner: at 256 the ulp is 2, so 0.5 cannot join a bf16 total."""
+    data = np.concatenate([np.array([256.0], dtype=BFLOAT16), np.full(4096, 0.5, dtype=BFLOAT16)])
+    assert float(Tensor(data, dtype=bfloat16).sum().numpy()) == pytest.approx(256.0 + 2048.0, rel=1e-2)
 
 
 def test_double_holds_what_float32_loses():
