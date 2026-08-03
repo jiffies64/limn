@@ -45,19 +45,18 @@ def sdpa(
         raise ValueError(f"causal sdpa needs square keys, got {q.shape[-2]} queries and {k.shape[-2]} keys")
 
     work = np.dtype(np.float32) if q.dtype == np.float16 else q.dtype
-    Q, K, V = q.astype(work), k.astype(work), v.astype(work)
+    Q, K, V = q.astype(work, copy=False), k.astype(work, copy=False), v.astype(work, copy=False)
     batch, t_q, t_k = q.shape[:-2], q.shape[-2], k.shape[-2]
 
     out = np.zeros(batch + (t_q, v.shape[-1]), dtype=work)
     running_max = np.full(batch + (t_q,), -np.inf, dtype=work)
     running_sum = np.zeros(batch + (t_q,), dtype=work)
+    rows = np.arange(t_q)[:, None]  # the mask's trailing dims broadcast over any batch
     for j0 in range(0, t_k, block_size):
         j1 = min(j0 + block_size, t_k)
         scores = Q @ K[..., j0:j1, :].swapaxes(-1, -2) * scale
         if causal:
-            rows = np.arange(t_q).reshape((1,) * len(batch) + (t_q, 1))
-            cols = np.arange(j0, j1).reshape((1,) * len(batch) + (1, j1 - j0))
-            scores = np.where(cols <= rows, scores, -np.inf)
+            scores = np.where(np.arange(j0, j1) <= rows, scores, -np.inf)
         block_max = scores.max(axis=-1)
         new_max = np.maximum(running_max, block_max)
         rescale = np.exp(running_max - new_max)
@@ -81,9 +80,7 @@ def _plain(q: np.ndarray, k: np.ndarray, v: np.ndarray, *, causal: bool, scale: 
     """Attention the obvious way, for the checker to diff against: builds the whole t_q by t_k."""
     scores = q @ k.swapaxes(-1, -2) * scale
     if causal:
-        rows = np.arange(q.shape[-2]).reshape((1,) * (q.ndim - 2) + (q.shape[-2], 1))
-        cols = np.arange(k.shape[-2]).reshape((1,) * (q.ndim - 2) + (1, k.shape[-2]))
-        scores = np.where(cols <= rows, scores, -np.inf)
+        scores = np.where(np.arange(k.shape[-2]) <= np.arange(q.shape[-2])[:, None], scores, -np.inf)
     shifted = scores - scores.max(axis=-1, keepdims=True)
     p = np.exp(shifted)
     return (p / p.sum(axis=-1, keepdims=True)) @ v
@@ -103,22 +100,23 @@ def check() -> None:
     tail = rand(f32, 100, 32)
     hot_q = rand(f32, 256, 64) * 100.0
     cases = [
-        (q, k, v, True, 32, f32, 1e-5, "f32 causal batched (2,3,128,32)"),
-        (q, k, v, False, 32, f32, 1e-5, "f32 full batched (2,3,128,32)"),
-        (rect_q, rect_k, rect_v, False, 16, f32, 1e-5, "f32 rectangular 64x160"),
-        (tail, tail, rand(f32, 100, 32), False, 32, f32, 1e-5, "f32 100 keys, undivided tail"),
-        (hot_q, rand(f32, 256, 64), rand(f32, 256, 64), True, 64, f32, 1e-4, "f32 causal, Q x 100"),
-        (rand(f64, 2, 64, 32), rand(f64, 2, 64, 32), rand(f64, 2, 64, 16), True, 32, f64, 1e-12, "f64 causal"),
-        (rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 48), True, 32, f16, 2e-3, "f16 causal batched"),
+        (q, k, v, True, 1e-5, "f32 causal batched (2,3,128,32)"),
+        (q, k, v, False, 1e-5, "f32 full batched (2,3,128,32)"),
+        (rect_q, rect_k, rect_v, False, 1e-5, "f32 rectangular 64x160"),
+        (tail, tail, rand(f32, 100, 32), False, 1e-5, "f32 100 keys, undivided tail"),
+        (hot_q, rand(f32, 256, 64), rand(f32, 256, 64), True, 1e-4, "f32 causal, Q x 100"),
+        (rand(f64, 2, 64, 32), rand(f64, 2, 64, 32), rand(f64, 2, 64, 16), True, 1e-12, "f64 causal"),
+        (rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 48), True, 2e-3, "f16 causal batched"),
     ]
-    for cq, ck, cv, causal, hd, dtype, tol, name in cases:
+    for cq, ck, cv, causal, tol, name in cases:
         # float16 is compared widened: the check is the recurrence, not the storage rounding
-        wide = np.float32 if dtype == f16 else dtype
-        expected = _plain(cq.astype(wide), ck.astype(wide), cv.astype(wide), causal=causal, scale=hd**-0.5)
+        wide = np.float32 if cq.dtype == f16 else cq.dtype
+        scale = cq.shape[-1] ** -0.5
+        expected = _plain(cq.astype(wide), ck.astype(wide), cv.astype(wide), causal=causal, scale=scale)
         worst, worst_block = 0.0, 0
         for block in (1, 16, ck.shape[-2], ck.shape[-2] + 7):
-            got = sdpa(cq, ck, cv, causal=causal, scale=hd**-0.5, block_size=block)
-            assert got.dtype == dtype, f"{name}: result dtype {got.dtype}, want {dtype}"
+            got = sdpa(cq, ck, cv, causal=causal, scale=scale, block_size=block)
+            assert got.dtype == cq.dtype, f"{name}: result dtype {got.dtype}, want {cq.dtype}"
             diff = float(np.abs(got.astype(wide) - expected).max())
             worst, worst_block = (diff, block) if diff > worst else (worst, worst_block)
         verdict = "ok " if worst <= tol else "FAIL"

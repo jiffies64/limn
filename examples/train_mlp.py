@@ -6,7 +6,7 @@ from limn import Tensor, set_seed
 from limn.nn import Linear, parameters
 from limn.ops import Node, Op, topological
 from limn.optim import AdamW
-from limn.schedule import CUT_OPS, addressed, realized, schedule
+from limn.schedule import boundaries, realized, schedule
 
 
 class MLP:
@@ -31,17 +31,13 @@ CUT_REASON = {
 
 
 def cut_reasons(sinks: list[Node]) -> dict[Node, str]:
-    """Why each cut node needs its own buffer: the scheduler's boundaries(), with the reason kept."""
-    reasons: dict[Node, str] = {}
-    for node in topological(sinks):
-        if node.op in CUT_OPS:
-            reasons[node] = CUT_REASON[node.op]
-        if (src := addressed(node)) is not None and src.op not in (Op.BUFFER, Op.CONST):
-            reasons.setdefault(src, f"a {node.op.name} indexes into its layout, so the bytes must exist")
-    for sink in sinks:
-        if (home := realized(sink)).op is not Op.BUFFER:
-            reasons.setdefault(home, "requested as an output")
-    return reasons
+    """Why each cut node needs its own buffer: boundaries() decides, this only names the rule."""
+    homes = {realized(sink) for sink in sinks}
+    return {
+        node: CUT_REASON.get(node.op)
+        or ("requested as an output" if node in homes else "a view or gather indexes its layout, so the bytes must exist")
+        for node in boundaries(sinks, topological(sinks))
+    }
 
 
 def report_fusion(title: str, *tensors: Tensor) -> None:

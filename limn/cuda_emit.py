@@ -745,15 +745,24 @@ def emit_sdpa(node) -> str:
     dtype = node.dtype
     comp = CUDA_VALUE[accumulate_in(dtype)]  # the width the recurrence runs at
     mem = CUDA_TYPE[dtype]  # the width the buffers hold
-    exp = "expf" if comp == "float" else "exp"
-    fmax = "fmaxf" if comp == "float" else "fmax"
-    suf = "f" if comp == "float" else ""
-    zero = "0.0" + suf
+    exp, fmax = ("expf", "fmaxf") if comp == "float" else ("exp", "fmax")
+    zero = c_literal(0.0, accumulate_in(dtype))
     hd, t_q, t_k, hd_v = q.shape[-1], q.shape[-2], k.shape[-2], v.shape[-1]
     n_chunks = math.ceil(t_q / BLOCK)
     tile = SDPA_TILE_K
     scale_lit = c_literal(scale, accumulate_in(dtype))
     keys_end = "i + 1" if causal else f"{t_k}LL"
+    block_keys = f"(row_chunk + 1) * {BLOCK} < {t_k} ? (row_chunk + 1) * {BLOCK} : {t_k}LL" if causal else f"{t_k}LL"
+
+    def load_tile(name: str, base: str, width: int) -> list[str]:
+        """One cooperative copy of a key/value tile into shared memory, zero-filled past t_k."""
+        return [
+            f"    for (int idx = (int)threadIdx.x; idx < {tile} * {width}; idx += blockDim.x) {{",
+            f"      int lj = idx / {width}, d = idx - lj * {width};",
+            "      long long j = j0 + lj;",
+            f"      {name}[lj][d] = j < {t_k} ? {base}[j * {width} + d] : {mem}({zero});",
+            "    }",
+        ]
 
     lines = [
         kernel_sig(SDPA_KERNEL, [q.dtype, k.dtype, v.dtype], dtype),
@@ -775,18 +784,10 @@ def emit_sdpa(node) -> str:
         f"    for (int d = 0; d < {hd}; d++) q_local[d] = ({comp})q_row[d];",
         "  }",
         f"  long long keys_end = valid ? ({keys_end}) : 0LL;",
-        *([f"  long long block_keys = (row_chunk + 1) * {BLOCK} < {t_k} ? (row_chunk + 1) * {BLOCK} : {t_k}LL;"] if causal else []),
-        f"  for (long long j0 = 0; j0 < {'block_keys' if causal else t_k}; j0 += {tile}) {{",
-        f"    for (int idx = (int)threadIdx.x; idx < {tile} * {hd}; idx += blockDim.x) {{",
-        f"      int lj = idx / {hd};",
-        "      long long j = j0 + lj;",
-        f"      K_tile[lj][idx - lj * {hd}] = j < {t_k} ? k_base[j * {hd} + (idx - lj * {hd})] : {mem}({zero});",
-        "    }",
-        f"    for (int idx = (int)threadIdx.x; idx < {tile} * {hd_v}; idx += blockDim.x) {{",
-        f"      int lj = idx / {hd_v};",
-        "      long long j = j0 + lj;",
-        f"      V_tile[lj][idx - lj * {hd_v}] = j < {t_k} ? v_base[j * {hd_v} + (idx - lj * {hd_v})] : {mem}({zero});",
-        "    }",
+        f"  long long block_keys = {block_keys};",
+        f"  for (long long j0 = 0; j0 < block_keys; j0 += {tile}) {{",
+        *load_tile("K_tile", "k_base", hd),
+        *load_tile("V_tile", "v_base", hd_v),
         "    __syncthreads();",
         f"    long long tile_end = j0 + {tile} < keys_end ? j0 + {tile} : keys_end;",
         "    for (long long j = j0; j < tile_end; j++) {",

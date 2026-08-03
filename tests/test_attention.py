@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import needs_cc, needs_cuda, read
+from conftest import check, cudev, needs_cc, needs_cuda
 
 from limn import Tensor, grad, set_device, set_seed
 from limn.nn import Linear, parameters
@@ -150,66 +150,49 @@ def _cuda_custom_graphs(causal: bool):
 @needs_cuda
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 def test_cuda_matches_the_numpy_custom(causal):
-    from limn import backend_cuda
-
-    dev = backend_cuda.CudaDevice()
     out, _, _ = _cuda_custom_graphs(causal)
-    got = read(dev, dev.execute([out.node])[0], out)  # the device under test runs before .numpy() retires
-    np.testing.assert_allclose(got, out.numpy(), rtol=1e-5, atol=1e-5)
+    check(cudev, out)
 
 
 @needs_cuda
 def test_cuda_custom_is_deterministic():
-    from limn import backend_cuda
-
-    dev = backend_cuda.CudaDevice()
     out, _, _ = _cuda_custom_graphs(True)
-    first = dev.copyout(dev.execute([out.node])[0])
-    second = dev.copyout(dev.execute([out.node])[0])
+    first = cudev.copyout(cudev.execute([out.node])[0])
+    second = cudev.copyout(cudev.execute([out.node])[0])
     np.testing.assert_array_equal(first, second)
 
 
 @needs_cuda
 def test_cuda_backward_runs_and_matches_numpy():
-    from limn import backend_cuda
-
-    dev = backend_cuda.CudaDevice()
-    out, leaves, (qd, kd, vd) = _cuda_custom_graphs(True)
+    out, leaves, _ = _cuda_custom_graphs(True)
     (out * out).sum().backward()
-    q = Tensor(qd, requires_grad=True)
-    k = Tensor(kd, requires_grad=True)
-    v = Tensor(vd, requires_grad=True)
-    want_out = q.attention(k, v, causal=True)
-    (want_out * want_out).sum().backward()
-    for leaf, want in zip(leaves, (q, k, v), strict=True):
-        got = read(dev, dev.execute([leaf.grad.node])[0], leaf.grad)
-        np.testing.assert_allclose(got, want.grad.numpy(), rtol=1e-4, atol=1e-4)
+    for leaf in leaves:
+        check(cudev, leaf.grad, rtol=1e-4, atol=1e-4)
 
 
 @needs_cuda
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 def test_cuda_handles_a_ragged_key_tail(causal):
     """100 keys is 3 tiles and a remainder, so the zero-filled tail of the last tile runs."""
-    from limn import backend_cuda
-
-    dev = backend_cuda.CudaDevice()
     q, k, v = rand(2, 2, 100, 16), rand(2, 2, 100, 16), rand(2, 2, 100, 24)
-    out = q.attention(k, v, causal=causal)
-    got = read(dev, dev.execute([out.node])[0], out)
-    np.testing.assert_allclose(got, out.numpy(), rtol=1e-5, atol=1e-5)
+    check(cudev, q.attention(k, v, causal=causal))
 
 
 @needs_cuda
 def test_cuda_rows_beyond_one_block_chunk():
     """300 rows split across two blocks: the second block's tail threads sit past t_q, and
     under causal the first block stops streaming tiles at its own diagonal."""
-    from limn import backend_cuda
-
-    dev = backend_cuda.CudaDevice()
     q, k, v = rand(300, 16), rand(300, 16), rand(300, 24)
-    out = q.attention(k, v, causal=True)
-    got = read(dev, dev.execute([out.node])[0], out)
-    np.testing.assert_allclose(got, out.numpy(), rtol=1e-5, atol=1e-5)
+    check(cudev, q.attention(k, v, causal=True))
+
+
+def test_ir_prints_over_a_custom_kernel():
+    """The custom kernel never lowers, so the printable IR shows everything but it."""
+    from limn.codegen import ir
+
+    q, k, v = rand(2, 8, 16), rand(2, 8, 16), rand(2, 8, 16)
+    text = ir(q.attention(k, v, causal=True))
+    assert text and "CUSTOM" not in text
 
 
 @needs_cuda
@@ -217,20 +200,16 @@ def test_capture_replays_the_custom_step():
     from limn import capture
 
     set_device("cuda")
-    try:
-        qd, kd, vd = (rng.standard_normal(s).astype(np.float32) for s in ((2, 3, 32, 16),) * 2 + ((2, 3, 32, 24),))
-        q, k, v = (Tensor(d) for d in (qd, kd, vd))
+    qd, kd, vd = (rng.standard_normal(s).astype(np.float32) for s in ((2, 3, 32, 16),) * 2 + ((2, 3, 32, 24),))
+    q, k, v = (Tensor(d) for d in (qd, kd, vd))
 
-        def step(q, k, v):
-            return q.attention(k, v, causal=True).realize()
+    def step(q, k, v):
+        return q.attention(k, v, causal=True).realize()
 
-        direct = step(q, k, v).numpy()
-        replayed = capture(step)
-        results = [replayed(q, k, v).numpy() for _ in range(3)]  # observe twice, then a real replay
-        for got in results:
-            np.testing.assert_array_equal(got, direct)
-    finally:
-        set_device("numpy")
+    direct = step(q, k, v).numpy()
+    replayed = capture(step)
+    for got in [replayed(q, k, v).numpy() for _ in range(3)]:  # observe twice, then a real replay
+        np.testing.assert_array_equal(got, direct)
 
 
 @needs_cc
@@ -238,13 +217,11 @@ def test_unregistered_device_falls_back_to_composed():
     shapes = ((2, 3, 32, 8), (2, 3, 32, 8), (2, 3, 32, 12))
     data = [rng.standard_normal(s).astype(np.float32) for s in shapes]
     set_device("c")
-    try:
-        q, k, v = (Tensor(d) for d in data)
-        t = q.attention(k, v, causal=True)
-        assert Op.CUSTOM not in {n.op for n in topological([t.node])}
-        got = t.numpy()
-    finally:
-        set_device("numpy")
+    q, k, v = (Tensor(d) for d in data)
+    t = q.attention(k, v, causal=True)
+    assert Op.CUSTOM not in {n.op for n in topological([t.node])}
+    got = t.numpy()
+    set_device("numpy")
     q, k, v = (Tensor(d) for d in data)
     want = composed_attention(q, k, v, causal=True, scale=8**-0.5)
     np.testing.assert_allclose(got, want.numpy(), rtol=1e-5, atol=1e-5)
