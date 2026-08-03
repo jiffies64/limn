@@ -232,6 +232,7 @@ def test_gather_reads_a_narrow_table_and_scatter_sums_into_one():
 @needs_cc
 def test_the_c_device_says_it_has_no_half_rather_than_emitting_nonsense():
     a = tensor(float16, 4, 3)
+    assert cdev is not None
     with pytest.raises(NotImplementedError, match="float16"):
         cdev.execute([(a + a).node])
 
@@ -240,6 +241,7 @@ def test_the_c_device_says_it_has_no_half_rather_than_emitting_nonsense():
 def test_the_c_device_catches_a_half_it_only_computes_in():
     """A CAST fuses, so this nest reads and writes float32 and is float16 in the middle."""
     x, y = Tensor(randf(4, 3)), Tensor(randf(4, 3))
+    assert cdev is not None
     with pytest.raises(NotImplementedError, match="float16"):
         cdev.execute([((x.half() * 2.0).float() + y).node])
 
@@ -287,6 +289,7 @@ def test_cuda_half_gradients_match_numpy_device():
     x = tensor(float16, 128, 64, requires_grad=True)
     w = tensor(float16, 64, 32, seed=1, requires_grad=True)
     (x @ w).relu().sum().backward()
+    assert x.grad is not None and w.grad is not None
     check(cudev, x.grad, **SPECS[float16].big_tol)
     check(cudev, w.grad, **SPECS[float16].big_tol)
 
@@ -300,6 +303,7 @@ def test_cuda_scatter_adds_doubles_atomically():
     try:
         table = tensor(float64, 6, 4, requires_grad=True)
         (table.gather_rows(Tensor(indices_data)) * Tensor(weights, dtype=float64)).sum().backward()
+        assert table.grad is not None
         got = table.grad.numpy()
     finally:
         set_device("numpy")
@@ -314,6 +318,7 @@ def test_cuda_says_which_dtypes_it_cannot_scatter(dtype):
     """atomicAdd has no 8- or 16-bit overload, and a float16 one needs an architecture emission cannot see."""
     values = tensor(dtype, 2, 3, 4)
     indices = Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32))
+    assert cudev is not None
     with pytest.raises(NotImplementedError, match=str(dtype)):
         cudev.execute([scatter_rows(values, indices, (6, 4)).node])
 
