@@ -30,14 +30,13 @@ class Block:
         self.proj = Linear(DIM, DIM)
         self.up, self.down = Linear(DIM, 4 * DIM), Linear(4 * DIM, DIM)
 
-    def __call__(self, x: Tensor, mask: Tensor) -> Tensor:
+    def __call__(self, x: Tensor) -> Tensor:
         b, t, c = x.shape
         hd = c // HEADS
         qkv = self.qkv(self.ln1(x)).reshape(b, t, 3, HEADS, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv
-        scores = (q @ k.transpose(-2, -1)) * (1.0 / hd**0.5)
-        att = mask.where(scores, -1e9).softmax(-1)
-        x = x + self.proj((att @ v).permute(0, 2, 1, 3).reshape(b, t, c))
+        att = q.attention(k, v, causal=True)
+        x = x + self.proj(att.permute(0, 2, 1, 3).reshape(b, t, c))
         return x + self.down(self.up(self.ln2(x)).relu())
 
 
@@ -49,17 +48,11 @@ class GPT:
         self.ln = LayerNorm(DIM)
         self.head = Linear(DIM, VOCAB, bias=False)
 
-    def __call__(self, tokens: Tensor, mask: Tensor) -> Tensor:
+    def __call__(self, tokens: Tensor) -> Tensor:
         x = self.tok(tokens) + self.pos(Tensor.arange(CTX))
         for block in self.blocks:
-            x = block(x, mask)
+            x = block(x)
         return self.head(self.ln(x))
-
-
-def causal_mask() -> Tensor:
-    rows = Tensor.arange(CTX).reshape(CTX, 1)
-    cols = Tensor.arange(CTX).reshape(1, CTX)
-    return (cols <= rows).reshape(1, 1, CTX, CTX)
 
 
 def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
@@ -95,7 +88,7 @@ def load_checkpoint(path: Path, params: list[Tensor]) -> None:
     realize(*[p.assign(Tensor(stored[f"arr_{i}"])) for i, p in enumerate(params)])
 
 
-def sample(model: GPT, mask: Tensor, n: int, temperature: float, rng: np.random.Generator) -> str:
+def sample(model: GPT, n: int, temperature: float, rng: np.random.Generator) -> str:
     window = np.full(CTX, ord("\n"), dtype=np.int32)
     prompt = b"Once upon a time"
     window[-len(prompt) :] = np.frombuffer(prompt, dtype=np.uint8)
@@ -103,7 +96,7 @@ def sample(model: GPT, mask: Tensor, n: int, temperature: float, rng: np.random.
     with no_grad():
         for _ in range(n):
             # only the last position predicts, so drop the rest on the device rather than copy it back
-            logits = model(Tensor(window.reshape(1, CTX)), mask)[0, -1].numpy()
+            logits = model(Tensor(window.reshape(1, CTX)))[0, -1].numpy()
             weights = np.exp((logits - logits.max()) / temperature)
             token = int(rng.choice(VOCAB, p=weights / weights.sum()))
             out.append(token)
@@ -138,7 +131,6 @@ def main() -> None:
         load_checkpoint(checkpoint, params)
         print(f"resumed from {checkpoint}")
     opt = AdamW(params, lr=args.lr)
-    mask = causal_mask().realize()  # realized once; unrealized it would be recomputed inside every step
 
     budget = args.tokens if args.tokens is not None else (500_000_000 if args.full else 50_000_000)
     tokens_per_step = args.batch * CTX
@@ -148,7 +140,7 @@ def main() -> None:
     @capture
     def train_step(x: Tensor, y: Tensor) -> Tensor:
         opt.zero_grad()
-        loss = cross_entropy(model(x, mask), y)
+        loss = cross_entropy(model(x), y)
         loss.backward()
         opt.step(loss)  # the loss realizes with the updates, so logging it costs no second forward
         opt.zero_grad()  # once recorded the function never runs again; leave no gradient graphs behind
@@ -167,7 +159,7 @@ def main() -> None:
             save_checkpoint(checkpoint, params)
 
     print(f"\ndone in {(time.perf_counter() - start) / 3600:.2f}h; a story:\n")
-    print(sample(model, mask, args.sample_bytes, args.temperature, rng))
+    print(sample(model, args.sample_bytes, args.temperature, rng))
 
 
 if __name__ == "__main__":
