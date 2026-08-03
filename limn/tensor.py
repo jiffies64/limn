@@ -534,7 +534,22 @@ class Tensor:
             return composed_attention(q, k, v, causal=causal, scale=scale)
         q, k, v = _contiguous(q), _contiguous(k), _contiguous(v)
         node = Node(Op.CUSTOM, (q.node, k.node, v.node), wider, batch + (q.shape[-2], v.shape[-1]), ("sdpa", causal, scale))
-        return Tensor.from_node(node, (q, k, v))
+        mask = _causal_mask(q.shape[-2], k.shape[-2]) if causal else None
+
+        def backward(g: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+            # the probabilities are recomputed, not saved: the forward kept no t_q by t_k
+            scores = (q @ k.transpose(-2, -1)) * scale
+            if mask is not None:
+                scores = mask.where(scores, -1e9)
+            p = scores.softmax(-1)
+            dp = g @ v.transpose(-2, -1)
+            ds = p * (dp - (dp * p).sum(axis=-1, keepdim=True))
+            if mask is not None:
+                ds = mask.where(ds, 0)
+            ds = ds * scale
+            return ds @ k, ds.transpose(-2, -1) @ q, p.transpose(-2, -1) @ g
+
+        return Tensor.from_node(node, (q, k, v), backward)
 
     # ---- autograd ----
 
