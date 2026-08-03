@@ -8,11 +8,11 @@
 
 A deep learning framework built to be read. The whole stack is here: lazy tensors over a
 closed set of 19 primitive ops, reverse-mode autograd that can differentiate its own
-gradients, a scheduler that fuses the graph into kernels, an IR you can print, conv layers, dtypes from int8 to float64, and C and CUDA
-backends that JIT-compile it, in about 3,600 lines of Python with numpy as the only runtime
-dependency. In spirit it sits between
-micrograd and tinygrad: small enough to read in one sitting, real enough that a matmul comes
-out the other end as one fused loop nest with the stride-1 dim innermost.
+gradients, a scheduler that fuses the graph into kernels, an IR you can print, conv layers,
+dtypes from int8 to float64, and C and CUDA backends that JIT-compile it, with numpy as the
+only runtime dependency. In spirit it sits between micrograd and tinygrad: small enough to
+read in one sitting, real enough that a matmul comes out the other end as one fused loop nest
+with the stride-1 dim innermost.
 
 ```python
 from limn import Tensor
