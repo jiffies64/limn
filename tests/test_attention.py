@@ -200,6 +200,19 @@ def test_cuda_handles_a_ragged_key_tail(causal):
 
 
 @needs_cuda
+def test_cuda_rows_beyond_one_block_chunk():
+    """300 rows split across two blocks: the second block's tail threads sit past t_q, and
+    under causal the first block stops streaming tiles at its own diagonal."""
+    from limn import backend_cuda
+
+    dev = backend_cuda.CudaDevice()
+    q, k, v = rand(300, 16), rand(300, 16), rand(300, 24)
+    out = q.attention(k, v, causal=True)
+    got = read(dev, dev.execute([out.node])[0], out)
+    np.testing.assert_allclose(got, out.numpy(), rtol=1e-5, atol=1e-5)
+
+
+@needs_cuda
 def test_capture_replays_the_custom_step():
     from limn import capture
 

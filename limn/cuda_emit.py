@@ -736,7 +736,9 @@ def emit_sdpa(node) -> str:
 
     A block covers BLOCK consecutive query rows of a single batch. Every thread helps load
     each tile and meets at the same barriers, and threads whose row is past the end of t_q
-    simply skip the per-row work.
+    simply skip the per-row work. A causal block also stops streaming tiles at its own last
+    row's diagonal: every key past it is masked for every row the block holds, and the bound
+    depends only on blockIdx, so the barriers stay uniform.
     """
     _, causal, scale = node.arg
     q, k, v = node.srcs
@@ -773,7 +775,8 @@ def emit_sdpa(node) -> str:
         f"    for (int d = 0; d < {hd}; d++) q_local[d] = ({comp})q_row[d];",
         "  }",
         f"  long long keys_end = valid ? ({keys_end}) : 0LL;",
-        f"  for (long long j0 = 0; j0 < {t_k}; j0 += {tile}) {{",
+        *([f"  long long block_keys = (row_chunk + 1) * {BLOCK} < {t_k} ? (row_chunk + 1) * {BLOCK} : {t_k}LL;"] if causal else []),
+        f"  for (long long j0 = 0; j0 < {'block_keys' if causal else t_k}; j0 += {tile}) {{",
         f"    for (int idx = (int)threadIdx.x; idx < {tile} * {hd}; idx += blockDim.x) {{",
         f"      int lj = idx / {hd};",
         "      long long j = j0 + lj;",
