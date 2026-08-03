@@ -256,20 +256,22 @@ def test_gather_reads_a_narrow_table_and_scatter_sums_into_one():
 
 
 @needs_cc
-def test_the_c_device_says_it_has_no_half_rather_than_emitting_nonsense():
-    a = tensor(float16, 4, 3)
+@pytest.mark.parametrize("dtype", [float16, bfloat16], ids=str)
+def test_the_c_device_says_it_has_no_half_width_float_rather_than_emitting_nonsense(dtype):
+    a = tensor(dtype, 4, 3)
     assert cdev is not None
-    with pytest.raises(NotImplementedError, match="float16"):
+    with pytest.raises(NotImplementedError, match=str(dtype)):
         cdev.execute([(a + a).node])
 
 
 @needs_cc
-def test_the_c_device_catches_a_half_it_only_computes_in():
-    """A CAST fuses, so this nest reads and writes float32 and is float16 in the middle."""
+@pytest.mark.parametrize("dtype", [float16, bfloat16], ids=str)
+def test_the_c_device_catches_a_half_width_float_it_only_computes_in(dtype):
+    """A CAST fuses, so this nest reads and writes float32 and is half-width in the middle."""
     x, y = Tensor(randf(4, 3)), Tensor(randf(4, 3))
     assert cdev is not None
-    with pytest.raises(NotImplementedError, match="float16"):
-        cdev.execute([((x.half() * 2.0).float() + y).node])
+    with pytest.raises(NotImplementedError, match=str(dtype)):
+        cdev.execute([((x.cast(dtype) * 2.0).float() + y).node])
 
 
 # ---- the compiled devices against the numpy reference ----
