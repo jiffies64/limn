@@ -187,6 +187,19 @@ def test_cuda_backward_runs_and_matches_numpy():
 
 
 @needs_cuda
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_cuda_handles_a_ragged_key_tail(causal):
+    """100 keys is 3 tiles and a remainder, so the zero-filled tail of the last tile runs."""
+    from limn import backend_cuda
+
+    dev = backend_cuda.CudaDevice()
+    q, k, v = rand(2, 2, 100, 16), rand(2, 2, 100, 16), rand(2, 2, 100, 24)
+    out = q.attention(k, v, causal=causal)
+    got = read(dev, dev.execute([out.node])[0], out)
+    np.testing.assert_allclose(got, out.numpy(), rtol=1e-5, atol=1e-5)
+
+
+@needs_cuda
 def test_capture_replays_the_custom_step():
     from limn import capture
 
