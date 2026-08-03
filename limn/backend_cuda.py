@@ -26,7 +26,6 @@ import functools
 import glob
 import hashlib
 import importlib.util
-import math
 from collections.abc import Callable
 
 import numpy as np
@@ -39,6 +38,7 @@ from limn.cuda_emit import (
     emit_sdpa,
     outer_extent,
     part_name,
+    sdpa_blocks,
     split_partials,
     split_scratch,
     tile_count,
@@ -356,10 +356,9 @@ class CudaDevice(CompiledDevice):
         or a capture treats its call exactly like a lowered nest's."""
         if node.arg[0] != "sdpa":
             return super().custom_runner(node)
-        q = node.srcs[0]
-        rows = math.prod(q.shape[:-2]) * q.shape[-2]
         functions = compile_cuda(emit_sdpa(node), self.arch, [SDPA_KERNEL])
-        return self._launcher(functions[SDPA_KERNEL], self._grid(rows), len(node.srcs) + 1)
+        # one block per (batch, chunk of rows); the kernel decodes blockIdx the same way
+        return self._launcher(functions[SDPA_KERNEL], sdpa_blocks(node), len(node.srcs) + 1)
 
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
         splits = [split_partials(nest) for nest in nests]

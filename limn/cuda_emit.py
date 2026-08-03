@@ -715,15 +715,28 @@ def emit_cuda(nests: list[LoopNest]) -> str:
 # ---- fused attention: a CUSTOM kernel the schedule never lowers ----
 
 SDPA_KERNEL = "sdpa"
+SDPA_TILE_K = 32  # keys staged through shared memory per step
+
+
+def sdpa_blocks(node) -> int:
+    """How many blocks the kernel launches: one per (batch, chunk of query rows).
+
+    Blocks never straddle a batch, because a block's shared K/V tile belongs to exactly one
+    batch; the launcher and the kernel's blockIdx decoding must agree on this count.
+    """
+    q = node.srcs[0]
+    return math.prod(q.shape[:-2]) * math.ceil(q.shape[-2] / BLOCK)
 
 
 def emit_sdpa(node) -> str:
     """One hand-written kernel for a CUSTOM ("sdpa", causal, scale) node: one thread per query
-    row walks its keys with the online softmax recurrence, so no t_q by t_k buffer exists.
+    row keeps the online softmax recurrence in registers while K and V stream through shared
+    memory a tile at a time, so no t_q by t_k buffer exists and a tile is read from global
+    once per block rather than once per row.
 
-    This is the deliberately plain form: each thread streams K and V from global memory and
-    holds its row of q and its running output in per-thread locals. Staging K and V through
-    shared memory is a later optimization, not part of getting the numbers right.
+    A block covers BLOCK consecutive query rows of a single batch. Every thread helps load
+    each tile and meets at the same barriers, and threads whose row is past the end of t_q
+    simply skip the per-row work.
     """
     _, causal, scale = node.arg
     q, k, v = node.srcs
@@ -735,38 +748,60 @@ def emit_sdpa(node) -> str:
     suf = "f" if comp == "float" else ""
     zero = "0.0" + suf
     hd, t_q, t_k, hd_v = q.shape[-1], q.shape[-2], k.shape[-2], v.shape[-1]
-    rows = math.prod(q.shape[:-2]) * t_q
+    n_chunks = math.ceil(t_q / BLOCK)
+    tile = SDPA_TILE_K
+    scale_lit = c_literal(scale, accumulate_in(dtype))
     keys_end = "i + 1" if causal else f"{t_k}LL"
 
     lines = [
         kernel_sig(SDPA_KERNEL, [q.dtype, k.dtype, v.dtype], dtype),
-        grid_stride(rows),
-        f"    long long b = gid / {t_q};",
-        f"    long long i = gid - b * {t_q};",
-        f"    const {mem}* q_row = in0 + gid * {hd};",
-        f"    const {mem}* k_base = in1 + b * {t_k} * {hd};",
-        f"    const {mem}* v_base = in2 + b * {t_k} * {hd_v};",
-        f"    {mem}* o_row = out + gid * {hd_v};",
-        f"    {comp} q_local[{hd}];",
+        f"  __shared__ {mem} K_tile[{tile}][{hd}];",
+        f"  __shared__ {mem} V_tile[{tile}][{hd_v}];",
+        f"  long long b = blockIdx.x / {n_chunks};",
+        f"  long long row_chunk = blockIdx.x - b * {n_chunks};",
+        f"  int i = (int)(row_chunk * {BLOCK} + threadIdx.x);",
+        f"  int valid = i < {t_q};",
+        f"  const {mem}* k_base = in1 + b * {t_k} * {hd};",
+        f"  const {mem}* v_base = in2 + b * {t_k} * {hd_v};",
+        f"  {comp} q_local[{hd}];",
+        f"  {comp} acc[{hd_v}];",
+        f"  {comp} m = -INFINITY;",
+        f"  {comp} l = {zero};",
+        f"  for (int d = 0; d < {hd_v}; d++) acc[d] = {zero};",
+        "  if (valid) {",
+        f"    const {mem}* q_row = in0 + (b * {t_q} + i) * {hd};",
         f"    for (int d = 0; d < {hd}; d++) q_local[d] = ({comp})q_row[d];",
-        f"    {comp} m = -INFINITY;",
-        f"    {comp} l = {zero};",
-        f"    {comp} acc[{hd_v}];",
-        f"    for (int d = 0; d < {hd_v}; d++) acc[d] = {zero};",
-        f"    long long keys_end = {keys_end};",
-        "    for (long long j = 0; j < keys_end; j++) {",
-        f"      const {mem}* k_row = k_base + j * {hd};",
+        "  }",
+        f"  long long keys_end = valid ? ({keys_end}) : 0LL;",
+        f"  for (long long j0 = 0; j0 < {t_k}; j0 += {tile}) {{",
+        f"    for (int idx = (int)threadIdx.x; idx < {tile} * {hd}; idx += blockDim.x) {{",
+        f"      int lj = idx / {hd};",
+        "      long long j = j0 + lj;",
+        f"      K_tile[lj][idx - lj * {hd}] = j < {t_k} ? k_base[j * {hd} + (idx - lj * {hd})] : {mem}({zero});",
+        "    }",
+        f"    for (int idx = (int)threadIdx.x; idx < {tile} * {hd_v}; idx += blockDim.x) {{",
+        f"      int lj = idx / {hd_v};",
+        "      long long j = j0 + lj;",
+        f"      V_tile[lj][idx - lj * {hd_v}] = j < {t_k} ? v_base[j * {hd_v} + (idx - lj * {hd_v})] : {mem}({zero});",
+        "    }",
+        "    __syncthreads();",
+        f"    long long tile_end = j0 + {tile} < keys_end ? j0 + {tile} : keys_end;",
+        "    for (long long j = j0; j < tile_end; j++) {",
+        "      int lj = (int)(j - j0);",
         f"      {comp} s = {zero};",
-        f"      for (int d = 0; d < {hd}; d++) s += q_local[d] * ({comp})k_row[d];",
-        f"      s *= {c_literal(scale, accumulate_in(dtype))};",
+        f"      for (int d = 0; d < {hd}; d++) s += q_local[d] * ({comp})K_tile[lj][d];",
+        f"      s *= {scale_lit};",
         f"      {comp} m_new = {fmax}(m, s);",
         f"      {comp} p = {exp}(s - m_new);",
         f"      {comp} alpha = {exp}(m - m_new);",
         "      l = l * alpha + p;",
-        f"      const {mem}* v_row = v_base + j * {hd_v};",
-        f"      for (int d = 0; d < {hd_v}; d++) acc[d] = acc[d] * alpha + p * ({comp})v_row[d];",
+        f"      for (int d = 0; d < {hd_v}; d++) acc[d] = acc[d] * alpha + p * ({comp})V_tile[lj][d];",
         "      m = m_new;",
         "    }",
+        "    __syncthreads();",
+        "  }",
+        "  if (valid) {",
+        f"    {mem}* o_row = out + (b * {t_q} + i) * {hd_v};",
         f"    for (int d = 0; d < {hd_v}; d++) o_row[d] = ({mem})(acc[d] / l);",
         "  }",
         "}",
