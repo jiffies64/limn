@@ -5,7 +5,7 @@ description = "A small, readable deep learning framework: lazy tensors, autograd
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["numpy>=2.0"]
+dependencies = ["ml_dtypes>=0.4", "numpy>=2.0"]
 
 [project.optional-dependencies]
 cuda = [

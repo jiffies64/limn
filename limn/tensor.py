@@ -22,7 +22,7 @@ from typing import SupportsIndex
 import numpy as np
 
 from limn import device
-from limn.ops import DTYPES, FLOATS, DType, Node, Op, float16, float32, float64, int32, promote, topological
+from limn.ops import DTYPES, FLOATS, DType, Node, Op, bfloat16, float16, float32, float64, int32, promote, topological
 from limn.schedule import realized
 from limn.view import View
 
@@ -224,7 +224,7 @@ class Tensor:
     def cast(self, dtype: DType) -> Tensor:
         """Convert dtype. Between float dtypes this carries gradients; to or from an int it detaches.
 
-        broadcast_pair inserts these itself wherever a float16 meets a float32, so detaching would
+        broadcast_pair inserts these itself wherever a narrow float meets a wider one, so detaching would
         strip requires_grad off a parameter and leave the optimizer skipping it. An int carries no
         gradient, so those casts still end the chain.
         """
@@ -246,6 +246,9 @@ class Tensor:
 
     def half(self) -> Tensor:
         return self.cast(float16)
+
+    def bfloat16(self) -> Tensor:
+        return self.cast(bfloat16)
 
     def double(self) -> Tensor:
         return self.cast(float64)

@@ -12,9 +12,10 @@ import weakref
 from collections.abc import Callable
 from typing import Any, Protocol
 
+import ml_dtypes
 import numpy as np
 
-from limn.ops import DType, Node, Op, accumulate_in, float16, float32, float64, int8, int16, int32
+from limn.ops import DType, Node, Op, accumulate_in, bfloat16, float16, float32, float64, int8, int16, int32
 from limn.sdpa import kernel as sdpa_kernel
 from limn.view import View
 
@@ -24,6 +25,7 @@ NUMPY_DTYPES: dict[DType, np.dtype] = {
     float64: np.dtype(np.float64),
     float32: np.dtype(np.float32),
     float16: np.dtype(np.float16),
+    bfloat16: np.dtype(ml_dtypes.bfloat16),  # numpy has no bfloat16; ml_dtypes registers one
     int32: np.dtype(np.int32),
     int16: np.dtype(np.int16),
     int8: np.dtype(np.int8),
