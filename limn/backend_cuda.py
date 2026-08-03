@@ -26,14 +26,27 @@ import functools
 import glob
 import hashlib
 import importlib.util
+import math
 from collections.abc import Callable
 
 import numpy as np
 
 from limn.codegen import LoopNest
-from limn.cuda_emit import BLOCK, emit_cuda, outer_extent, part_name, split_partials, split_scratch, tile_count, tiled
+from limn.cuda_emit import (
+    BLOCK,
+    SDPA_KERNEL,
+    emit_cuda,
+    emit_sdpa,
+    outer_extent,
+    part_name,
+    split_partials,
+    split_scratch,
+    tile_count,
+    tiled,
+)
 from limn.device import Buffer
 from limn.jit import CompiledDevice, Runner
+from limn.ops import Node
 
 GRID = 4096  # most blocks per launch; the grid-stride loop covers whatever is left
 
@@ -334,6 +347,19 @@ class CudaDevice(CompiledDevice):
 
     def finish(self) -> None:
         check(self.api.cuCtxSynchronize(), "waiting for the batch")
+
+    def has_custom(self, name: str) -> bool:
+        return name == "sdpa"
+
+    def custom_runner(self, node: Node) -> Runner:
+        """The fused-attention kernel is compiled here and launched like any other, so a plan
+        or a capture treats its call exactly like a lowered nest's."""
+        if node.arg[0] != "sdpa":
+            return super().custom_runner(node)
+        q = node.srcs[0]
+        rows = math.prod(q.shape[:-2]) * q.shape[-2]
+        functions = compile_cuda(emit_sdpa(node), self.arch, [SDPA_KERNEL])
+        return self._launcher(functions[SDPA_KERNEL], self._grid(rows), len(node.srcs) + 1)
 
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
         splits = [split_partials(nest) for nest in nests]
