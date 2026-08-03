@@ -55,7 +55,9 @@ def report_fusion(title: str, *tensors: Tensor) -> None:
         root = k.ast
         fused = [n.op.name for n in k.body if n is not root and n.op is not Op.CONST]
         print(f"\nk{i}  {root.op.name}{list(root.shape)}  <- its own kernel: {reasons[root]}")
-        print(f"    fused inside ({len(fused)} ops ride free): {' '.join(fused) if fused else 'nothing, just the ' + root.op.name}")
+        print(
+            f"    fused inside ({len(fused)} ops ride free): {' '.join(fused) if fused else 'nothing, just the ' + root.op.name}"
+        )
         reads = [f"{_describe(inp, producer)} {inp.dtype}{list(inp.shape)}" for inp in k.inputs]
         print(f"    reads from memory ({len(reads)}): {', '.join(reads)}")
     print()
