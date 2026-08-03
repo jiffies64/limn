@@ -14,17 +14,24 @@ from limn.tensor import composed_attention
 
 HEADS, HD = 6, 32
 CASES = {256: 50, 1024: 20, 4096: 5}  # sequence length -> timed replays
+TRIALS = 3  # the GPU may be contended; the min of a few trials is the stable number
 
 
 def time_step(step, args, reps: int) -> float:
-    """Milliseconds per call: two runs settle the capture, one warms the replay, the rest time."""
+    """Milliseconds per call, the best of a few trials. Two runs settle the capture and one
+    warms the replay before each timed pass, so contention shows up as a slower trial, not
+    as a cold first call."""
     replayed = capture(step)
-    for _ in range(3):
-        replayed(*args)
-    start = time.perf_counter()
-    for _ in range(reps):
-        replayed(*args)
-    return (time.perf_counter() - start) / reps * 1e3
+
+    def once() -> float:
+        for _ in range(3):
+            replayed(*args)
+        start = time.perf_counter()
+        for _ in range(reps):
+            replayed(*args)
+        return (time.perf_counter() - start) / reps * 1e3
+
+    return min(once() for _ in range(TRIALS))
 
 
 def fused_step(q, k, v):
