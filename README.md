@@ -3,16 +3,16 @@
 *limn (verb): to outline in clear sharp detail; to delineate.*
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
-![Runtime dependency: numpy](https://img.shields.io/badge/runtime%20dependency-numpy-013243?logo=numpy&logoColor=white)
+![Runtime dependencies: numpy · ml_dtypes](https://img.shields.io/badge/runtime%20dependencies-numpy%20%C2%B7%20ml_dtypes-013243?logo=numpy&logoColor=white)
 ![Backends: numpy, c and cuda](https://img.shields.io/badge/backends-numpy%20%C2%B7%20c%20%C2%B7%20cuda-555555)
 
 A deep learning framework built to be read. The whole stack is here: lazy tensors over a
 closed set of 19 primitive ops, reverse-mode autograd that can differentiate its own
 gradients, a scheduler that fuses the graph into kernels, an IR you can print, conv layers,
-dtypes from int8 to float64, and C and CUDA backends that JIT-compile it, with numpy as the
-only runtime dependency. In spirit it sits between micrograd and tinygrad: small enough to
-read in one sitting, real enough that a matmul comes out the other end as one fused loop nest
-with the stride-1 dim innermost.
+dtypes from int8 to float64, and C and CUDA backends that JIT-compile it, with numpy and
+ml_dtypes as the only runtime dependencies. In spirit it sits between micrograd and tinygrad:
+small enough to read in one sitting, real enough that a matmul comes out the other end as one
+fused loop nest with the stride-1 dim innermost.
 
 ```python
 from limn import Tensor
@@ -34,10 +34,10 @@ uv run python examples/train_mlp.py      # AdamW on a toy regression; loss must 
 uv run python examples/train_stories.py  # byte-level GPT on TinyStories; --full for the long run
 ```
 
-`uv sync` installs numpy plus the dev group (pytest, ruff, CPU-only torch). The `c` device
-also needs a C compiler on `PATH` as `cc`. The `cuda` device needs an NVIDIA driver and
-NVRTC: either a CUDA toolkit, or no root access at all with `uv sync --extra cuda`, which
-pulls NVRTC as a wheel.
+`uv sync` installs numpy and ml_dtypes, which supplies the bfloat16 numpy lacks, plus the
+dev group (pytest, ruff, CPU-only torch). The `c` device also needs a C compiler on `PATH`
+as `cc`. The `cuda` device needs an NVIDIA driver and NVRTC: either a CUDA toolkit, or no
+root access at all with `uv sync --extra cuda`, which pulls NVRTC as a wheel.
 
 Contributing? `git config core.hooksPath .githooks` turns on the repo hooks: commit messages
 follow `type: subject` (feat, fix, docs, refactor, test, speedup, chore) and pushes run the
@@ -98,18 +98,22 @@ numpy device interprets it as the reference every backend's kernel is diffed aga
 device that registers no kernel for the name never sees the node at all: the frontend
 composes the op from the primitives instead.
 
-Six dtypes: `float64`, `float32`, `float16`, `int32`, `int16`, and `int8`. `float16` is a
-storage width, not a working precision: it halves the bytes a kernel moves, and every device
-widens it to compute, so a reduce keeps its running total in `float32` and rounds back once at
-the end. Mixing it with `float32` promotes, and casting between the two carries gradients,
-which is what makes a `float32` master weight met by `float16` activations train. `float64` is
+Seven dtypes: `float64`, `float32`, `float16`, `bfloat16`, `int32`, `int16`, and `int8`.
+`float16` and `bfloat16` are storage widths, not working precisions: each halves the bytes a
+kernel moves, and every device widens them to compute, so a reduce keeps its running total in
+`float32` and rounds back once at the end. They hold different halves of the same bargain,
+`float16` keeping mantissa and `bfloat16` keeping `float32`'s range, so neither contains the
+other's numbers and the two meet at `float32`. Mixing either with a wider float promotes, and
+casting between float dtypes carries gradients, which is what makes a `float32` master weight
+met by narrower activations train. `float64` is
 the opposite trade: every device computes it natively at its own width, and gradients and
 optimizer state keep that width. The narrow ints are exact storage: arithmetic wraps modulo
 2**width, the same on every device, a python scalar takes the tensor's dtype rather than
 widening it, and an int meeting a float joins the floats at `float32` or wider. The `c` device
-has no `float16` and says so; on `cuda` a `float16` scatter is the one float-family gap, since
-its atomic add needs an architecture the emitter cannot see, and a narrow-int scatter declines
-because `atomicAdd` has no 8- or 16-bit overload.
+keeps only the dtypes C can spell natively and declines both half widths, saying so; on `cuda`
+a half-width scatter is the one float-family gap, since its atomic add needs an architecture
+the emitter cannot see, and a narrow-int scatter declines because `atomicAdd` has no 8- or
+16-bit overload.
 
 ## Reading the schedule
 
@@ -245,7 +249,7 @@ Every layer answers to an oracle above it:
 | `c` backend | the numpy device | a shared graph corpus runs on both devices and is diffed at 1e-5 |
 | `cuda` backend | the numpy device | the same corpus, plus grid-stride coverage past one launch's thread count, atomic scatter collisions on a single row, tiled matmuls across every tile width and tail, and a training loop on the device |
 | cuda emission | its own invariants | no GPU needed: the tiling decision is checked for covering every output cell and for staging whole slabs, since a tile the block cannot fill in whole passes would fold shared memory nobody wrote |
-| `float16` | the numpy device | the corpus and the matmuls again at half width, diffed at float16's own rounding, plus the dtype rules and that a cast between float dtypes still carries gradients |
+| the half-width floats | the numpy device | the corpus and the matmuls again at each width, diffed at the width's own rounding, plus the dtype rules, that a cast between float dtypes still carries gradients, and that the two meet at float32 |
 | `int8`, `int16` | the numpy device | an integer corpus (wraparound, compares, reduces, matmul, gather) on the `c` and `cuda` devices, diffed for exact equality since modular arithmetic leaves nothing to rounding |
 | `float64` | the numpy device | the corpus and the tiled matmuls again in double, diffed at 1e-12, plus that gradients and optimizer state hold the width and that a `cuda` scatter adds atomically in double |
 
