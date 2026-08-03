@@ -502,6 +502,40 @@ class Tensor:
         shifted = self - self.max(axis, keepdim=True).detach()
         return shifted - shifted.exp().sum(axis, keepdim=True).log()
 
+    def attention(self, k: Tensor, v: Tensor, *, causal: bool = False) -> Tensor:
+        """softmax(q @ k' / sqrt(hd)) @ v over the key axis, as one fused kernel where the
+        device registers one.
+
+        Validates like matmul: batch dims broadcast, q's head dim is k's, k's key count is
+        v's, all floats. causal hides keys to the right of each query row and wants square
+        keys. A device with no registered "sdpa" kernel gets the composed form instead, so
+        every device runs this; a registered kernel reads contiguous srcs, which is what the
+        CONTIGUOUS wraps here owe it.
+        """
+        q = self
+        if q.ndim < 2 or k.ndim < 2 or v.ndim < 2:
+            raise ValueError(f"attention needs 2D+ tensors, got {q.shape}, {k.shape}, {v.shape}")
+        if q.shape[-1] != k.shape[-1]:
+            raise ValueError(f"attention: head dims differ, {q.shape[-1]} and {k.shape[-1]}")
+        if k.shape[-2] != v.shape[-2]:
+            raise ValueError(f"attention: key counts differ, {k.shape[-2]} and {v.shape[-2]}")
+        if causal and q.shape[-2] != k.shape[-2]:
+            raise ValueError(f"causal attention needs square keys, got {q.shape[-2]} queries and {k.shape[-2]} keys")
+        if q.dtype not in FLOATS or k.dtype not in FLOATS or v.dtype not in FLOATS:
+            raise ValueError(f"attention needs float dtypes, got {q.dtype}, {k.dtype}, {v.dtype}")
+        wider = promote(promote(q.dtype, k.dtype), v.dtype)
+        q, k, v = q.cast(wider), k.cast(wider), v.cast(wider)
+        batch = broadcast_shape(broadcast_shape(q.shape[:-2], k.shape[:-2], "attention"), v.shape[:-2], "attention")
+        q = broadcast_to(q, batch + q.shape[-2:], "attention")
+        k = broadcast_to(k, batch + k.shape[-2:], "attention")
+        v = broadcast_to(v, batch + v.shape[-2:], "attention")
+        scale = q.shape[-1] ** -0.5
+        if not device.active().has_custom("sdpa"):
+            return composed_attention(q, k, v, causal=causal, scale=scale)
+        q, k, v = _contiguous(q), _contiguous(k), _contiguous(v)
+        node = Node(Op.CUSTOM, (q.node, k.node, v.node), wider, batch + (q.shape[-2], v.shape[-1]), ("sdpa", causal, scale))
+        return Tensor.from_node(node, (q, k, v))
+
     # ---- autograd ----
 
     def backward(self, create_graph: bool = False) -> None:
@@ -596,6 +630,28 @@ def scatter_rows(values: Tensor, indices: Tensor, shape: tuple[int, ...]) -> Ten
         raise ValueError(f"scatter_rows: values {values.shape} do not match indices {indices.shape} into {shape}")
     node = Node(Op.SCATTER, (indices.node, values.node), values.dtype, shape)
     return Tensor.from_node(node, (values,), lambda g: (g.gather_rows(indices),))
+
+
+def composed_attention(q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float) -> Tensor:
+    """Attention from the primitives: what every device runs when no fused kernel is
+    registered, and the form the fused kernel's grad_fn differentiates."""
+    scores = (q @ k.transpose(-2, -1)) * scale
+    if causal:
+        scores = _causal_mask(q.shape[-2], k.shape[-2]).where(scores, -1e9)
+    return scores.softmax(-1) @ v
+
+
+def _causal_mask(t_q: int, t_k: int) -> Tensor:
+    """1 on and below the diagonal, 0 past it: cols <= rows, as arange compares."""
+    rows = Tensor.arange(t_q).reshape(t_q, 1)
+    cols = Tensor.arange(t_k).reshape(1, t_k)
+    return cols <= rows
+
+
+def _contiguous(t: Tensor) -> Tensor:
+    """A row-major copy of t, recorded: the gradient of a copy is the gradient."""
+    node = Node(Op.CONTIGUOUS, (t.node,), t.dtype, t.shape)
+    return Tensor.from_node(node, (t,), lambda g: (g,))
 
 
 def as_ints(shape: Sequence[int] | tuple) -> tuple[int, ...]:

@@ -86,6 +86,7 @@ class Op(Enum):
     # barriers
     CONTIGUOUS = auto()  # copy src into canonical row-major layout
     ASSIGN = auto()  # (target BUFFER node, value): overwrite target's bytes with value
+    CUSTOM = auto()  # arg (name, ...) a kernel the device supplies whole; the name picks it in the device's registry
 
 
 @dataclass(eq=False)  # eq=False: nodes hash by identity, so a BUFFER node stays itself as its bytes change

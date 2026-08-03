@@ -15,6 +15,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from limn.ops import DType, Node, Op, accumulate_in, float16, float32, float64, int8, int16, int32
+from limn.sdpa import kernel as sdpa_kernel
 from limn.view import View
 
 type Buffer = Any
@@ -41,6 +42,7 @@ class Device(Protocol):
     def copyin(self, buf: Buffer, array: np.ndarray) -> None: ...
     def copyout(self, buf: Buffer) -> np.ndarray: ...
     def execute(self, sinks: list[Node]) -> list[Buffer]: ...
+    def has_custom(self, name: str) -> bool: ...
 
 
 class HostDevice:
@@ -71,6 +73,12 @@ class NumpyDevice(HostDevice):
 
     def __init__(self) -> None:
         self.cache: weakref.WeakKeyDictionary[Node, np.ndarray] = weakref.WeakKeyDictionary()
+        # the CUSTOM kernels this device interprets, by the name carried in the node's arg;
+        # the reference for every backend's kernel of the same name
+        self.custom: dict[str, Callable[[list[np.ndarray], tuple], np.ndarray]] = {"sdpa": sdpa_kernel}
+
+    def has_custom(self, name: str) -> bool:
+        return name in self.custom
 
     def execute(self, sinks: list[Node]) -> list[Buffer]:
         """Compute every sink; return one buffer of result bytes per sink.
@@ -146,6 +154,12 @@ class NumpyDevice(HostDevice):
                 np.add.at(result, srcs[0], srcs[1])  # buffered, so repeated indices accumulate
             case Op.CONTIGUOUS:
                 result = np.ascontiguousarray(srcs[0])
+            case Op.CUSTOM:
+                name = node.arg[0]
+                kernel = self.custom.get(name)
+                if kernel is None:
+                    raise NotImplementedError(f"the numpy device has no rule for custom op {name!r}")
+                result = kernel(srcs, node.arg)
             case Op.ASSIGN:
                 result = srcs[1]
             case _:

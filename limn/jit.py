@@ -116,6 +116,11 @@ class CompiledDevice:
         """Overwrite an assign's target buffer with the computed value, after the whole batch ran."""
         raise NotImplementedError
 
+    def has_custom(self, name: str) -> bool:
+        """Whether this device supplies a kernel for the named CUSTOM op; the frontend falls
+        back to composing the op from primitives when it does not."""
+        return False
+
     def prepare(self, buf: Buffer) -> Buffer:
         """Admit a BUFFER node's bytes; a backend whose memory is elsewhere migrates them here."""
         return buf

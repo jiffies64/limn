@@ -7,6 +7,7 @@ between kernels:
     CONTIGUOUS, ASSIGN   a copy and an in-place write already mean "put this in a buffer"
     SUM, MAX             a reduce stores what it accumulated
     GATHER, SCATTER      a table read at a computed row, and the write that undoes it
+    CUSTOM               the device supplies the whole kernel; nothing schedules inside it
     an addressed src     a VIEW's buffer and a GATHER's table are indexed, so they have to be bytes
     every sink           the caller asked for these bytes, unless it aliases a buffer already
 
@@ -42,7 +43,7 @@ from dataclasses import dataclass
 
 from limn.ops import Node, Op, topological
 
-CUT_OPS = (Op.CONTIGUOUS, Op.ASSIGN, Op.SUM, Op.MAX, Op.GATHER, Op.SCATTER)
+CUT_OPS = (Op.CONTIGUOUS, Op.ASSIGN, Op.SUM, Op.MAX, Op.GATHER, Op.SCATTER, Op.CUSTOM)
 
 
 @dataclass(frozen=True)
