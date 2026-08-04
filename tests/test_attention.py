@@ -14,7 +14,7 @@ from conftest import check, cudev, needs_cc, needs_cuda
 
 from limn import Tensor, grad, set_device, set_seed
 from limn.nn import Linear, parameters
-from limn.ops import DType, Op, bfloat16, float16, float32, topological
+from limn.ops import Custom, DType, Op, bfloat16, float16, float32, topological
 from limn.optim import AdamW
 from limn.tensor import composed_attention
 
@@ -56,7 +56,7 @@ def test_numpy_builds_a_custom_node():
     q, k, v = rand(2, 8, 16), rand(2, 8, 16), rand(2, 8, 16)
     t = q.attention(k, v, causal=True)
     assert t.node.op is Op.CUSTOM
-    assert t.node.arg == ("sdpa", True, 16**-0.5)
+    assert t.node.arg == Custom("sdpa", (True, 16**-0.5), ((float32, (2, 8, 16)), (float32, (2, 8, 1))), index=0)
 
 
 def test_validation():
@@ -71,6 +71,40 @@ def test_validation():
         Tensor(np.arange(12, dtype=np.int32).reshape(4, 3)).attention(k, v)  # ints carry no attention
     with pytest.raises(ValueError):
         q[0, 0].attention(k, v)  # 1D tensors
+
+
+def _weighted_grads(fused: bool, q_shape, k_shape, v_shape, causal: bool, data: list[np.ndarray]) -> list[np.ndarray]:
+    """d(w . attention(q, k, v))/d(q, k, v), fused or composed. The random weighting is what
+    makes the incoming gradient uneven, so a backward that ignored it would show."""
+    q, k, v = (Tensor(d, requires_grad=True) for d in data[:3])
+    scale = q_shape[-1] ** -0.5
+    att = q.attention(k, v, causal=causal) if fused else composed_attention(q, k, v, causal=causal, scale=scale)
+    loss = (att * Tensor(data[3])).sum()
+    return [g.numpy() for g in grad(loss, [q, k, v])]
+
+
+@pytest.mark.parametrize("q_shape,k_shape,v_shape,causal", CASES, ids=str)
+def test_backward_matches_the_composed_backward(q_shape, k_shape, v_shape, causal):
+    """The same shapes the forward is held to: batched, plain 2D, rectangular keys, and batch
+    dims that broadcast, where a leaf's gradient sums over the dim it was expanded along."""
+    out_shape = np.broadcast_shapes(q_shape[:-2], k_shape[:-2], v_shape[:-2]) + (q_shape[-2], v_shape[-1])
+    data = [rng.standard_normal(s).astype(np.float32) for s in (q_shape, k_shape, v_shape, out_shape)]
+    for got, want in zip(*(_weighted_grads(f, q_shape, k_shape, v_shape, causal, data) for f in (True, False))):
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_the_backward_never_builds_a_t_by_t(causal):
+    """The point of the whole exercise: the composed backward materializes (t_q, t_k) three
+    times over, and the fused one must not put a single node of that shape in the graph."""
+    t, hd, hd_v = 48, 8, 12
+    q, k, v = (
+        Tensor(rng.standard_normal(s).astype(np.float32), requires_grad=True) for s in ((2, 3, t, hd),) * 2 + ((2, 3, t, hd_v),)
+    )
+    weight = Tensor(rng.standard_normal((2, 3, t, hd_v)).astype(np.float32))
+    grads = grad((q.attention(k, v, causal=causal) * weight).sum(), [q, k, v])
+    square = [n for n in topological([g.node for g in grads]) if n.shape[-2:] == (t, t)]
+    assert not square, f"the backward graph holds {len(square)} nodes of shape (..., {t}, {t})"
 
 
 def _attention_case(causal: bool):
@@ -176,6 +210,57 @@ def test_cuda_backward_runs_and_matches_numpy():
     for leaf in leaves:
         assert leaf.grad is not None
         check(cudev, leaf.grad, rtol=1e-4, atol=1e-4)
+
+
+def _cuda_backward_grads(q_shape, k_shape, v_shape, causal: bool, dtype: DType = float32):
+    out_shape = np.broadcast_shapes(q_shape[:-2], k_shape[:-2], v_shape[:-2]) + (q_shape[-2], v_shape[-1])
+    data = [rng.standard_normal(s).astype(np.float32) for s in (q_shape, k_shape, v_shape, out_shape)]
+    q, k, v = (Tensor(d, dtype=dtype, requires_grad=True) for d in data[:3])
+    return grad((q.attention(k, v, causal=causal) * Tensor(data[3], dtype=dtype)).sum(), [q, k, v])
+
+
+@needs_cuda
+def test_cuda_two_attentions_on_one_input():
+    """Two calls over the same q, k and v build CUSTOM nodes a plan cannot tell apart by name,
+    params and srcs, which is all it merges siblings by; they still owe four separate buffers."""
+    q, k, v = rand(2, 3, 32, 8), rand(2, 3, 32, 8), rand(2, 3, 32, 12)
+    check(cudev, q.attention(k, v, causal=True) + q.attention(k, v, causal=True))
+
+
+@needs_cuda
+def test_cuda_backward_is_deterministic():
+    """One thread owns each row's total in both passes, so no float lands in an atomic and two
+    runs of the same kernels give back the same bits."""
+    assert cudev is not None
+    for g in _cuda_backward_grads((2, 3, 64, 16), (2, 3, 64, 16), (2, 3, 64, 24), causal=True):
+        first = cudev.copyout(cudev.execute([g.node])[0])
+        second = cudev.copyout(cudev.execute([g.node])[0])
+        np.testing.assert_array_equal(first, second)
+
+
+@needs_cuda
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("dtype,tol", [(float32, 1e-4), (float16, 4e-3), (bfloat16, 3e-2)], ids=str)
+def test_cuda_backward_matches_the_numpy_custom(causal, dtype, tol):
+    for g in _cuda_backward_grads((2, 3, 64, 16), (2, 3, 64, 16), (2, 3, 64, 24), causal, dtype):
+        check(cudev, g, rtol=tol, atol=tol)
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    "q_shape,k_shape,v_shape,causal",
+    [
+        ((2, 2, 100, 16), (2, 2, 100, 16), (2, 2, 100, 24), True),  # 3 tiles of keys and a remainder
+        ((2, 2, 100, 16), (2, 2, 100, 16), (2, 2, 100, 24), False),
+        ((300, 16), (300, 16), (300, 24), True),  # rows and keys past one block's chunk
+        ((40, 8), (72, 8), (72, 12), False),  # rectangular: the two passes cover different counts
+    ],
+    ids=["ragged causal", "ragged full", "two chunks", "rectangular"],
+)
+def test_cuda_backward_covers_the_ragged_shapes(q_shape, k_shape, v_shape, causal):
+    """The tails the two passes have to agree on, since one walks queries and the other keys."""
+    for g in _cuda_backward_grads(q_shape, k_shape, v_shape, causal):
+        check(cudev, g, rtol=1e-4, atol=1e-4)
 
 
 @needs_cuda

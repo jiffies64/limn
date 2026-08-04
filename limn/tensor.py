@@ -21,9 +21,10 @@ from typing import SupportsIndex
 
 import numpy as np
 
-from limn import device
-from limn.ops import DTYPES, FLOATS, DType, Node, Op, bfloat16, float16, float32, float64, int32, promote, topological
-from limn.schedule import realized
+from limn import device, sdpa
+from limn.ops import DTYPES, FLOATS, DType, Node, Op, accumulate_in, bfloat16, custom, float16, float32, float64, int32
+from limn.ops import promote, topological
+from limn.schedule import CUT_OPS, realized
 from limn.view import View
 
 grad_enabled: bool = True
@@ -507,13 +508,18 @@ class Tensor:
 
     def attention(self, k: Tensor, v: Tensor, *, causal: bool = False) -> Tensor:
         """softmax(q @ k' / sqrt(hd)) @ v over the key axis, as one fused kernel where the
-        device registers one.
+        device registers one, backward as well as forward.
 
         Validates like matmul: batch dims broadcast, q's head dim is k's, k's key count is
         v's, all floats. causal hides keys to the right of each query row and wants square
         keys. A device with no registered "sdpa" kernel gets the composed form instead, so
         every device runs this; a registered kernel reads contiguous srcs, which is what the
         CONTIGUOUS wraps here owe it.
+
+        The forward writes a second output besides the answer: L, the per-row logsumexp, which
+        is what lets the backward rebuild probabilities in blocks instead of keeping a t_q by
+        t_k around. Nothing but the backward reads it, and a graph that never asks for it pays
+        one buffer of t_q floats per batch.
         """
         q = self
         if q.ndim < 2 or k.ndim < 2 or v.ndim < 2:
@@ -533,20 +539,16 @@ class Tensor:
         k = broadcast_to(k, batch + k.shape[-2:], "attention")
         v = broadcast_to(v, batch + v.shape[-2:], "attention")
         scale = q.shape[-1] ** -0.5
-        if not device.active().has_custom("sdpa"):
+        if not device.active().has_custom(sdpa.SDPA):
             return composed_attention(q, k, v, causal=causal, scale=scale)
         q, k, v = _contiguous(q), _contiguous(k), _contiguous(v)
-        node = Node(Op.CUSTOM, (q.node, k.node, v.node), wider, batch + (q.shape[-2], v.shape[-1]), ("sdpa", causal, scale))
-
-        def backward(g: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-            # the probabilities are recomputed, not saved: the forward kept no t_q by t_k.
-            # a masked p entry is exactly 0 (exp underflows the -1e9), so ds needs no re-mask.
-            p = _attention_probs(q, k, causal=causal, scale=scale)
-            dp = g @ v.transpose(-2, -1)
-            ds = p * (dp - (dp * p).sum(axis=-1, keepdim=True)) * scale
-            return ds @ k, ds.transpose(-2, -1) @ q, p.transpose(-2, -1) @ g
-
-        return Tensor.from_node(node, (q, k, v), backward)
+        rows = batch + (q.shape[-2], 1)  # a statistic per query row, shaped to broadcast over keys
+        outs = ((wider, batch + (q.shape[-2], v.shape[-1])), (accumulate_in(wider), rows))
+        node, lse = custom(sdpa.SDPA, (q.node, k.node, v.node), (causal, scale), outs)
+        out = Tensor.from_node(node, (q, k, v))
+        if out.requires_grad:
+            out.grad_fn = _attention_backward(out, Tensor.from_node(lse), q, k, v, causal=causal, scale=scale)
+        return out
 
     # ---- autograd ----
 
@@ -646,8 +648,43 @@ def scatter_rows(values: Tensor, indices: Tensor, shape: tuple[int, ...]) -> Ten
 
 def composed_attention(q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float) -> Tensor:
     """Attention from the primitives: what every device runs when no fused kernel is
-    registered, and the form the fused kernel's grad_fn differentiates."""
+    registered, and the form the fused kernel's grad_fn falls back to."""
     return _attention_probs(q, k, causal=causal, scale=scale) @ v
+
+
+def _attention_backward(out: Tensor, lse: Tensor, q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float) -> BackwardFn:
+    """The gradient of the fused attention: two more fused kernels, or the composed form.
+
+    The fused pair keeps the promise the forward makes. dQ streams keys past each query row and
+    dK with dV stream queries past each key row, both rebuilding probabilities from the saved L,
+    so the largest thing either one holds is a tile. The composed form materializes the whole
+    t_q by t_k twice over, which at a transformer's own shapes is what caps its context length.
+
+    It is still what runs when the gradient is itself being differentiated: a CUSTOM node has no
+    gradient of its own, so a second derivative needs the arithmetic spelled in primitives. That
+    is exactly what create_graph asks for, and gradients() signals it by leaving grad_enabled on
+    while it calls this. A device holding only half the kernels falls back the same way.
+    """
+
+    def backward(g: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if grad_enabled or not all(device.active().has_custom(name) for name in (sdpa.SDPA_BWD_Q, sdpa.SDPA_BWD_KV)):
+            # a masked p entry is exactly 0 (exp underflows the -1e9), so ds needs no re-mask
+            p = _attention_probs(q, k, causal=causal, scale=scale)
+            dp = g @ v.transpose(-2, -1)
+            ds = p * (dp - (dp * p).sum(axis=-1, keepdim=True)) * scale
+            return ds @ k, ds.transpose(-2, -1) @ q, p.transpose(-2, -1) @ g
+        do = _contiguous(g)
+        # the row dot of the output and its gradient, the one thing besides L both passes need.
+        # It is ordinary elementwise work, so the scheduler fuses it into a single reduce.
+        saved = lse.dtype
+        delta = (do.cast(saved) * out.cast(saved)).sum(axis=-1, keepdim=True)
+        srcs = tuple(t.node for t in (q, k, v, do, lse, _contiguous(delta)))
+        params = (causal, scale)
+        (dq,) = custom(sdpa.SDPA_BWD_Q, srcs, params, ((q.dtype, q.shape),))
+        dk, dv = custom(sdpa.SDPA_BWD_KV, srcs, params, ((k.dtype, k.shape), (v.dtype, v.shape)))
+        return Tensor.from_node(dq), Tensor.from_node(dk), Tensor.from_node(dv)
+
+    return backward
 
 
 def _attention_probs(q: Tensor, k: Tensor, *, causal: bool, scale: float) -> Tensor:
@@ -665,9 +702,13 @@ def _causal_mask(t_q: int, t_k: int) -> Tensor:
 
 
 def _contiguous(t: Tensor) -> Tensor:
-    """A row-major copy of t, recorded (the gradient of a copy is the gradient); a realized
-    buffer already is one, so it passes through untouched."""
-    if t.node.op is Op.BUFFER:
+    """A row-major copy of t, recorded (the gradient of a copy is the gradient).
+
+    Anything the scheduler already cuts into a buffer of its own writes that buffer row-major,
+    and a realized one is row-major by construction, so both pass through untouched. What is
+    left is a view or an expression, and a custom kernel reading either has to be handed a copy.
+    """
+    if t.node.op is Op.BUFFER or t.node.op in CUT_OPS:
         return t
     node = Node(Op.CONTIGUOUS, (t.node,), t.dtype, t.shape)
     return Tensor.from_node(node, (t,), lambda g: (g,))

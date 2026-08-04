@@ -4,8 +4,10 @@ import numpy as np
 import pytest
 from conftest import needs_cc, randf
 
-from limn import Tensor, capture, set_device, set_seed
+from limn import Tensor, capture, device, realize, set_device, set_seed
+from limn.jit import CompiledDevice
 from limn.nn import Linear, parameters
+from limn.ops import custom, float32
 from limn.optim import SGD, AdamW
 
 
@@ -197,6 +199,62 @@ def test_replay_is_bound_to_the_device_that_recorded_it():
     set_device("c")  # a fresh instance of the same backend, not the recording's device
     with pytest.raises(ValueError, match="device that recorded"):
         fn(Tensor(randf(4)))
+
+
+def pair_device() -> tuple[list[str], Tensor, tuple[Tensor, Tensor]]:
+    """The c device with a stub two-output CUSTOM kernel on it (x * 2 and x + 1 out of one
+    call), the tensor it reads, and a Tensor over each of its outputs."""
+    set_device("c")
+    dev = device.active()
+    assert isinstance(dev, CompiledDevice)
+    runs: list[str] = []
+
+    def build(node):
+        def run(inputs: list, outs: list) -> None:
+            runs.append(node.arg.name)
+            x = inputs[0].view(np.float32)
+            outs[0][:] = (x * 2.0).view(np.uint8)
+            outs[1][:] = (x + 1.0).view(np.uint8)
+
+        return run
+
+    dev.custom["pair"] = build
+    x = Tensor(np.arange(4, dtype=np.float32))
+    doubled, incremented = (Tensor.from_node(n) for n in custom("pair", (x.node,), (), ((float32, (4,)),) * 2))
+    return runs, x, (doubled, incremented)
+
+
+@needs_cc
+def test_a_multi_output_custom_runs_once_for_every_output():
+    """Two nodes of one kernel are one call: it runs once and each node takes its own buffer."""
+    runs, _, (doubled, incremented) = pair_device()
+    realize(doubled, incremented)
+    assert runs == ["pair"]
+    np.testing.assert_array_equal(doubled.numpy(), np.arange(4) * 2.0)
+    np.testing.assert_array_equal(incremented.numpy(), np.arange(4) + 1.0)
+
+
+@needs_cc
+def test_two_calls_on_the_same_inputs_stay_apart():
+    """Same kernel, same params, same srcs is exactly what siblings are merged by, and two
+    independent calls look identical under it. The second one's output 0 finds slot 0 taken
+    and opens a call of its own instead of taking over the first's buffers."""
+    runs, x, first = pair_device()
+    second = tuple(Tensor.from_node(n) for n in custom("pair", (x.node,), (), ((float32, (4,)),) * 2))
+    realize(*first, *second)
+    assert runs == ["pair", "pair"]
+    for doubled, incremented in (first, second):
+        np.testing.assert_array_equal(doubled.numpy(), np.arange(4) * 2.0)
+        np.testing.assert_array_equal(incremented.numpy(), np.arange(4) + 1.0)
+
+
+@needs_cc
+def test_an_output_nothing_reads_still_gets_its_buffer():
+    """The kernel writes every output whether or not the graph asked for it, so the one nobody
+    reads has to be allocated anyway; without it the call would write past a stranger's bytes."""
+    runs, _, (_, incremented) = pair_device()
+    np.testing.assert_array_equal(incremented.numpy(), np.arange(4) + 1.0)
+    assert runs == ["pair"]
 
 
 def test_on_an_interpreting_device_the_function_just_runs():

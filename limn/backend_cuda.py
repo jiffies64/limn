@@ -33,12 +33,10 @@ import numpy as np
 from limn.codegen import LoopNest
 from limn.cuda_emit import (
     BLOCK,
-    SDPA_KERNEL,
+    SDPA_KERNELS,
     emit_cuda,
-    emit_sdpa,
     outer_extent,
     part_name,
-    sdpa_blocks,
     split_partials,
     split_scratch,
     tile_count,
@@ -290,7 +288,8 @@ class CudaDevice(CompiledDevice):
         context = ctypes.c_void_p()
         check(api.cuDevicePrimaryCtxRetain(ctypes.byref(context), dev), "retaining the primary context")
         check(api.cuCtxSetCurrent(context), "making the context current")
-        self.custom[SDPA_KERNEL] = self._sdpa_runner
+        for name in SDPA_KERNELS:
+            self.custom[name] = self._sdpa_runner
 
     # ---- Device protocol: raw byte buffers ----
 
@@ -350,11 +349,14 @@ class CudaDevice(CompiledDevice):
         check(self.api.cuCtxSynchronize(), "waiting for the batch")
 
     def _sdpa_runner(self, node: Node) -> Runner:
-        """The fused-attention kernel is compiled here and launched like any other, so a plan
-        or a capture treats its call exactly like a lowered nest's."""
-        functions = compile_cuda(emit_sdpa(node), self.arch, [SDPA_KERNEL])
+        """A fused-attention kernel is compiled here and launched like any other, so a plan
+        or a capture treats its call exactly like a lowered nest's. The three of them differ
+        only in their source and in how many blocks cover the rows they hand out."""
+        name = node.arg.name
+        emit, grid = SDPA_KERNELS[name]
+        functions = compile_cuda(emit(node), self.arch, [name])
         # one block per (batch, chunk of rows); the kernel decodes blockIdx the same way
-        return self._launcher(functions[SDPA_KERNEL], sdpa_blocks(node), len(node.srcs) + 1)
+        return self._launcher(functions[name], grid(node), len(node.srcs), len(node.arg.outs))
 
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
         splits = [split_partials(nest) for nest in nests]
@@ -363,16 +365,16 @@ class CudaDevice(CompiledDevice):
         out: list[Runner] = []
         for nest, partials in zip(nests, splits, strict=True):
             cells = outer_extent(nest)
-            nargs = len(nest.kernel.inputs) + 1
+            nin = len(nest.kernel.inputs)
             if partials:
-                part = self._launcher(functions[part_name(nest)], self._grid(cells * partials), nargs)
-                final = self._launcher(functions[nest.name], self._grid(cells), 2)
+                part = self._launcher(functions[part_name(nest)], self._grid(cells * partials), nin, 1)
+                final = self._launcher(functions[nest.name], self._grid(cells), 1, 1)
                 out.append(self._split_runner(part, final, split_scratch(nest, partials)))
             elif plan := tiled(nest):
                 # a tiled kernel's unit of work is a tile, not a cell, and its block is LANES^2 threads
-                out.append(self._launcher(functions[nest.name], min(tile_count(*plan), GRID), nargs))
+                out.append(self._launcher(functions[nest.name], min(tile_count(*plan), GRID), nin, 1))
             else:
-                out.append(self._launcher(functions[nest.name], self._grid(cells), nargs))
+                out.append(self._launcher(functions[nest.name], self._grid(cells), nin, 1))
         return out
 
     @staticmethod
@@ -384,26 +386,28 @@ class CudaDevice(CompiledDevice):
         # part-write. Taken on the first call, so a plan that is compiled but never run holds none.
         scratch: list[Buffer] = []
 
-        def run(inputs: list[Buffer], out: Buffer) -> None:
+        def run(inputs: list[Buffer], outs: list[Buffer]) -> None:
             if not scratch:
                 scratch.append(self._alloc(partials_nbytes))
-            part(inputs, scratch[0])
-            final(scratch, out)
+            part(inputs, scratch)  # the one scratch buffer is the partial stage's output and the fold's input
+            final(scratch, outs)
 
         return run
 
-    def _launcher(self, fn: ctypes.c_void_p, grid: int, nargs: int) -> Runner:
+    def _launcher(self, fn: ctypes.c_void_p, grid: int, nin: int, nout: int) -> Runner:
         launch = self.api.cuLaunchKernel
         # the param arrays are built once and refilled per call, which is safe because
         # cuLaunchKernel copies the pointed-to arguments before it returns
+        nargs = nin + nout
         ptrs = (CUdeviceptr * nargs)()
         size = ctypes.sizeof(CUdeviceptr)
         params = (ctypes.c_void_p * nargs)(*[ctypes.addressof(ptrs) + k * size for k in range(nargs)])
 
-        def run(inputs: list[Buffer], out: Buffer) -> None:
+        def run(inputs: list[Buffer], outs: list[Buffer]) -> None:
             for k, buf in enumerate(inputs):
                 ptrs[k] = buf.ptr
-            ptrs[nargs - 1] = out.ptr
+            for k, buf in enumerate(outs):
+                ptrs[nin + k] = buf.ptr
             check(launch(fn, grid, 1, 1, BLOCK, 1, 1, 0, None, params, None), "launching a kernel")
 
         return run
