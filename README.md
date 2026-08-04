@@ -93,10 +93,34 @@ Three rules hold it together:
 | escape hatch | `CUSTOM` |
 
 `CUSTOM` is the one door out of the composition: it names a kernel a device supplies whole
-instead of lowering a loop nest, and `sdpa`, the fused attention, is the one limn has. The
-numpy device interprets it as the reference every backend's kernel is diffed against, and a
-device that registers no kernel for the name never sees the node at all: the frontend
-composes the op from the primitives instead.
+instead of lowering a loop nest, and fused attention is the one limn has, as three of them:
+`sdpa` forward, `sdpa_bwd_q` and `sdpa_bwd_kv` for the gradient. The numpy device interprets
+each as the reference every backend's kernel is diffed against, and a device that registers
+no kernel for a name never sees the node at all: the frontend composes the op from the
+primitives instead.
+
+A node holds one value and a fused kernel can have several to give back, so a `CUSTOM` kernel
+with more than one output is one node per output, sharing srcs and differing only in which
+output they name. Nothing between the frontend and the device has to know they belong
+together, since running the kernel once per node is already correct; the executor spots the
+siblings and merges them into one call that writes all of them.
+
+The attention itself is flash-shaped on both sides. The forward streams K and V past each
+query row in tiles, keeping a running max, denominator and weighted sum in registers, and
+saves one number per row besides the answer: L, the row's logsumexp. That is the whole of
+what the backward needs, because a probability is `exp(s - L)`, so the gradient recomputes
+them in tiles rather than keeping a `t_q` by `t_k` from the forward. It takes two passes
+because dQ sums over keys while dK and dV sum over queries: one thread owns one row's total
+in each, so nothing accumulates across blocks, no float lands in an atomic, and two runs give
+the same bits. dK and dV come out of one pass because they share the probabilities that pass
+recomputes. What it buys is the shape of the memory: over 8192 tokens of 6-head, 32-wide
+causal attention, a training step's intermediates are 30 MB at any context length, against
+229 MB at `T=256` and 3.1 GB at `T=4096` for the composed form. `examples/bench_attention.py`
+measures both, forward and backward.
+
+A second derivative is the one thing the fused pair does not serve: a `CUSTOM` node carries no
+gradient of its own, so `create_graph=True` gets the composed backward, which is spelled in
+primitives and can be differentiated again.
 
 Seven dtypes: `float64`, `float32`, `float16`, `bfloat16`, `int32`, `int16`, and `int8`.
 `float16` and `bfloat16` are storage widths, not working precisions: each halves the bytes a
@@ -252,6 +276,7 @@ Every layer answers to an oracle above it:
 | the half-width floats | the numpy device | the corpus and the matmuls again at each width, diffed at the width's own rounding, plus the dtype rules, that a cast between float dtypes still carries gradients, and that the two meet at float32 |
 | `int8`, `int16` | the numpy device | an integer corpus (wraparound, compares, reduces, matmul, gather) on the `c` and `cuda` devices, diffed for exact equality since modular arithmetic leaves nothing to rounding |
 | `float64` | the numpy device | the corpus and the tiled matmuls again in double, diffed at 1e-12, plus that gradients and optimizer state hold the width and that a `cuda` scatter adds atomically in double |
+| fused attention | PyTorch, then the numpy device | forward and backward diffed against the composed form at every shape the seam allows and against `torch`'s own sdpa, with a check that the backward graph holds no `t_q` by `t_k` node at all; the `cuda` kernels then diffed against the numpy ones at each width, over ragged tiles, rows past one block, and rectangular keys, and held to giving the same bits twice |
 
 ## Layout
 
@@ -265,6 +290,7 @@ limn/
   codegen.py     lowers kernels to the printable loop-nest IR
   jit.py         the shared executor: plan caching and the assign transaction
   capture.py     records a step's kernel calls once, replays them on new batches
+  sdpa.py        the numpy reference for the fused attention kernels, forward and backward
   backend_c.py   renders the IR as C, compiles it, calls it through ctypes
   cuda_emit.py   renders the IR as CUDA C: one thread per cell, split reduces, tiled matmuls
   backend_cuda.py  binds the driver and NVRTC, compiles, owns device memory and launching
