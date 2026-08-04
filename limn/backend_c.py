@@ -254,7 +254,7 @@ class CDevice(CompiledDevice, HostDevice):
             fn = getattr(lib, nest.name)
             fn.argtypes = [ctypes.c_void_p] * (len(nest.kernel.inputs) + 1)
             fn.restype = None
-            runners.append(lambda inputs, out, fn=fn: fn(*[b.ctypes.data for b in inputs], out.ctypes.data))
+            runners.append(lambda inputs, outs, fn=fn: fn(*[b.ctypes.data for b in inputs], outs[0].ctypes.data))
         return runners
 
     def out_alloc(self, nb: int, zero: bool) -> Buffer:

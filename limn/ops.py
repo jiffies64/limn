@@ -90,7 +90,7 @@ class Op(Enum):
     # barriers
     CONTIGUOUS = auto()  # copy src into canonical row-major layout
     ASSIGN = auto()  # (target BUFFER node, value): overwrite target's bytes with value
-    CUSTOM = auto()  # arg (name, ...) a kernel the device supplies whole; the name picks it in the device's registry
+    CUSTOM = auto()  # arg is a Custom: a kernel the device supplies whole, and which of its outputs this node is
 
 
 @dataclass(eq=False)  # eq=False: nodes hash by identity, so a BUFFER node stays itself as its bytes change
@@ -103,6 +103,37 @@ class Node:
 
     def __repr__(self) -> str:
         return f"Node({self.op.name}, shape={self.shape}, dtype={self.dtype})"
+
+
+@dataclass(frozen=True)
+class Custom:
+    """A CUSTOM node's arg: which kernel the device runs, what parameterises it, and which of
+    that kernel's outputs this node stands for.
+
+    A node holds one value, and a fused kernel can have more than one to give back (flash
+    attention's backward wants dK and dV out of the same streaming pass). So a multi-output
+    kernel is one node per output, all sharing srcs, name and params and differing only in
+    `index`. Nothing between here and the device has to know they belong together: each node
+    stands on its own and running the kernel once per node is correct, merely wasteful. An
+    executor that spots the siblings runs the kernel once and hands each its own buffer, which
+    is what jit.py does.
+
+    `outs` names every output's dtype and shape, so a single node still says what the whole
+    kernel writes when a sibling is missing from a graph and its buffer is only scratch.
+    """
+
+    name: str
+    params: tuple
+    outs: tuple[tuple[DType, tuple[int, ...]], ...]
+    index: int = 0
+
+
+def custom(name: str, srcs: tuple[Node, ...], params: tuple, outs: Sequence[tuple[DType, tuple[int, ...]]]) -> tuple[Node, ...]:
+    """One CUSTOM node per output of this kernel, in output order; see Custom."""
+    specs = tuple(outs)
+    return tuple(
+        Node(Op.CUSTOM, srcs, dtype, shape, Custom(name, params, specs, index)) for index, (dtype, shape) in enumerate(specs)
+    )
 
 
 def topological[T](sinks: Sequence[T], srcs: Callable[[T], Sequence[T]] = operator.attrgetter("srcs")) -> list[T]:

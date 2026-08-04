@@ -16,7 +16,7 @@ import ml_dtypes
 import numpy as np
 
 from limn.ops import DType, Node, Op, accumulate_in, bfloat16, float16, float32, float64, int8, int16, int32
-from limn.sdpa import kernel as sdpa_kernel
+from limn.sdpa import KERNELS as SDPA_KERNELS
 from limn.view import View
 
 type Buffer = Any
@@ -76,8 +76,9 @@ class NumpyDevice(HostDevice):
     def __init__(self) -> None:
         self.cache: weakref.WeakKeyDictionary[Node, np.ndarray] = weakref.WeakKeyDictionary()
         # the CUSTOM kernels this device interprets, by the name carried in the node's arg;
-        # the reference for every backend's kernel of the same name
-        self.custom: dict[str, Callable[[list[np.ndarray], tuple], np.ndarray]] = {"sdpa": sdpa_kernel}
+        # the reference for every backend's kernel of the same name. Each returns one array per
+        # output the kernel writes, and a node takes the one its arg names.
+        self.custom: dict[str, Callable[[list[np.ndarray], Any], tuple[np.ndarray, ...]]] = dict(SDPA_KERNELS)
 
     def has_custom(self, name: str) -> bool:
         return name in self.custom
@@ -157,11 +158,13 @@ class NumpyDevice(HostDevice):
             case Op.CONTIGUOUS:
                 result = np.ascontiguousarray(srcs[0])
             case Op.CUSTOM:
-                name = node.arg[0]
-                kernel = self.custom.get(name)
+                # a multi-output kernel runs once per node that names one of its outputs, since
+                # each is its own cache entry. The reference interpreter can afford that; a
+                # compiled backend merges the siblings into one call (jit.py).
+                kernel = self.custom.get(node.arg.name)
                 if kernel is None:
-                    raise NotImplementedError(f"the numpy device has no rule for custom op {name!r}")
-                result = kernel(srcs, node.arg)
+                    raise NotImplementedError(f"the numpy device has no rule for custom op {node.arg.name!r}")
+                result = kernel(srcs, node.arg)[node.arg.index]
             case Op.ASSIGN:
                 result = srcs[1]
             case _:

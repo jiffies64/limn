@@ -31,18 +31,25 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from limn.codegen import LoopNest, lower_all
 from limn.device import Buffer
-from limn.ops import Node, Op, topological
+from limn.ops import Custom, Node, Op, topological
 from limn.schedule import realized, schedule
 
-Runner = Callable[[list[Buffer], Buffer], None]
+Runner = Callable[[list[Buffer], list[Buffer]], None]
 
 
 def nbytes(node: Node) -> int:
     return node.dtype.itemsize * math.prod(node.shape)
+
+
+def sibling_key(node: Node, position: dict[Node, int]) -> tuple:
+    """What makes two CUSTOM nodes two outputs of the same call: one kernel, one set of
+    parameters, one set of srcs. The index they differ in is deliberately left out."""
+    arg: Custom = node.arg
+    return arg.name, arg.params, tuple(position[src] for src in node.srcs)
 
 
 def graph_key(order: list[Node], position: dict[Node, int], sinks: list[Node]) -> tuple:
@@ -63,12 +70,17 @@ def graph_key(order: list[Node], position: dict[Node, int], sinks: list[Node]) -
 
 @dataclass(frozen=True, slots=True)
 class Call:
-    """One compiled kernel invocation, with its buffers named by position in topological order."""
+    """One compiled kernel invocation, with its buffers named by position in topological order.
+
+    A lowered nest writes one buffer; a CUSTOM kernel may write several (see ops.Custom), and
+    then `outputs` holds one position per value it writes. An output nothing in this graph reads
+    is None: the kernel writes it regardless, so the buffer is allocated and dropped.
+    """
 
     fn: Runner
     inputs: tuple[int, ...]
-    output: int  # the position whose value this call produces (the ASSIGN node itself for assigns)
-    out_nbytes: int
+    outputs: tuple[int | None, ...]  # the positions this call's values land in (the ASSIGN node itself for assigns)
+    out_nbytes: tuple[int, ...]
     zero_fill: bool  # a scatter adds into its output and reaches only the rows its indices name
     assign_target: int | None  # the BUFFER position an assign commits to, once every call has run
 
@@ -125,8 +137,8 @@ class CompiledDevice:
     def custom_runner(self, node: Node) -> Runner:
         """A callable for a CUSTOM kernel, which never reaches the loop-nest IR. A backend
         registers a builder per name in self.custom; the rest refuse the node at plan time."""
-        if (build := self.custom.get(node.arg[0])) is None:
-            raise NotImplementedError(f"{type(self).__name__} has no kernel for custom op {node.arg[0]!r}")
+        if (build := self.custom.get(node.arg.name)) is None:
+            raise NotImplementedError(f"{type(self).__name__} has no kernel for custom op {node.arg.name!r}")
         return build(node)
 
     def prepare(self, buf: Buffer) -> Buffer:
@@ -165,11 +177,13 @@ class CompiledDevice:
             bufs[p] = self.prepare(buf)
         deferred: list[tuple[int, Buffer]] = []
         for call in plan.calls:
-            out = self.out_alloc(call.out_nbytes, call.zero_fill)
-            call.fn([bufs[p] for p in call.inputs], out)
-            bufs[call.output] = out
+            outs = [self.out_alloc(nb, call.zero_fill) for nb in call.out_nbytes]
+            call.fn([bufs[p] for p in call.inputs], outs)
+            for p, out in zip(call.outputs, outs, strict=True):
+                if p is not None:  # a multi-output kernel writes this one, but nothing here reads it
+                    bufs[p] = out
             if call.assign_target is not None:
-                deferred.append((call.assign_target, out))
+                deferred.append((call.assign_target, outs[0]))
         for p, value in deferred:
             self.commit(sources[p], value)
             bufs[p] = value
@@ -182,23 +196,52 @@ class CompiledDevice:
         A CUSTOM kernel is handed to the device whole and never touches the loop-nest IR; the
         rest lower and compile together. Calls come back in kernel order either way, so a
         custom kernel sits in the plan exactly where the schedule put it.
+
+        The schedule gives each of a multi-output kernel's nodes a kernel of its own, since each
+        is a value that has to end up in a buffer. Running it once per node would be correct and
+        wasteful, so the siblings (same name, same params, same srcs) fold into the one call that
+        writes all of them; the merge is the only place in the stack that has to know they are
+        siblings at all.
+
+        A node joins any call under its key whose slot for its own output is still free, which
+        is what keeps two *independent* calls on the same inputs apart: the second one's output
+        0 finds slot 0 taken and opens a call of its own. Which of several equal calls a node
+        lands in does not matter, because a shared key means the same kernel over the same bytes
+        with the same parameters, so they all write the same values.
         """
         kernels = schedule(sinks, order)
         nests = lower_all(sinks, order, kernels)
         fns = iter(self.runners(nests) if nests else [])  # a graph of pure views schedules no kernels
-        calls = tuple(
-            Call(
-                fn=self.custom_runner(kernel.ast) if kernel.ast.op is Op.CUSTOM else next(fns),
-                inputs=tuple(position[node] for node in kernel.inputs),
-                output=position[kernel.ast],
-                out_nbytes=nbytes(kernel.target),
-                zero_fill=kernel.ast.op is Op.SCATTER,
-                assign_target=position[kernel.target] if kernel.ast.op is Op.ASSIGN else None,
+        calls: list[Call] = []
+        merged: dict[tuple, list[int]] = {}  # a multi-output kernel's siblings -> the calls emitted for them
+        for kernel in kernels:
+            root = kernel.ast
+            if root.op is Op.CUSTOM:
+                arg: Custom = root.arg
+                group = merged.setdefault(sibling_key(root, position), [])
+                if (at := next((c for c in group if calls[c].outputs[arg.index] is None), None)) is not None:
+                    bound = list(calls[at].outputs)
+                    bound[arg.index] = position[root]
+                    calls[at] = replace(calls[at], outputs=tuple(bound))
+                    continue
+                group.append(len(calls))
+                fn = self.custom_runner(root)
+                outputs = tuple(position[root] if k == arg.index else None for k in range(len(arg.outs)))
+                out_nbytes = tuple(dtype.itemsize * math.prod(shape) for dtype, shape in arg.outs)
+            else:
+                fn, outputs, out_nbytes = next(fns), (position[root],), (nbytes(kernel.target),)
+            calls.append(
+                Call(
+                    fn=fn,
+                    inputs=tuple(position[node] for node in kernel.inputs),
+                    outputs=outputs,
+                    out_nbytes=out_nbytes,
+                    zero_fill=root.op is Op.SCATTER,
+                    assign_target=position[kernel.target] if root.op is Op.ASSIGN else None,
+                )
             )
-            for kernel in kernels
-        )
         return Plan(
-            calls,
+            tuple(calls),
             tuple(p for p, node in enumerate(order) if node.op is Op.BUFFER),
             tuple(position[realized(sink)] for sink in sinks),
             len(order),
