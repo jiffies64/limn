@@ -45,13 +45,6 @@ def nbytes(node: Node) -> int:
     return node.dtype.itemsize * math.prod(node.shape)
 
 
-def sibling_key(node: Node, position: dict[Node, int]) -> tuple:
-    """What makes two CUSTOM nodes two outputs of the same call: one kernel, one set of
-    parameters, one set of srcs. The index they differ in is deliberately left out."""
-    arg: Custom = node.arg
-    return arg.name, arg.params, tuple(position[src] for src in node.srcs)
-
-
 def graph_key(order: list[Node], position: dict[Node, int], sinks: list[Node]) -> tuple:
     """This graph's structure, as a hashable key: two graphs with the same key lower to the same code.
 
@@ -199,9 +192,10 @@ class CompiledDevice:
 
         The schedule gives each of a multi-output kernel's nodes a kernel of its own, since each
         is a value that has to end up in a buffer. Running it once per node would be correct and
-        wasteful, so the siblings (same name, same params, same srcs) fold into the one call that
-        writes all of them; the merge is the only place in the stack that has to know they are
-        siblings at all.
+        wasteful, so the siblings fold into the one call that writes all of them; the merge is
+        the only place in the stack that has to know they are siblings at all. What makes two of
+        them siblings is one kernel, one set of parameters, one set of srcs, which is the key
+        below, and deliberately not the output index they differ in.
 
         A node joins any call under its key whose slot for its own output is still free, which
         is what keeps two *independent* calls on the same inputs apart: the second one's output
@@ -218,7 +212,7 @@ class CompiledDevice:
             root = kernel.ast
             if root.op is Op.CUSTOM:
                 arg: Custom = root.arg
-                group = merged.setdefault(sibling_key(root, position), [])
+                group = merged.setdefault((arg.name, arg.params, tuple(position[src] for src in root.srcs)), [])
                 if (at := next((c for c in group if calls[c].outputs[arg.index] is None), None)) is not None:
                     bound = list(calls[at].outputs)
                     bound[arg.index] = position[root]
