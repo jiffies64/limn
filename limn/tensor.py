@@ -506,7 +506,7 @@ class Tensor:
         shifted = self - self.max(axis, keepdim=True).detach()
         return shifted - shifted.exp().sum(axis, keepdim=True).log()
 
-    def attention(self, k: Tensor, v: Tensor, *, causal: bool = False) -> Tensor:
+    def attention(self, k: Tensor, v: Tensor, *, causal: bool = False, key_mask: Tensor | None = None) -> Tensor:
         """softmax(q @ k' / sqrt(hd)) @ v over the key axis, as one fused kernel where the
         device registers one, backward as well as forward.
 
@@ -515,6 +515,18 @@ class Tensor:
         keys. A device with no registered "sdpa" kernel gets the composed form instead, so
         every device runs this; a registered kernel reads contiguous srcs, which is what the
         CONTIGUOUS wraps here owe it.
+
+        key_mask is (..., t_k), one flag per key rather than one per (query, key) pair, and a
+        zero hides that key from every query row. That is the shape padding comes in, and the
+        shape a partly filled kv cache comes in, and it is the only masking that leaves the
+        promise above intact: a flag per pair would be the t_q by t_k this whole path exists to
+        avoid. It carries no gradient and composes with causal. Its leading dims broadcast
+        against the others, so a (batch, t_k) mask over (batch, heads, t_q, hd) queries has to
+        say which axis it means, as (batch, 1, t_k).
+
+        Hiding every key of a row is the caller's error rather than a case with an answer: the
+        fused form gives that row NaN, as torch does, and the composed form gives it a uniform
+        row, since it stands -1e9 in for -inf and softmax normalizes the ties away.
 
         The forward writes a second output besides the answer: L, the per-row logsumexp, which
         is what lets the backward rebuild probabilities in blocks instead of keeping a t_q by
@@ -532,26 +544,34 @@ class Tensor:
             raise ValueError(f"causal attention needs square keys, got {q.shape[-2]} queries and {k.shape[-2]} keys")
         if q.dtype not in FLOATS or k.dtype not in FLOATS or v.dtype not in FLOATS:
             raise ValueError(f"attention needs float dtypes, got {q.dtype}, {k.dtype}, {v.dtype}")
+        if key_mask is not None and key_mask.shape[-1:] != k.shape[-2:-1]:
+            raise ValueError(f"attention: a key mask ends in one flag per key, {k.shape[-2]}, got {key_mask.shape}")
         wider = promote(promote(q.dtype, k.dtype), v.dtype)
         q, k, v = q.cast(wider), k.cast(wider), v.cast(wider)
         batch = broadcast_shape(broadcast_shape(q.shape[:-2], k.shape[:-2], "attention"), v.shape[:-2], "attention")
         q = broadcast_to(q, batch + q.shape[-2:], "attention")
         k = broadcast_to(k, batch + k.shape[-2:], "attention")
         v = broadcast_to(v, batch + v.shape[-2:], "attention")
+        if key_mask is not None:
+            # at the others' width, so a kernel reads one spelling of it and an int flag lands on 1.0
+            key_mask = broadcast_to(key_mask.cast(wider), batch + k.shape[-2:-1], "attention")
         scale = q.shape[-1] ** -0.5
         if not device.active().has_custom(sdpa.SDPA):
-            return composed_attention(q, k, v, causal=causal, scale=scale)
+            return composed_attention(q, k, v, causal=causal, scale=scale, key_mask=key_mask)
         q, k, v = _contiguous(q), _contiguous(k), _contiguous(v)
+        mask = None if key_mask is None else _contiguous(key_mask)
+        # the mask rides last, so every index the kernels already read stays where it was
+        srcs = (q.node, k.node, v.node) + ((mask.node,) if mask is not None else ())
         rows = batch + (q.shape[-2], 1)  # a statistic per query row, shaped to broadcast over keys
         outs = ((wider, batch + (q.shape[-2], v.shape[-1])), (accumulate_in(wider), rows))
-        node, lse = custom(sdpa.SDPA, (q.node, k.node, v.node), (causal, scale), outs)
+        node, lse = custom(sdpa.SDPA, srcs, (causal, scale), outs)
         out = Tensor.from_node(node, (q, k, v))
         if out.requires_grad:
             # the backward reads the output back, over a second Tensor on the same node rather
             # than over `out`: a grad_fn closing on the tensor that holds it is a reference cycle,
             # and every buffer under the graph would then wait for a collector pass to be freed
             saved = (Tensor.from_node(node), Tensor.from_node(lse))
-            out.grad_fn = _attention_backward(*saved, q, k, v, causal=causal, scale=scale)
+            out.grad_fn = _attention_backward(*saved, q, k, v, mask, causal=causal, scale=scale)
         return out
 
     # ---- autograd ----
@@ -650,13 +670,15 @@ def scatter_rows(values: Tensor, indices: Tensor, shape: tuple[int, ...]) -> Ten
     return Tensor.from_node(node, (values,), lambda g: (g.gather_rows(indices),))
 
 
-def composed_attention(q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float) -> Tensor:
+def composed_attention(q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float, key_mask: Tensor | None = None) -> Tensor:
     """Attention from the primitives: what every device runs when no fused kernel is
     registered, and the form the fused kernel's grad_fn falls back to."""
-    return _attention_probs(q, k, causal=causal, scale=scale) @ v
+    return _attention_probs(q, k, causal=causal, scale=scale, key_mask=key_mask) @ v
 
 
-def _attention_backward(out: Tensor, lse: Tensor, q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float) -> BackwardFn:
+def _attention_backward(
+    out: Tensor, lse: Tensor, q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None, *, causal: bool, scale: float
+) -> BackwardFn:
     """The gradient of the fused attention: two more fused kernels, or the composed form.
 
     The fused pair keeps the promise the forward makes. dQ streams keys past each query row and
@@ -673,7 +695,7 @@ def _attention_backward(out: Tensor, lse: Tensor, q: Tensor, k: Tensor, v: Tenso
     def backward(g: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if grad_enabled or not all(device.active().has_custom(name) for name in (sdpa.SDPA_BWD_Q, sdpa.SDPA_BWD_KV)):
             # a masked p entry is exactly 0 (exp underflows the -1e9), so ds needs no re-mask
-            p = _attention_probs(q, k, causal=causal, scale=scale)
+            p = _attention_probs(q, k, causal=causal, scale=scale, key_mask=mask)
             dp = g @ v.transpose(-2, -1)
             ds = p * (dp - (dp * p).sum(axis=-1, keepdim=True)) * scale
             return ds @ k, ds.transpose(-2, -1) @ q, p.transpose(-2, -1) @ g
@@ -682,7 +704,8 @@ def _attention_backward(out: Tensor, lse: Tensor, q: Tensor, k: Tensor, v: Tenso
         # It is ordinary elementwise work, so the scheduler fuses it into a single reduce.
         saved = lse.dtype
         delta = (do.cast(saved) * out.cast(saved)).sum(axis=-1, keepdim=True)
-        srcs = tuple(t.node for t in (q, k, v, do, lse, _contiguous(delta)))
+        held = (q, k, v, do, lse, _contiguous(delta)) + ((mask,) if mask is not None else ())
+        srcs = tuple(t.node for t in held)
         params = (causal, scale)
         (dq,) = custom(sdpa.SDPA_BWD_Q, srcs, params, ((q.dtype, q.shape),))
         dk, dv = custom(sdpa.SDPA_BWD_KV, srcs, params, ((k.dtype, k.shape), (v.dtype, v.shape)))
@@ -691,12 +714,17 @@ def _attention_backward(out: Tensor, lse: Tensor, q: Tensor, k: Tensor, v: Tenso
     return backward
 
 
-def _attention_probs(q: Tensor, k: Tensor, *, causal: bool, scale: float) -> Tensor:
+def _attention_probs(q: Tensor, k: Tensor, *, causal: bool, scale: float, key_mask: Tensor | None = None) -> Tensor:
     """softmax of the masked, scaled scores; -1e9 stands in for -inf, and exp underflows it
-    to an exact zero, so masked probabilities are 0 and not merely small."""
+    to an exact zero, so masked probabilities are 0 and not merely small.
+
+    A key mask is one flag per key, so it takes a length-1 query axis to line up against a
+    row of scores; the two maskings compose, and a key hidden by either is gone."""
     scores = (q @ k.transpose(-2, -1)) * scale
     if causal:
         scores = _causal_mask(q.shape[-2], k.shape[-2]).where(scores, -1e9)
+    if key_mask is not None:
+        scores = key_mask.reshape(*key_mask.shape[:-1], 1, key_mask.shape[-1]).where(scores, -1e9)
     return scores.softmax(-1)
 
 

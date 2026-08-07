@@ -55,7 +55,7 @@ def _blocks(n: int, block_size: int) -> list[tuple[int, int]]:
     return [(start, min(start + block_size, n)) for start in range(0, n, block_size)]
 
 
-def _validate(q: np.ndarray, k: np.ndarray, v: np.ndarray, causal: bool) -> None:
+def _validate(q: np.ndarray, k: np.ndarray, v: np.ndarray, key_mask: np.ndarray | None, causal: bool) -> None:
     if q.ndim < 2 or k.ndim != q.ndim or v.ndim != q.ndim:
         raise ValueError(f"sdpa wants 2D+ inputs of equal rank, got {q.shape}, {k.shape}, {v.shape}")
     if q.shape[:-2] != k.shape[:-2] or q.shape[:-2] != v.shape[:-2] or k.shape[-2] != v.shape[-2]:
@@ -64,21 +64,35 @@ def _validate(q: np.ndarray, k: np.ndarray, v: np.ndarray, causal: bool) -> None
         raise ValueError(f"sdpa: head dims differ, {q.shape[-1]} and {k.shape[-1]}")
     if causal and q.shape[-2] != k.shape[-2]:
         raise ValueError(f"causal sdpa needs square keys, got {q.shape[-2]} queries and {k.shape[-2]} keys")
+    if key_mask is not None and key_mask.shape != q.shape[:-2] + k.shape[-2:-1]:
+        raise ValueError(f"sdpa key mask must be {q.shape[:-2] + k.shape[-2:-1]}, got {key_mask.shape}")
 
 
-def _scores(a: np.ndarray, b: np.ndarray, rows: range, cols: range, *, causal: bool, scale: float) -> np.ndarray:
+def _keep(key_mask: np.ndarray | None, cols: slice) -> np.ndarray | None:
+    """A block of the key mask, shaped to broadcast over a block of scores: one flag per key,
+    the same for every query row, so it needs a length-1 query axis wedged in."""
+    return None if key_mask is None else key_mask[..., None, cols]
+
+
+def _scores(
+    a: np.ndarray, b: np.ndarray, rows: range, cols: range, *, causal: bool, scale: float, keep: np.ndarray | None = None
+) -> np.ndarray:
     """The scaled scores of the `rows` queries against the `cols` keys, -inf where causal hides
-    a key: the block every pass starts from. The mask comes from the two index ranges, since a
-    block knows where it sits on each axis, and it lands on the trailing dims only, so it
-    broadcasts over any batch."""
+    a key: the block every pass starts from. The causal mask comes from the two index ranges,
+    since a block knows where it sits on each axis, and it lands on the trailing dims only, so it
+    broadcasts over any batch. `keep` hides a key from every query row instead of from the ones
+    left of it, and the two compose."""
     scores = a @ b.swapaxes(-1, -2) * scale
-    return np.where(np.asarray(cols) <= np.asarray(rows)[:, None], scores, -np.inf) if causal else scores
+    if causal:
+        scores = np.where(np.asarray(cols) <= np.asarray(rows)[:, None], scores, -np.inf)
+    return scores if keep is None else np.where(keep, scores, -np.inf)
 
 
 def sdpa(
     q: np.ndarray,
     k: np.ndarray,
     v: np.ndarray,
+    key_mask: np.ndarray | None = None,
     *,
     causal: bool,
     scale: float,
@@ -88,14 +102,16 @@ def sdpa(
 
     The inputs share their leading dims; q is (..., t_q, hd), k is (..., t_k, hd),
     v is (..., t_k, hd_v). causal wants t_q == t_k and hides keys to the right of each
-    query row. half-width float inputs widen to float32 for the recurrence and round back
-    once at the end, the same rule every reduce in limn owes.
+    query row. key_mask is (..., t_k), one flag per key and the same for every query row,
+    and a falsy one hides that key. half-width float inputs widen to float32 for the
+    recurrence and round back once at the end, the same rule every reduce in limn owes.
 
     Returns the output and L, the per-row logsumexp of the masked scaled scores, as
     (..., t_q, 1) at the recurrence's own width: the row statistic the backward rebuilds
-    probabilities from.
+    probabilities from. A row left with no key at all is the caller's error: it comes back
+    NaN, as it does from torch, and its L is -inf.
     """
-    _validate(q, k, v, causal)
+    _validate(q, k, v, key_mask, causal)
     Q, K, V = _widened(q, k, v)
     work = Q.dtype
     batch, t_q, t_k = q.shape[:-2], q.shape[-2], k.shape[-2]
@@ -104,11 +120,16 @@ def sdpa(
     running_max = np.full(batch + (t_q,), -np.inf, dtype=work)
     running_sum = np.zeros(batch + (t_q,), dtype=work)
     for j0, j1 in _blocks(t_k, block_size):
-        scores = _scores(Q, K[..., j0:j1, :], range(t_q), range(j0, j1), causal=causal, scale=scale)
-        block_max = scores.max(axis=-1)
-        new_max = np.maximum(running_max, block_max)
-        rescale = np.exp(running_max - new_max)
-        weights = np.exp(scores - new_max[..., None])
+        scores = _scores(
+            Q, K[..., j0:j1, :], range(t_q), range(j0, j1), causal=causal, scale=scale, keep=_keep(key_mask, slice(j0, j1))
+        )
+        new_max = np.maximum(running_max, scores.max(axis=-1))
+        # a row whose keys have all been hidden so far has no baseline to convert against, and
+        # -inf minus -inf is NaN rather than the nothing it should be. Standing that row's
+        # baseline at 0 leaves both its factors exp(-inf), which is the zero it has accumulated.
+        baseline = np.where(np.isneginf(new_max), work.type(0), new_max)
+        rescale = np.exp(running_max - baseline)
+        weights = np.exp(scores - baseline[..., None])
         running_sum = running_sum * rescale + weights.sum(axis=-1)
         out = out * rescale[..., None] + weights @ V[..., j0:j1, :]
         running_max = new_max
@@ -123,6 +144,7 @@ def sdpa_backward_q(
     do: np.ndarray,
     lse: np.ndarray,
     delta: np.ndarray,
+    key_mask: np.ndarray | None = None,
     *,
     causal: bool,
     scale: float,
@@ -134,12 +156,13 @@ def sdpa_backward_q(
     lse and delta are the forward's per-row logsumexp and the row dot sum_d dO_id * O_id, both
     (..., t_q, 1), which is the shape that broadcasts over a block of keys.
     """
-    _validate(q, k, v, causal)
+    _validate(q, k, v, key_mask, causal)
     Q, K, V, DO, L, D = _widened(q, k, v, do, lse, delta)
     t_q, t_k = q.shape[-2], k.shape[-2]
     dq = np.zeros(Q.shape, dtype=Q.dtype)
     for j0, j1 in _blocks(t_k, block_size):
-        scores = _scores(Q, K[..., j0:j1, :], range(t_q), range(j0, j1), causal=causal, scale=scale)
+        keep = _keep(key_mask, slice(j0, j1))
+        scores = _scores(Q, K[..., j0:j1, :], range(t_q), range(j0, j1), causal=causal, scale=scale, keep=keep)
         p = np.exp(scores - L)  # exactly zero where the mask sent the score to -inf
         dp = DO @ V[..., j0:j1, :].swapaxes(-1, -2)
         ds = p * (dp - D) * scale
@@ -154,20 +177,24 @@ def sdpa_backward_kv(
     do: np.ndarray,
     lse: np.ndarray,
     delta: np.ndarray,
+    key_mask: np.ndarray | None = None,
     *,
     causal: bool,
     scale: float,
     block_size: int = 16,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """dK and dV out of one pass over blocks of queries, since both fold the same recomputed p."""
-    _validate(q, k, v, causal)
+    """dK and dV out of one pass over blocks of queries, since both fold the same recomputed p.
+
+    A hidden key contributes to no query row, so its p is zero the whole way down and its dK
+    and dV rows come out zero, which is what a gradient that reaches nothing should be."""
+    _validate(q, k, v, key_mask, causal)
     Q, K, V, DO, L, D = _widened(q, k, v, do, lse, delta)
     t_q, t_k = q.shape[-2], k.shape[-2]
     dk = np.zeros(K.shape, dtype=K.dtype)
     dv = np.zeros(V.shape, dtype=V.dtype)
     for i0, i1 in _blocks(t_q, block_size):
         Qi, DOi = Q[..., i0:i1, :], DO[..., i0:i1, :]
-        scores = _scores(Qi, K, range(i0, i1), range(t_k), causal=causal, scale=scale)
+        scores = _scores(Qi, K, range(i0, i1), range(t_k), causal=causal, scale=scale, keep=_keep(key_mask, slice(None)))
         p = np.exp(scores - L[..., i0:i1, :])
         dv += p.swapaxes(-1, -2) @ DOi
         dp = DOi @ V.swapaxes(-1, -2)
@@ -197,24 +224,25 @@ KERNELS = {name: _kernel(fn) for name, fn in ((SDPA, sdpa), (SDPA_BWD_Q, sdpa_ba
 # ---- checker: run as a script ----
 
 
-def _plain_probs(q: np.ndarray, k: np.ndarray, *, causal: bool, scale: float) -> np.ndarray:
+def _plain_probs(q: np.ndarray, k: np.ndarray, *, causal: bool, scale: float, key_mask=None) -> np.ndarray:
     """The probabilities the obvious way, for the checker to diff against: the whole t_q by t_k
     at once, softmaxed in one shot rather than folded block by block."""
-    scores = _scores(q, k, range(q.shape[-2]), range(k.shape[-2]), causal=causal, scale=scale)
+    keep = _keep(key_mask, slice(None))
+    scores = _scores(q, k, range(q.shape[-2]), range(k.shape[-2]), causal=causal, scale=scale, keep=keep)
     weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
     return weights / weights.sum(axis=-1, keepdims=True)
 
 
-def _plain(q: np.ndarray, k: np.ndarray, v: np.ndarray, *, causal: bool, scale: float) -> np.ndarray:
+def _plain(q: np.ndarray, k: np.ndarray, v: np.ndarray, *, causal: bool, scale: float, key_mask=None) -> np.ndarray:
     """Attention the obvious way: the answer the recurrence has to land on."""
-    return _plain_probs(q, k, causal=causal, scale=scale) @ v
+    return _plain_probs(q, k, causal=causal, scale=scale, key_mask=key_mask) @ v
 
 
 def _plain_backward(
-    q: np.ndarray, k: np.ndarray, v: np.ndarray, do: np.ndarray, *, causal: bool, scale: float
+    q: np.ndarray, k: np.ndarray, v: np.ndarray, do: np.ndarray, *, causal: bool, scale: float, key_mask=None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The textbook backward, materialized: the form Tensor.attention used to differentiate."""
-    p = _plain_probs(q, k, causal=causal, scale=scale)
+    p = _plain_probs(q, k, causal=causal, scale=scale, key_mask=key_mask)
     dp = do @ v.swapaxes(-1, -2)
     ds = p * (dp - (dp * p).sum(axis=-1, keepdims=True)) * scale
     return ds @ k, ds.swapaxes(-1, -2) @ q, p.swapaxes(-1, -2) @ do
@@ -245,31 +273,38 @@ def check() -> None:
     rect_q, rect_k, rect_v = rand(f32, 64, 200, 16), rand(f32, 64, 160, 16), rand(f32, 64, 160, 48)
     tail = rand(f32, 100, 32)
     hot_q = rand(f32, 256, 64) * 100.0
+    pad = np.arange(128) < 77  # a padded batch: the keys past 77 are not there
+    holes = rng.random((2, 3, 128)) > 0.3  # hidden keys need not be a suffix
+    step_q, step_k, step_v = rand(f32, 4, 1, 32), rand(f32, 4, 96, 32), rand(f32, 4, 96, 48)
     cases = [
-        (q, k, v, True, 1e-5, "f32 causal batched (2,3,128,32)"),
-        (q, k, v, False, 1e-5, "f32 full batched (2,3,128,32)"),
-        (rect_q, rect_k, rect_v, False, 1e-5, "f32 rectangular 64x160"),
-        (tail, tail, rand(f32, 100, 32), False, 1e-5, "f32 100 keys, undivided tail"),
-        (hot_q, rand(f32, 256, 64), rand(f32, 256, 64), True, 1e-4, "f32 causal, Q x 100"),
-        (rand(f64, 2, 64, 32), rand(f64, 2, 64, 32), rand(f64, 2, 64, 16), True, 1e-12, "f64 causal"),
-        (rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 48), True, 2e-3, "f16 causal batched"),
-        (rand(bf16, 2, 3, 128, 32), rand(bf16, 2, 3, 128, 32), rand(bf16, 2, 3, 128, 48), True, 2e-2, "bf16 causal batched"),
+        (q, k, v, None, True, 1e-5, "f32 causal batched (2,3,128,32)"),
+        (q, k, v, None, False, 1e-5, "f32 full batched (2,3,128,32)"),
+        (rect_q, rect_k, rect_v, None, False, 1e-5, "f32 rectangular 64x160"),
+        (tail, tail, rand(f32, 100, 32), None, False, 1e-5, "f32 100 keys, undivided tail"),
+        (hot_q, rand(f32, 256, 64), rand(f32, 256, 64), None, True, 1e-4, "f32 causal, Q x 100"),
+        (rand(f64, 2, 64, 32), rand(f64, 2, 64, 32), rand(f64, 2, 64, 16), None, True, 1e-12, "f64 causal"),
+        (rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 32), rand(f16, 2, 3, 128, 48), None, True, 2e-3, "f16 causal batched"),
+        (rand(bf16, 2, 3, 128, 32), rand(bf16, 2, 3, 128, 32), rand(bf16, 2, 3, 128, 48), None, True, 2e-2, "bf16 causal"),
+        (q, k, v, np.broadcast_to(pad, (2, 3, 128)), True, 1e-5, "f32 causal, 77 keys of 128"),
+        (q, k, v, holes.astype(f32), False, 1e-5, "f32 full, keys hidden at random"),
+        (step_q, step_k, step_v, np.arange(96) < 61, False, 1e-5, "f32 one query row, 61 keys of 96"),
     ]
-    for cq, ck, cv, causal, tol, name in cases:
+    for cq, ck, cv, mask, causal, tol, name in cases:
         # half-width floats are compared widened: the check is the recurrence, not the storage rounding
         wide = np.float32 if cq.dtype in HALF_FLOATS else cq.dtype
         scale = cq.shape[-1] ** -0.5
         wq, wk, wv = cq.astype(wide), ck.astype(wide), cv.astype(wide)
         do = rng.standard_normal(cq.shape[:-1] + cv.shape[-1:]).astype(wide)  # the output's shape
-        expected = _plain(wq, wk, wv, causal=causal, scale=scale)
-        wanted = _plain_backward(wq, wk, wv, do, causal=causal, scale=scale)
+        mask = None if mask is None else np.broadcast_to(mask, cq.shape[:-2] + ck.shape[-2:-1])
+        expected = _plain(wq, wk, wv, causal=causal, scale=scale, key_mask=mask)
+        wanted = _plain_backward(wq, wk, wv, do, causal=causal, scale=scale, key_mask=mask)
         worst, worst_block = 0.0, 0
         for block in (1, 16, ck.shape[-2], ck.shape[-2] + 7):
-            got, lse = sdpa(cq, ck, cv, causal=causal, scale=scale, block_size=block)
+            got, lse = sdpa(cq, ck, cv, mask, causal=causal, scale=scale, block_size=block)
             assert got.dtype == cq.dtype, f"{name}: result dtype {got.dtype}, want {cq.dtype}"
             assert lse.shape == cq.shape[:-1] + (1,), f"{name}: lse shape {lse.shape}"
             delta = (do * got.astype(wide)).sum(axis=-1, keepdims=True)
-            args = (cq, ck, cv, do.astype(cq.dtype), lse, delta)
+            args = (cq, ck, cv, do.astype(cq.dtype), lse, delta, mask)
             grads = (
                 sdpa_backward_q(*args, causal=causal, scale=scale, block_size=block),
                 *sdpa_backward_kv(*args, causal=causal, scale=scale, block_size=block),
