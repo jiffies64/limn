@@ -25,6 +25,17 @@ print(x.grad.numpy())    # nothing computes until here
 
 ## Getting started
 
+limn is not on PyPI, so install it from the repository:
+
+```
+uv pip install "git+https://github.com/jiffies64/limn.git"          # latest main
+uv pip install "git+https://github.com/jiffies64/limn.git@v0.1.0"   # pinned to a tag
+uv add "git+https://github.com/jiffies64/limn.git"                  # or as a project dependency
+uv pip install "limn[cuda] @ git+https://github.com/jiffies64/limn.git"   # with NVRTC as a wheel
+```
+
+To work on it instead, clone it and let `uv sync` build the environment:
+
 ```
 git clone https://github.com/jiffies64/limn.git
 cd limn
