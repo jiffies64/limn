@@ -777,7 +777,6 @@ class Sdpa:
     saved: str  # the width the row statistics (L and D) are stored at, which is the compute width
     zero: str
     exp: str
-    fmax: str
     log: str
     t_q: int
     t_k: int
@@ -888,7 +887,6 @@ def sdpa_form(node) -> Sdpa:
         saved=CUDA_TYPE[wide],
         zero=c_literal(0.0, wide),
         exp="expf" if single else "exp",
-        fmax="fmaxf" if single else "fmax",
         log="logf" if single else "log",
         t_q=q.shape[-2],
         t_k=k.shape[-2],
@@ -901,6 +899,12 @@ def emit_sdpa(node) -> str:
     """The forward: one thread per query row keeps the online softmax recurrence in registers
     while K and V stream through shared memory a tile at a time, so no t_q by t_k buffer exists
     and a tile is read from global once per block rather than once per row.
+
+    A key only owes the running total a rescale when it raises the row's max, which past the
+    first few keys is rare: the odds a row's j-th key beats all j-1 before it are 1/j. Asking
+    first costs a compare, and skipping pays back the hd_v multiplies the unconditional form
+    spends on a factor of exactly 1. Where the max does move the arithmetic is the same one,
+    since exp(0) is 1 and a running total times 1 is itself.
 
     Besides the output it writes L, the row's logsumexp, which is what the recurrence's running
     max and denominator already are: m + log(l). That is the whole of what the backward needs to
@@ -920,12 +924,15 @@ def emit_sdpa(node) -> str:
             f"      {f.comp} s = {f.zero};",
             f"      for (int d = 0; d < {f.hd}; d++) s += q_local[d] * K_tile[lj][d];",
             f"      s *= {f.scale};",
-            f"      {f.comp} m_new = {f.fmax}(m, s);",
-            f"      {f.comp} p = {f.exp}(s - m_new);",
-            f"      {f.comp} alpha = {f.exp}(m - m_new);",
-            "      l = l * alpha + p;",
-            f"      for (int d = 0; d < {f.hd_v}; d++) acc[d] = acc[d] * alpha + p * V_tile[lj][d];",
-            "      m = m_new;",
+            "      if (s > m) {",
+            f"        {f.comp} alpha = {f.exp}(m - s);",
+            "        l *= alpha;",
+            f"        for (int d = 0; d < {f.hd_v}; d++) acc[d] *= alpha;",
+            "        m = s;",
+            "      }",
+            f"      {f.comp} p = {f.exp}(s - m);",
+            "      l += p;",
+            f"      for (int d = 0; d < {f.hd_v}; d++) acc[d] += p * V_tile[lj][d];",
         ],
         store=[
             f"    {f.mem}* o_row = out0 + (b * {f.t_q} + i) * {f.hd_v};",
