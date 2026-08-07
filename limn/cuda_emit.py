@@ -754,20 +754,16 @@ def emit_cuda(nests: list[LoopNest]) -> str:
 SDPA_TILE_K = 32  # keys (or queries) staged through shared memory per step
 
 
-def sdpa_blocks(node) -> int:
-    """How many blocks a query-row kernel launches: one per (batch, chunk of query rows).
+def sdpa_blocks(node, rows: int = 0) -> int:
+    """How many blocks a fused-attention kernel launches: one per (batch, chunk of the rows it
+    hands out), which is q's rows for the two query-row kernels and k's for the pass that turns
+    the loop inside out.
 
     Blocks never straddle a batch, because a block's shared tile belongs to exactly one batch;
     the launcher and the kernel's blockIdx decoding must agree on this count.
     """
-    q = node.srcs[0]
-    return math.prod(q.shape[:-2]) * math.ceil(q.shape[-2] / BLOCK)
-
-
-def sdpa_kv_blocks(node) -> int:
-    """The same, for the backward pass that gives one thread a key row instead of a query row."""
-    k = node.srcs[1]
-    return math.prod(k.shape[:-2]) * math.ceil(k.shape[-2] / BLOCK)
+    src = node.srcs[rows]
+    return math.prod(src.shape[:-2]) * math.ceil(src.shape[-2] / BLOCK)
 
 
 @dataclass(frozen=True)
@@ -796,25 +792,80 @@ class Sdpa:
     def k_chunks(self) -> int:
         return math.ceil(self.t_k / BLOCK)
 
-    def tile(self, name: str, base: str, rows: int, width: int, indent: str = "    ") -> list[str]:
+    def tile(self, name: str, base: str, rows: int, width: int) -> list[str]:
         """One cooperative copy of a tile of `rows`-by-`width` into shared memory, zero-filled
-        past the end of the axis so a ragged tail costs a select rather than a branch."""
+        past the end of the axis so a ragged tail costs a select rather than a branch.
+
+        The tile holds the compute width, not the storage width: every element is read once per
+        row the block owns, so a half width converted on the way in pays one conversion per
+        staged element instead of up to BLOCK of them in the dot products.
+        """
         return [
-            f"{indent}for (int idx = (int)threadIdx.x; idx < {SDPA_TILE_K} * {width}; idx += blockDim.x) {{",
-            f"{indent}  int lr = idx / {width}, d = idx - lr * {width};",
-            f"{indent}  long long r = r0 + lr;",
-            f"{indent}  {name}[lr][d] = r < {rows} ? ({self.comp}){base}[r * {width} + d] : {self.zero};",
-            f"{indent}}}",
+            f"    for (int idx = (int)threadIdx.x; idx < {SDPA_TILE_K} * {width}; idx += blockDim.x) {{",
+            f"      int lr = idx / {width}, d = idx - lr * {width};",
+            "      long long r = r0 + lr;",
+            f"      {name}[lr][d] = r < {rows} ? ({self.comp}){base}[r * {width} + d] : {self.zero};",
+            "    }",
         ]
 
-    def row(self, name: str, base: str, rows: int, indent: str = "    ") -> list[str]:
+    def row(self, name: str, base: str, rows: int) -> list[str]:
         """One statistic per row of a tile: L and D, which the backward reads alongside them."""
         return [
-            f"{indent}for (int lr = (int)threadIdx.x; lr < {SDPA_TILE_K}; lr += blockDim.x) {{",
-            f"{indent}  long long r = r0 + lr;",
-            f"{indent}  {name}[lr] = r < {rows} ? ({self.comp}){base}[r] : {self.zero};",
-            f"{indent}}}",
+            f"    for (int lr = (int)threadIdx.x; lr < {SDPA_TILE_K}; lr += blockDim.x) {{",
+            "      long long r = r0 + lr;",
+            f"      {name}[lr] = r < {rows} ? ({self.comp}){base}[r] : {self.zero};",
+            "    }",
         ]
+
+    def query_rows(self, sig: str, held: list[str], loaded: list[str], step: list[str], store: list[str]) -> str:
+        """A whole kernel that gives one thread one query row and streams K and V past it.
+
+        `held` is what the row accumulates and `loaded` what it reads from its own inputs, the
+        one inside the guard because a thread past t_q has no row to read; `step` is the work
+        one key j costs, over K_tile[lj] and V_tile[lj]; `store` writes the totals back. Every
+        thread helps load each tile and meets the same barriers either side of it. A causal
+        block also stops streaming at its own last row's diagonal: every key past that is masked
+        for every row the block holds, and the bound depends only on blockIdx, so the barriers
+        stay uniform. Sharing the frame is what makes the forward and the dQ pass provably one
+        traversal, which they have to be for exp(s - L) to rebuild the forward's probabilities.
+        """
+        chunk = f"(row_chunk + 1) * {BLOCK}"
+        lines = [
+            sig,
+            f"  __shared__ {self.comp} K_tile[{SDPA_TILE_K}][{self.hd}];",
+            f"  __shared__ {self.comp} V_tile[{SDPA_TILE_K}][{self.hd_v}];",
+            f"  long long b = blockIdx.x / {self.q_chunks};",
+            f"  long long row_chunk = blockIdx.x - b * {self.q_chunks};",
+            f"  int i = (int)(row_chunk * {BLOCK} + threadIdx.x);",
+            f"  int valid = i < {self.t_q};",
+            f"  const {self.mem}* k_base = in1 + b * {self.t_k} * {self.hd};",
+            f"  const {self.mem}* v_base = in2 + b * {self.t_k} * {self.hd_v};",
+            f"  {self.comp} q_local[{self.hd}];",
+            *held,
+            "  if (valid) {",
+            f"    const {self.mem}* q_row = in0 + (b * {self.t_q} + i) * {self.hd};",
+            f"    for (int d = 0; d < {self.hd}; d++) q_local[d] = ({self.comp})q_row[d];",
+            *loaded,
+            "  }",
+            f"  long long keys_end = valid ? ({'i + 1' if self.causal else f'{self.t_k}LL'}) : 0LL;",
+            f"  long long block_keys = {f'{chunk} < {self.t_k} ? {chunk} : ' if self.causal else ''}{self.t_k}LL;",
+            f"  for (long long r0 = 0; r0 < block_keys; r0 += {SDPA_TILE_K}) {{",
+            *self.tile("K_tile", "k_base", self.t_k, self.hd),
+            *self.tile("V_tile", "v_base", self.t_k, self.hd_v),
+            "    __syncthreads();",
+            f"    long long tile_end = r0 + {SDPA_TILE_K} < keys_end ? r0 + {SDPA_TILE_K} : keys_end;",
+            "    for (long long j = r0; j < tile_end; j++) {",
+            "      int lj = (int)(j - r0);",
+            *step,
+            "    }",
+            "    __syncthreads();",
+            "  }",
+            "  if (valid) {",
+            *store,
+            "  }",
+            "}",
+        ]
+        return PRELUDE + "\n" + "\n".join(lines) + "\n"
 
 
 def sdpa_form(node) -> Sdpa:
@@ -851,72 +902,37 @@ def emit_sdpa(node) -> str:
     while K and V stream through shared memory a tile at a time, so no t_q by t_k buffer exists
     and a tile is read from global once per block rather than once per row.
 
-    A block covers BLOCK consecutive query rows of a single batch. Every thread helps load each
-    tile and meets at the same barriers, and threads whose row is past the end of t_q simply
-    skip the per-row work. A causal block also stops streaming tiles at its own last row's
-    diagonal: every key past it is masked for every row the block holds, and the bound depends
-    only on blockIdx, so the barriers stay uniform.
-
-    The tiles hold the compute width, not the storage width: every element is read once per
-    query row in the block, so a half width converted on the way in pays one conversion per
-    staged element instead of up to BLOCK of them in the dot products.
-
     Besides the output it writes L, the row's logsumexp, which is what the recurrence's running
     max and denominator already are: m + log(l). That is the whole of what the backward needs to
     rebuild a probability, and it costs one number per query row instead of t_k of them.
     """
     f = sdpa_form(node)
-    keys_end = "i + 1" if f.causal else f"{f.t_k}LL"
-    block_keys = f"(row_chunk + 1) * {BLOCK} < {f.t_k} ? (row_chunk + 1) * {BLOCK} : {f.t_k}LL" if f.causal else f"{f.t_k}LL"
-
-    lines = [
+    return f.query_rows(
         kernel_sig(SDPA, [node.srcs[0].dtype] * 3, [dtype for dtype, _ in node.arg.outs]),
-        f"  __shared__ {f.comp} K_tile[{SDPA_TILE_K}][{f.hd}];",
-        f"  __shared__ {f.comp} V_tile[{SDPA_TILE_K}][{f.hd_v}];",
-        f"  long long b = blockIdx.x / {f.q_chunks};",
-        f"  long long row_chunk = blockIdx.x - b * {f.q_chunks};",
-        f"  int i = (int)(row_chunk * {BLOCK} + threadIdx.x);",
-        f"  int valid = i < {f.t_q};",
-        f"  const {f.mem}* k_base = in1 + b * {f.t_k} * {f.hd};",
-        f"  const {f.mem}* v_base = in2 + b * {f.t_k} * {f.hd_v};",
-        f"  {f.comp} q_local[{f.hd}];",
-        f"  {f.comp} acc[{f.hd_v}];",
-        f"  {f.comp} m = -INFINITY;",
-        f"  {f.comp} l = {f.zero};",
-        f"  for (int d = 0; d < {f.hd_v}; d++) acc[d] = {f.zero};",
-        "  if (valid) {",
-        f"    const {f.mem}* q_row = in0 + (b * {f.t_q} + i) * {f.hd};",
-        f"    for (int d = 0; d < {f.hd}; d++) q_local[d] = ({f.comp})q_row[d];",
-        "  }",
-        f"  long long keys_end = valid ? ({keys_end}) : 0LL;",
-        f"  long long block_keys = {block_keys};",
-        f"  for (long long r0 = 0; r0 < block_keys; r0 += {SDPA_TILE_K}) {{",
-        *f.tile("K_tile", "k_base", f.t_k, f.hd),
-        *f.tile("V_tile", "v_base", f.t_k, f.hd_v),
-        "    __syncthreads();",
-        f"    long long tile_end = r0 + {SDPA_TILE_K} < keys_end ? r0 + {SDPA_TILE_K} : keys_end;",
-        "    for (long long j = r0; j < tile_end; j++) {",
-        "      int lj = (int)(j - r0);",
-        f"      {f.comp} s = {f.zero};",
-        f"      for (int d = 0; d < {f.hd}; d++) s += q_local[d] * K_tile[lj][d];",
-        f"      s *= {f.scale};",
-        f"      {f.comp} m_new = {f.fmax}(m, s);",
-        f"      {f.comp} p = {f.exp}(s - m_new);",
-        f"      {f.comp} alpha = {f.exp}(m - m_new);",
-        "      l = l * alpha + p;",
-        f"      for (int d = 0; d < {f.hd_v}; d++) acc[d] = acc[d] * alpha + p * V_tile[lj][d];",
-        "      m = m_new;",
-        "    }",
-        "    __syncthreads();",
-        "  }",
-        "  if (valid) {",
-        f"    {f.mem}* o_row = out0 + (b * {f.t_q} + i) * {f.hd_v};",
-        f"    for (int d = 0; d < {f.hd_v}; d++) o_row[d] = ({f.mem})(acc[d] / l);",
-        f"    out1[b * {f.t_q} + i] = ({f.saved})(m + {f.log}(l));",
-        "  }",
-        "}",
-    ]
-    return PRELUDE + "\n" + "\n".join(lines) + "\n"
+        held=[
+            f"  {f.comp} acc[{f.hd_v}];",
+            f"  {f.comp} m = -INFINITY;",
+            f"  {f.comp} l = {f.zero};",
+            f"  for (int d = 0; d < {f.hd_v}; d++) acc[d] = {f.zero};",
+        ],
+        loaded=[],
+        step=[
+            f"      {f.comp} s = {f.zero};",
+            f"      for (int d = 0; d < {f.hd}; d++) s += q_local[d] * K_tile[lj][d];",
+            f"      s *= {f.scale};",
+            f"      {f.comp} m_new = {f.fmax}(m, s);",
+            f"      {f.comp} p = {f.exp}(s - m_new);",
+            f"      {f.comp} alpha = {f.exp}(m - m_new);",
+            "      l = l * alpha + p;",
+            f"      for (int d = 0; d < {f.hd_v}; d++) acc[d] = acc[d] * alpha + p * V_tile[lj][d];",
+            "      m = m_new;",
+        ],
+        store=[
+            f"    {f.mem}* o_row = out0 + (b * {f.t_q} + i) * {f.hd_v};",
+            f"    for (int d = 0; d < {f.hd_v}; d++) o_row[d] = ({f.mem})(acc[d] / l);",
+            f"    out1[b * {f.t_q} + i] = ({f.saved})(m + {f.log}(l));",
+        ],
+    )
 
 
 def emit_sdpa_bwd_q(node) -> str:
@@ -928,59 +944,35 @@ def emit_sdpa_bwd_q(node) -> str:
     so one pass over the keys serves both.
     """
     f = sdpa_form(node)
-    keys_end = "i + 1" if f.causal else f"{f.t_k}LL"
-    block_keys = f"(row_chunk + 1) * {BLOCK} < {f.t_k} ? (row_chunk + 1) * {BLOCK} : {f.t_k}LL" if f.causal else f"{f.t_k}LL"
-
-    lines = [
+    return f.query_rows(
         kernel_sig(SDPA_BWD_Q, [n.dtype for n in node.srcs], [node.arg.outs[0][0]]),
-        f"  __shared__ {f.comp} K_tile[{SDPA_TILE_K}][{f.hd}];",
-        f"  __shared__ {f.comp} V_tile[{SDPA_TILE_K}][{f.hd_v}];",
-        f"  long long b = blockIdx.x / {f.q_chunks};",
-        f"  long long row_chunk = blockIdx.x - b * {f.q_chunks};",
-        f"  int i = (int)(row_chunk * {BLOCK} + threadIdx.x);",
-        f"  int valid = i < {f.t_q};",
-        f"  const {f.mem}* k_base = in1 + b * {f.t_k} * {f.hd};",
-        f"  const {f.mem}* v_base = in2 + b * {f.t_k} * {f.hd_v};",
-        f"  {f.comp} q_local[{f.hd}];",
-        f"  {f.comp} do_local[{f.hd_v}];",
-        f"  {f.comp} dq[{f.hd}];",
-        f"  {f.comp} lse = {f.zero};",
-        f"  {f.comp} delta = {f.zero};",
-        f"  for (int d = 0; d < {f.hd}; d++) dq[d] = {f.zero};",
-        "  if (valid) {",
-        f"    const {f.mem}* q_row = in0 + (b * {f.t_q} + i) * {f.hd};",
-        f"    const {f.mem}* do_row = in3 + (b * {f.t_q} + i) * {f.hd_v};",
-        f"    for (int d = 0; d < {f.hd}; d++) q_local[d] = ({f.comp})q_row[d];",
-        f"    for (int d = 0; d < {f.hd_v}; d++) do_local[d] = ({f.comp})do_row[d];",
-        f"    lse = ({f.comp})in4[b * {f.t_q} + i];",
-        f"    delta = ({f.comp})in5[b * {f.t_q} + i];",
-        "  }",
-        f"  long long keys_end = valid ? ({keys_end}) : 0LL;",
-        f"  long long block_keys = {block_keys};",
-        f"  for (long long r0 = 0; r0 < block_keys; r0 += {SDPA_TILE_K}) {{",
-        *f.tile("K_tile", "k_base", f.t_k, f.hd),
-        *f.tile("V_tile", "v_base", f.t_k, f.hd_v),
-        "    __syncthreads();",
-        f"    long long tile_end = r0 + {SDPA_TILE_K} < keys_end ? r0 + {SDPA_TILE_K} : keys_end;",
-        "    for (long long j = r0; j < tile_end; j++) {",
-        "      int lj = (int)(j - r0);",
-        f"      {f.comp} s = {f.zero};",
-        f"      {f.comp} dp = {f.zero};",
-        f"      for (int d = 0; d < {f.hd}; d++) s += q_local[d] * K_tile[lj][d];",
-        f"      for (int d = 0; d < {f.hd_v}; d++) dp += do_local[d] * V_tile[lj][d];",
-        f"      {f.comp} p = {f.exp}(s * {f.scale} - lse);",
-        f"      {f.comp} ds = p * (dp - delta) * {f.scale};",
-        f"      for (int d = 0; d < {f.hd}; d++) dq[d] += ds * K_tile[lj][d];",
-        "    }",
-        "    __syncthreads();",
-        "  }",
-        "  if (valid) {",
-        f"    {f.mem}* dq_row = out + (b * {f.t_q} + i) * {f.hd};",
-        f"    for (int d = 0; d < {f.hd}; d++) dq_row[d] = ({f.mem})dq[d];",
-        "  }",
-        "}",
-    ]
-    return PRELUDE + "\n" + "\n".join(lines) + "\n"
+        held=[
+            f"  {f.comp} do_local[{f.hd_v}];",
+            f"  {f.comp} dq[{f.hd}];",
+            f"  {f.comp} lse = {f.zero};",
+            f"  {f.comp} delta = {f.zero};",
+            f"  for (int d = 0; d < {f.hd}; d++) dq[d] = {f.zero};",
+        ],
+        loaded=[
+            f"    const {f.mem}* do_row = in3 + (b * {f.t_q} + i) * {f.hd_v};",
+            f"    for (int d = 0; d < {f.hd_v}; d++) do_local[d] = ({f.comp})do_row[d];",
+            f"    lse = ({f.comp})in4[b * {f.t_q} + i];",
+            f"    delta = ({f.comp})in5[b * {f.t_q} + i];",
+        ],
+        step=[
+            f"      {f.comp} s = {f.zero};",
+            f"      {f.comp} dp = {f.zero};",
+            f"      for (int d = 0; d < {f.hd}; d++) s += q_local[d] * K_tile[lj][d];",
+            f"      for (int d = 0; d < {f.hd_v}; d++) dp += do_local[d] * V_tile[lj][d];",
+            f"      {f.comp} p = {f.exp}(s * {f.scale} - lse);",
+            f"      {f.comp} ds = p * (dp - delta) * {f.scale};",
+            f"      for (int d = 0; d < {f.hd}; d++) dq[d] += ds * K_tile[lj][d];",
+        ],
+        store=[
+            f"    {f.mem}* dq_row = out + (b * {f.t_q} + i) * {f.hd};",
+            f"    for (int d = 0; d < {f.hd}; d++) dq_row[d] = ({f.mem})dq[d];",
+        ],
+    )
 
 
 def emit_sdpa_bwd_kv(node) -> str:
@@ -1058,5 +1050,5 @@ def emit_sdpa_bwd_kv(node) -> str:
 SDPA_KERNELS = {
     SDPA: (emit_sdpa, sdpa_blocks),
     SDPA_BWD_Q: (emit_sdpa_bwd_q, sdpa_blocks),
-    SDPA_BWD_KV: (emit_sdpa_bwd_kv, sdpa_kv_blocks),
+    SDPA_BWD_KV: (emit_sdpa_bwd_kv, lambda node: sdpa_blocks(node, rows=1)),
 }
