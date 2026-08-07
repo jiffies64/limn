@@ -272,7 +272,7 @@ def test_cuda_backward_matches_the_numpy_custom(causal, dtype, tol):
         ((300, 16), (300, 16), (300, 24), True),  # rows and keys past one block's chunk
         ((40, 8), (72, 8), (72, 12), False),  # rectangular: the two passes cover different counts
     ],
-    ids=["ragged causal", "ragged full", "two chunks", "rectangular"],
+    ids=["ragged causal", "ragged full", "several chunks", "rectangular"],
 )
 def test_cuda_backward_covers_the_ragged_shapes(q_shape, k_shape, v_shape, causal):
     """The tails the two passes have to agree on, since one walks queries and the other keys."""
@@ -290,8 +290,8 @@ def test_cuda_handles_a_ragged_key_tail(causal):
 
 @needs_cuda
 def test_cuda_rows_beyond_one_block_chunk():
-    """300 rows split across two blocks: the second block's tail threads sit past t_q, and
-    under causal the first block stops streaming tiles at its own diagonal."""
+    """300 rows over more than one block: the last block's tail threads sit past t_q, and under
+    causal the earlier blocks stop streaming tiles at their own diagonal."""
     q, k, v = rand(300, 16), rand(300, 16), rand(300, 24)
     check(cudev, q.attention(k, v, causal=True))
 

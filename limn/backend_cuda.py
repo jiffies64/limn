@@ -33,6 +33,7 @@ import numpy as np
 from limn.codegen import LoopNest
 from limn.cuda_emit import (
     BLOCK,
+    SDPA_BLOCK,
     SDPA_KERNELS,
     emit_cuda,
     outer_extent,
@@ -355,8 +356,9 @@ class CudaDevice(CompiledDevice):
         name = node.arg.name
         emit, grid = SDPA_KERNELS[name]
         functions = compile_cuda(emit(node), self.arch, [name])
-        # one block per (batch, chunk of rows); the kernel decodes blockIdx the same way
-        return self._launcher(functions[name], grid(node), len(node.srcs), len(node.arg.outs))
+        # one block per (batch, chunk of rows), one thread per row; the kernel decodes blockIdx
+        # the same way, and its rows-per-block is the narrower SDPA_BLOCK, not a nest's BLOCK
+        return self._launcher(functions[name], grid(node), len(node.srcs), len(node.arg.outs), SDPA_BLOCK)
 
     def runners(self, nests: list[LoopNest]) -> list[Runner]:
         splits = [split_partials(nest) for nest in nests]
@@ -394,7 +396,7 @@ class CudaDevice(CompiledDevice):
 
         return run
 
-    def _launcher(self, fn: ctypes.c_void_p, grid: int, nin: int, nout: int) -> Runner:
+    def _launcher(self, fn: ctypes.c_void_p, grid: int, nin: int, nout: int, block: int = BLOCK) -> Runner:
         launch = self.api.cuLaunchKernel
         # the param arrays are built once and refilled per call, which is safe because
         # cuLaunchKernel copies the pointed-to arguments before it returns
@@ -408,6 +410,6 @@ class CudaDevice(CompiledDevice):
                 ptrs[k] = buf.ptr
             for k, buf in enumerate(outs):
                 ptrs[nin + k] = buf.ptr
-            check(launch(fn, grid, 1, 1, BLOCK, 1, 1, 0, None, params, None), "launching a kernel")
+            check(launch(fn, grid, 1, 1, block, 1, 1, 0, None, params, None), "launching a kernel")
 
         return run
