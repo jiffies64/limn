@@ -787,6 +787,7 @@ class Sdpa:
     zero: str
     exp: str
     log: str
+    mask: str | None  # the input holding the key mask, one flag per key, or None when there is none
     t_q: int
     t_k: int
     hd: int
@@ -836,18 +837,26 @@ class Sdpa:
         for every row the block holds, and the bound depends only on blockIdx, so the barriers
         stay uniform. Sharing the frame is what makes the forward and the dQ pass provably one
         traversal, which they have to be for exp(s - L) to rebuild the forward's probabilities.
+
+        A key mask stages one flag per key beside the tiles and a hidden key is skipped before
+        its dot product rather than sent to -inf: every thread in the block is on the same key
+        at the same time, so the skip is uniform across the warp and costs nothing, and a row
+        that has seen only hidden keys keeps a running max of -inf instead of the NaN that
+        subtracting one from itself would give.
         """
         chunk = f"(row_chunk + 1) * {SDPA_BLOCK}"
         lines = [
             sig,
             f"  __shared__ {self.comp} K_tile[{SDPA_TILE_K}][{self.hd}];",
             f"  __shared__ {self.comp} V_tile[{SDPA_TILE_K}][{self.hd_v}];",
+            *([f"  __shared__ {self.comp} M_tile[{SDPA_TILE_K}];"] if self.mask else []),
             f"  long long b = blockIdx.x / {self.q_chunks};",
             f"  long long row_chunk = blockIdx.x - b * {self.q_chunks};",
             f"  int i = (int)(row_chunk * {SDPA_BLOCK} + threadIdx.x);",
             f"  int valid = i < {self.t_q};",
             f"  const {self.mem}* k_base = in1 + b * {self.t_k} * {self.hd};",
             f"  const {self.mem}* v_base = in2 + b * {self.t_k} * {self.hd_v};",
+            *([f"  const {self.mem}* m_base = {self.mask} + b * {self.t_k};"] if self.mask else []),
             f"  {self.comp} q_local[{self.hd}];",
             *held,
             "  if (valid) {",
@@ -860,10 +869,12 @@ class Sdpa:
             f"  for (long long r0 = 0; r0 < block_keys; r0 += {SDPA_TILE_K}) {{",
             *self.tile("K_tile", "k_base", self.t_k, self.hd),
             *self.tile("V_tile", "v_base", self.t_k, self.hd_v),
+            *(self.row("M_tile", "m_base", self.t_k) if self.mask else []),
             "    __syncthreads();",
             f"    long long tile_end = r0 + {SDPA_TILE_K} < keys_end ? r0 + {SDPA_TILE_K} : keys_end;",
             "    for (long long j = r0; j < tile_end; j++) {",
             "      int lj = (int)(j - r0);",
+            *([f"      if (M_tile[lj] == {self.zero}) continue;"] if self.mask else []),
             *step,
             "    }",
             "    __syncthreads();",
@@ -876,11 +887,13 @@ class Sdpa:
         return PRELUDE + "\n" + "\n".join(lines) + "\n"
 
 
-def sdpa_form(node) -> Sdpa:
+def sdpa_form(node, inputs: int) -> Sdpa:
     """Read a CUSTOM attention node as the extents and widths its kernel is written in.
 
     Every one of the three takes q, k and v first, so the shapes come from the same place
     whichever kernel is being emitted, and the node's own dtype is the width they all compute at.
+    `inputs` is how many the kernel takes without a key mask; one more than that and the last
+    one is the mask, which rides at the end so no other input's index moves when it appears.
     """
     causal, scale = node.arg.params
     q, k, v = node.srcs[:3]
@@ -897,6 +910,7 @@ def sdpa_form(node) -> Sdpa:
         zero=c_literal(0.0, wide),
         exp="expf" if single else "exp",
         log="logf" if single else "log",
+        mask=f"in{inputs}" if len(node.srcs) > inputs else None,
         t_q=q.shape[-2],
         t_k=k.shape[-2],
         hd=q.shape[-1],
@@ -919,9 +933,9 @@ def emit_sdpa(node) -> str:
     max and denominator already are: m + log(l). That is the whole of what the backward needs to
     rebuild a probability, and it costs one number per query row instead of t_k of them.
     """
-    f = sdpa_form(node)
+    f = sdpa_form(node, 3)
     return f.query_rows(
-        kernel_sig(SDPA, [node.srcs[0].dtype] * 3, [dtype for dtype, _ in node.arg.outs]),
+        kernel_sig(SDPA, [node.srcs[0].dtype] * len(node.srcs), [dtype for dtype, _ in node.arg.outs]),
         held=[
             f"  {f.comp} acc[{f.hd_v}];",
             f"  {f.comp} m = -INFINITY;",
@@ -959,7 +973,7 @@ def emit_sdpa_bwd_q(node) -> str:
     exp(s - L), which is why the forward saved L; dP comes from the same V tile the forward used,
     so one pass over the keys serves both.
     """
-    f = sdpa_form(node)
+    f = sdpa_form(node, 6)
     return f.query_rows(
         kernel_sig(SDPA_BWD_Q, [n.dtype for n in node.srcs], [node.arg.outs[0][0]]),
         held=[
@@ -994,6 +1008,9 @@ def emit_sdpa_bwd_q(node) -> str:
 def emit_sdpa_bwd_kv(node) -> str:
     """dK and dV: the loop turned inside out, one thread per key row, queries streaming past it.
 
+    This is the one pass whose thread owns a key rather than a query, so a key mask is one flag
+    per thread instead of one per staged tile: a hidden key simply streams nothing.
+
     Both totals sum over queries and both need the same recomputed P, so they come out of one
     pass; splitting them would walk the queries twice to build the same probabilities. A causal
     block starts at the first query its own keys can see, which is its own first key: SDPA_BLOCK is a
@@ -1001,7 +1018,7 @@ def emit_sdpa_bwd_kv(node) -> str:
     every thread reaches the same barriers. Inside the tile each thread starts at its own
     diagonal.
     """
-    f = sdpa_form(node)
+    f = sdpa_form(node, 6)
     first_row = f"key_chunk * {SDPA_BLOCK}" if f.causal else "0"
 
     lines = [
@@ -1022,6 +1039,7 @@ def emit_sdpa_bwd_kv(node) -> str:
         f"  {f.comp} v_local[{f.hd_v}];",
         f"  {f.comp} dk[{f.hd}];",
         f"  {f.comp} dv[{f.hd_v}];",
+        *(["  int live = 1;"] if f.mask else []),
         f"  for (int d = 0; d < {f.hd}; d++) dk[d] = {f.zero};",
         f"  for (int d = 0; d < {f.hd_v}; d++) dv[d] = {f.zero};",
         "  if (valid) {",
@@ -1029,8 +1047,11 @@ def emit_sdpa_bwd_kv(node) -> str:
         f"    const {f.mem}* v_row = in2 + (b * {f.t_k} + j) * {f.hd_v};",
         f"    for (int d = 0; d < {f.hd}; d++) k_local[d] = ({f.comp})k_row[d];",
         f"    for (int d = 0; d < {f.hd_v}; d++) v_local[d] = ({f.comp})v_row[d];",
+        *([f"    live = ({f.comp}){f.mask}[b * {f.t_k} + j] != {f.zero};"] if f.mask else []),
         "  }",
-        f"  long long rows_end = valid ? {f.t_q}LL : 0LL;",
+        # a hidden key reaches no query row, so it streams nothing and keeps the zeroed dK and
+        # dV it started with, which is the gradient of a key nothing read
+        f"  long long rows_end = valid{' && live' if f.mask else ''} ? {f.t_q}LL : 0LL;",
         f"  for (long long r0 = {first_row}; r0 < {f.t_q}; r0 += {SDPA_TILE_K}) {{",
         *f.tile("Q_tile", "q_base", f.t_q, f.hd),
         *f.tile("DO_tile", "do_base", f.t_q, f.hd_v),

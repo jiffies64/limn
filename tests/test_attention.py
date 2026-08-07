@@ -73,16 +73,60 @@ def test_validation():
         Tensor(np.arange(12, dtype=np.int32).reshape(4, 3)).attention(k, v)  # ints carry no attention
     with pytest.raises(ValueError):
         q[0, 0].attention(k, v)  # 1D tensors
+    with pytest.raises(ValueError):
+        q.attention(k, v, key_mask=rand(4, 7))  # a flag per key, and there are 8
+    with pytest.raises(ValueError):
+        q.attention(k, v, key_mask=rand(3, 8))  # leading dims that do not broadcast
 
 
-def _weighted_grads(fused: bool, q_shape, k_shape, v_shape, causal: bool, data: list[np.ndarray]) -> list[np.ndarray]:
+def keys_live(shape: tuple[int, ...], live: int) -> Tensor:
+    """A mask over the last axis keeping the first `live` keys, the shape padding arrives in."""
+    return Tensor(np.broadcast_to(np.arange(shape[-1]) < live, shape).astype(np.float32))
+
+
+def _weighted_grads(fused: bool, q_shape, k_shape, v_shape, causal: bool, data, key_mask=None) -> list[np.ndarray]:
     """d(w . attention(q, k, v))/d(q, k, v), fused or composed. The random weighting is what
     makes the incoming gradient uneven, so a backward that ignored it would show."""
     q, k, v = (Tensor(d, requires_grad=True) for d in data[:3])
     scale = q_shape[-1] ** -0.5
-    att = q.attention(k, v, causal=causal) if fused else composed_attention(q, k, v, causal=causal, scale=scale)
+    kw = {"causal": causal, "key_mask": key_mask}
+    att = q.attention(k, v, **kw) if fused else composed_attention(q, k, v, scale=scale, **kw)
     loss = (att * Tensor(data[3])).sum()
     return [g.numpy() for g in grad(loss, [q, k, v])]
+
+
+def test_a_key_mask_equals_slicing_the_keys():
+    """The oracle that needs no second implementation: hiding a suffix of the keys gives exactly
+    what passing only the keys before it gives, gradients included."""
+    t, hd, hd_v, live = 24, 8, 12, 15
+    data = [rng.standard_normal(s).astype(np.float32) for s in ((2, t, hd), (2, t, hd), (2, t, hd_v), (2, t, hd_v))]
+
+    def grads(mask: Tensor | None, keys: int) -> list[np.ndarray]:
+        q, k, v = (Tensor(d[:, :n], requires_grad=True) for d, n in zip(data[:3], (t, keys, keys), strict=True))
+        return [g.numpy() for g in grad((q.attention(k, v, key_mask=mask) * Tensor(data[3])).sum(), [q, k, v])]
+
+    for got, want in zip(grads(keys_live((2, t), live), t), grads(None, live), strict=True):
+        np.testing.assert_allclose(got[:, : want.shape[1]], want, rtol=1e-5, atol=1e-5)  # dQ is whole, dK and dV are cut
+
+
+def test_a_hidden_key_takes_no_gradient():
+    """A key no query row reads is a key nothing flows back to, so its dK and dV rows are zero
+    rather than merely small: the fused passes never visit it at all."""
+    t, live = 20, 12
+    data = [rng.standard_normal((2, t, 8)).astype(np.float32) for _ in range(4)]
+    _, dk, dv = _weighted_grads(True, (2, t, 8), (2, t, 8), (2, t, 8), False, data, keys_live((2, t), live))
+    np.testing.assert_array_equal(dk[:, live:], 0.0)
+    np.testing.assert_array_equal(dv[:, live:], 0.0)
+
+
+def test_a_key_mask_matches_the_composed_form():
+    """Both maskings at once, so the fused kernels and the composed fallback have to agree on
+    how a causal mask and a key mask compose."""
+    shape, live = (2, 3, 32, 8), 21
+    data = [rng.standard_normal(shape).astype(np.float32) for _ in range(4)]
+    args = (shape, shape, shape, True, data, keys_live(shape[:-1], live))
+    for got, want in zip(*(_weighted_grads(f, *args) for f in (True, False)), strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("q_shape,k_shape,v_shape,causal", CASES, ids=str)
@@ -229,11 +273,12 @@ def test_cuda_backward_runs_and_matches_numpy():
         check(cudev, leaf.grad, rtol=1e-4, atol=1e-4)
 
 
-def _cuda_backward_grads(q_shape, k_shape, v_shape, causal: bool, dtype: DType = float32):
+def _cuda_backward_grads(q_shape, k_shape, v_shape, causal: bool, dtype: DType = float32, key_mask=None):
     out_shape = np.broadcast_shapes(q_shape[:-2], k_shape[:-2], v_shape[:-2]) + (q_shape[-2], v_shape[-1])
     data = [rng.standard_normal(s).astype(np.float32) for s in (q_shape, k_shape, v_shape, out_shape)]
     q, k, v = (Tensor(d, dtype=dtype, requires_grad=True) for d in data[:3])
-    return grad((q.attention(k, v, causal=causal) * Tensor(data[3], dtype=dtype)).sum(), [q, k, v])
+    weighted = q.attention(k, v, causal=causal, key_mask=key_mask) * Tensor(data[3], dtype=dtype)
+    return grad(weighted.sum(), [q, k, v])
 
 
 @needs_cuda
@@ -328,10 +373,24 @@ def test_unregistered_device_falls_back_to_composed():
     data = [rng.standard_normal(s).astype(np.float32) for s in shapes]
     set_device("c")
     q, k, v = (Tensor(d) for d in data)
-    t = q.attention(k, v, causal=True)
+    t = q.attention(k, v, causal=True, key_mask=keys_live((2, 3, 32), 20))
     assert Op.CUSTOM not in {n.op for n in topological([t.node])}
     got = t.numpy()
     set_device("numpy")
     q, k, v = (Tensor(d) for d in data)
-    want = composed_attention(q, k, v, causal=True, scale=8**-0.5)
+    want = composed_attention(q, k, v, causal=True, scale=8**-0.5, key_mask=keys_live((2, 3, 32), 20))
     np.testing.assert_allclose(got, want.numpy(), rtol=1e-5, atol=1e-5)
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    "q_shape,k_shape,causal",
+    [((2, 100, 16), (2, 100, 16), True), ((4, 1, 32), (4, 96, 32), False)],
+    ids=["ragged causal", "one query row against a partly filled cache"],
+)
+def test_cuda_key_mask_matches_the_numpy_custom(q_shape, k_shape, causal):
+    """The two shapes a key mask actually arrives in: a padded batch, and the decode step of a
+    kv cache, where one query row reads the slots filled so far and nothing past them."""
+    mask = keys_live(k_shape[:-1], k_shape[-2] * 2 // 3)
+    for g in _cuda_backward_grads(q_shape, k_shape, k_shape, causal, key_mask=mask):
+        check(cudev, g, rtol=1e-4, atol=1e-4)

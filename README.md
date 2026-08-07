@@ -118,6 +118,11 @@ causal attention, a training step's intermediates are 30 MB at any context lengt
 229 MB at `T=256` and 3.1 GB at `T=4096` for the composed form. `examples/bench_attention.py`
 measures both, forward and backward.
 
+Masking is a flag per key, `key_mask=(..., t_k)`, and not one per query-key pair: the pair form
+is the `t_q` by `t_k` the whole path exists to avoid, while a flag per key rides along with the
+tile already being staged and costs nothing against the numbers above. That is the shape padding
+comes in, and the shape a partly filled kv cache comes in, and it composes with `causal`.
+
 A second derivative is the one thing the fused pair does not serve: a `CUSTOM` node carries no
 gradient of its own, so `create_graph=True` gets the composed backward, which is spelled in
 primitives and can be differentiated again.
@@ -276,7 +281,7 @@ Every layer answers to an oracle above it:
 | the half-width floats | the numpy device | the corpus and the matmuls again at each width, diffed at the width's own rounding, plus the dtype rules, that a cast between float dtypes still carries gradients, and that the two meet at float32 |
 | `int8`, `int16` | the numpy device | an integer corpus (wraparound, compares, reduces, matmul, gather) on the `c` and `cuda` devices, diffed for exact equality since modular arithmetic leaves nothing to rounding |
 | `float64` | the numpy device | the corpus and the tiled matmuls again in double, diffed at 1e-12, plus that gradients and optimizer state hold the width and that a `cuda` scatter adds atomically in double |
-| fused attention | PyTorch, then the numpy device | forward and backward diffed against the composed form at every shape the seam allows and against `torch`'s own sdpa, with a check that the backward graph holds no `t_q` by `t_k` node at all; the `cuda` kernels then diffed against the numpy ones at each width, over ragged tiles, rows past one block, and rectangular keys, and held to giving the same bits twice |
+| fused attention | PyTorch, then the numpy device | forward and backward diffed against the composed form at every shape the seam allows and against `torch`'s own sdpa, with a check that the backward graph holds no `t_q` by `t_k` node at all; the `cuda` kernels then diffed against the numpy ones at each width, over ragged tiles, rows past one block, and rectangular keys, and held to giving the same bits twice; a key mask is checked against slicing the hidden keys away entirely |
 
 ## Layout
 
