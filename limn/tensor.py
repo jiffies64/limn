@@ -547,7 +547,11 @@ class Tensor:
         node, lse = custom(sdpa.SDPA, (q.node, k.node, v.node), (causal, scale), outs)
         out = Tensor.from_node(node, (q, k, v))
         if out.requires_grad:
-            out.grad_fn = _attention_backward(out, Tensor.from_node(lse), q, k, v, causal=causal, scale=scale)
+            # the backward reads the output back, over a second Tensor on the same node rather
+            # than over `out`: a grad_fn closing on the tensor that holds it is a reference cycle,
+            # and every buffer under the graph would then wait for a collector pass to be freed
+            saved = (Tensor.from_node(node), Tensor.from_node(lse))
+            out.grad_fn = _attention_backward(*saved, q, k, v, causal=causal, scale=scale)
         return out
 
     # ---- autograd ----

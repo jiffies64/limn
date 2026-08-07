@@ -2,6 +2,8 @@
 device, the backward against the composed form and torch, and a device that registers no
 kernel gets the composed form back."""
 
+import gc
+import weakref
 from functools import reduce
 from operator import add
 
@@ -105,6 +107,21 @@ def test_the_backward_never_builds_a_t_by_t(causal):
     grads = grad((q.attention(k, v, causal=causal) * weight).sum(), [q, k, v])
     square = [n for n in topological([g.node for g in grads]) if n.shape[-2:] == (t, t)]
     assert not square, f"the backward graph holds {len(square)} nodes of shape (..., {t}, {t})"
+
+
+def test_the_output_dies_with_its_last_reference():
+    """The fused backward reads the output back, so it must not hold the tensor that holds it:
+    a cycle there leaves every buffer under the graph to a collector pass. gc off is what makes
+    the check the reference count and not the collector."""
+    gc.disable()
+    try:
+        q, k, v = (Tensor(rng.standard_normal((2, 8, 4)).astype(np.float32), requires_grad=True) for _ in range(3))
+        out = q.attention(k, v, causal=True)
+        ref = weakref.ref(out)
+        del out
+        assert ref() is None
+    finally:
+        gc.enable()
 
 
 def _attention_case(causal: bool):
