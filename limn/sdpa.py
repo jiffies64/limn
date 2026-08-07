@@ -33,6 +33,7 @@ uses is KERNELS at the bottom.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from typing import Any
 
 import ml_dtypes
 import numpy as np
@@ -65,10 +66,13 @@ def _validate(q: np.ndarray, k: np.ndarray, v: np.ndarray, causal: bool) -> None
         raise ValueError(f"causal sdpa needs square keys, got {q.shape[-2]} queries and {k.shape[-2]} keys")
 
 
-def _mask(rows: range | np.ndarray, cols: range | np.ndarray) -> np.ndarray:
-    """The causal mask over a block: keys at or left of each query row, trailing dims only, so
-    it broadcasts over any batch."""
-    return np.asarray(cols) <= np.asarray(rows)[:, None]
+def _scores(a: np.ndarray, b: np.ndarray, rows: range, cols: range, *, causal: bool, scale: float) -> np.ndarray:
+    """The scaled scores of the `rows` queries against the `cols` keys, -inf where causal hides
+    a key: the block every pass starts from. The mask comes from the two index ranges, since a
+    block knows where it sits on each axis, and it lands on the trailing dims only, so it
+    broadcasts over any batch."""
+    scores = a @ b.swapaxes(-1, -2) * scale
+    return np.where(np.asarray(cols) <= np.asarray(rows)[:, None], scores, -np.inf) if causal else scores
 
 
 def sdpa(
@@ -100,9 +104,7 @@ def sdpa(
     running_max = np.full(batch + (t_q,), -np.inf, dtype=work)
     running_sum = np.zeros(batch + (t_q,), dtype=work)
     for j0, j1 in _blocks(t_k, block_size):
-        scores = Q @ K[..., j0:j1, :].swapaxes(-1, -2) * scale
-        if causal:
-            scores = np.where(_mask(range(t_q), range(j0, j1)), scores, -np.inf)
+        scores = _scores(Q, K[..., j0:j1, :], range(t_q), range(j0, j1), causal=causal, scale=scale)
         block_max = scores.max(axis=-1)
         new_max = np.maximum(running_max, block_max)
         rescale = np.exp(running_max - new_max)
@@ -137,9 +139,7 @@ def sdpa_backward_q(
     t_q, t_k = q.shape[-2], k.shape[-2]
     dq = np.zeros(Q.shape, dtype=Q.dtype)
     for j0, j1 in _blocks(t_k, block_size):
-        scores = Q @ K[..., j0:j1, :].swapaxes(-1, -2) * scale
-        if causal:
-            scores = np.where(_mask(range(t_q), range(j0, j1)), scores, -np.inf)
+        scores = _scores(Q, K[..., j0:j1, :], range(t_q), range(j0, j1), causal=causal, scale=scale)
         p = np.exp(scores - L)  # exactly zero where the mask sent the score to -inf
         dp = DO @ V[..., j0:j1, :].swapaxes(-1, -2)
         ds = p * (dp - D) * scale
@@ -167,9 +167,7 @@ def sdpa_backward_kv(
     dv = np.zeros(V.shape, dtype=V.dtype)
     for i0, i1 in _blocks(t_q, block_size):
         Qi, DOi = Q[..., i0:i1, :], DO[..., i0:i1, :]
-        scores = Qi @ K.swapaxes(-1, -2) * scale
-        if causal:
-            scores = np.where(_mask(range(i0, i1), range(t_k)), scores, -np.inf)
+        scores = _scores(Qi, K, range(i0, i1), range(t_k), causal=causal, scale=scale)
         p = np.exp(scores - L[..., i0:i1, :])
         dv += p.swapaxes(-1, -2) @ DOi
         dp = DOi @ V.swapaxes(-1, -2)
@@ -181,52 +179,42 @@ def sdpa_backward_kv(
 # ---- the registry: what the numpy device runs for each CUSTOM name ----
 
 
-def forward_kernel(srcs: list[np.ndarray], arg) -> tuple[np.ndarray, ...]:
-    """The CUSTOM "sdpa" node, as the numpy device runs it: (out, lse)."""
-    causal, scale = arg.params
-    return sdpa(srcs[0], srcs[1], srcs[2], causal=causal, scale=scale)
+def _kernel(fn: Callable[..., Any]) -> Callable[[list[np.ndarray], Any], tuple[np.ndarray, ...]]:
+    """One registry entry: the CUSTOM node's params unpacked into the keywords every kernel here
+    takes, and the lone answer of a one-output kernel read as the tuple the device expects."""
+
+    def run(srcs: list[np.ndarray], arg) -> tuple[np.ndarray, ...]:
+        causal, scale = arg.params
+        out = fn(*srcs, causal=causal, scale=scale)
+        return out if isinstance(out, tuple) else (out,)
+
+    return run
 
 
-def backward_q_kernel(srcs: list[np.ndarray], arg) -> tuple[np.ndarray, ...]:
-    causal, scale = arg.params
-    return (sdpa_backward_q(*srcs, causal=causal, scale=scale),)
-
-
-def backward_kv_kernel(srcs: list[np.ndarray], arg) -> tuple[np.ndarray, ...]:
-    causal, scale = arg.params
-    return sdpa_backward_kv(*srcs, causal=causal, scale=scale)
-
-
-KERNELS: dict[str, Callable[[list[np.ndarray], object], tuple[np.ndarray, ...]]] = {
-    SDPA: forward_kernel,
-    SDPA_BWD_Q: backward_q_kernel,
-    SDPA_BWD_KV: backward_kv_kernel,
-}
+KERNELS = {name: _kernel(fn) for name, fn in ((SDPA, sdpa), (SDPA_BWD_Q, sdpa_backward_q), (SDPA_BWD_KV, sdpa_backward_kv))}
 
 
 # ---- checker: run as a script ----
 
 
+def _plain_probs(q: np.ndarray, k: np.ndarray, *, causal: bool, scale: float) -> np.ndarray:
+    """The probabilities the obvious way, for the checker to diff against: the whole t_q by t_k
+    at once, softmaxed in one shot rather than folded block by block."""
+    scores = _scores(q, k, range(q.shape[-2]), range(k.shape[-2]), causal=causal, scale=scale)
+    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+    return weights / weights.sum(axis=-1, keepdims=True)
+
+
 def _plain(q: np.ndarray, k: np.ndarray, v: np.ndarray, *, causal: bool, scale: float) -> np.ndarray:
-    """Attention the obvious way, for the checker to diff against: builds the whole t_q by t_k."""
-    scores = q @ k.swapaxes(-1, -2) * scale
-    if causal:
-        scores = np.where(np.arange(k.shape[-2]) <= np.arange(q.shape[-2])[:, None], scores, -np.inf)
-    shifted = scores - scores.max(axis=-1, keepdims=True)
-    p = np.exp(shifted)
-    return (p / p.sum(axis=-1, keepdims=True)) @ v
+    """Attention the obvious way: the answer the recurrence has to land on."""
+    return _plain_probs(q, k, causal=causal, scale=scale) @ v
 
 
 def _plain_backward(
     q: np.ndarray, k: np.ndarray, v: np.ndarray, do: np.ndarray, *, causal: bool, scale: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The textbook backward, materialized: the form Tensor.attention used to differentiate."""
-    scores = q @ k.swapaxes(-1, -2) * scale
-    if causal:
-        scores = np.where(np.arange(k.shape[-2]) <= np.arange(q.shape[-2])[:, None], scores, -np.inf)
-    shifted = scores - scores.max(axis=-1, keepdims=True)
-    weights = np.exp(shifted)
-    p = weights / weights.sum(axis=-1, keepdims=True)
+    p = _plain_probs(q, k, causal=causal, scale=scale)
     dp = do @ v.swapaxes(-1, -2)
     ds = p * (dp - (dp * p).sum(axis=-1, keepdims=True)) * scale
     return ds @ k, ds.swapaxes(-1, -2) @ q, p.swapaxes(-1, -2) @ do
