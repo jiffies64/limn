@@ -750,8 +750,16 @@ def emit_cuda(nests: list[LoopNest]) -> str:
 # would have to accumulate one of them across blocks with atomics, and a float atomic adds in
 # whatever order the blocks happen to finish. Two passes keep every total inside the one thread
 # that owns its row, which is what makes the answer the same on every run.
+#
+# A block here is narrower than the BLOCK the lowered nests launch. Every thread meets two
+# barriers per staged tile, so the wider the block the more of it stands at each one, and a
+# sequence shorter than a block leaves the rest of its threads with no row at all. Halving it
+# measured faster at every length these kernels were timed at, most of all where a whole batch
+# fits inside one block. It has to stay a multiple of SDPA_TILE_K: the kv pass starts a causal
+# block at its own first key, and that bound has to land on a tile edge.
 
 SDPA_TILE_K = 32  # keys (or queries) staged through shared memory per step
+SDPA_BLOCK = 128  # rows one block hands out, one per thread
 
 
 def sdpa_blocks(node, rows: int = 0) -> int:
@@ -760,10 +768,11 @@ def sdpa_blocks(node, rows: int = 0) -> int:
     the loop inside out.
 
     Blocks never straddle a batch, because a block's shared tile belongs to exactly one batch;
-    the launcher and the kernel's blockIdx decoding must agree on this count.
+    the launcher and the kernel's blockIdx decoding must agree on this count, and on the
+    SDPA_BLOCK threads each one carries.
     """
     src = node.srcs[rows]
-    return math.prod(src.shape[:-2]) * math.ceil(src.shape[-2] / BLOCK)
+    return math.prod(src.shape[:-2]) * math.ceil(src.shape[-2] / SDPA_BLOCK)
 
 
 @dataclass(frozen=True)
@@ -785,11 +794,11 @@ class Sdpa:
 
     @property
     def q_chunks(self) -> int:
-        return math.ceil(self.t_q / BLOCK)
+        return math.ceil(self.t_q / SDPA_BLOCK)
 
     @property
     def k_chunks(self) -> int:
-        return math.ceil(self.t_k / BLOCK)
+        return math.ceil(self.t_k / SDPA_BLOCK)
 
     def tile(self, name: str, base: str, rows: int, width: int) -> list[str]:
         """One cooperative copy of a tile of `rows`-by-`width` into shared memory, zero-filled
@@ -828,14 +837,14 @@ class Sdpa:
         stay uniform. Sharing the frame is what makes the forward and the dQ pass provably one
         traversal, which they have to be for exp(s - L) to rebuild the forward's probabilities.
         """
-        chunk = f"(row_chunk + 1) * {BLOCK}"
+        chunk = f"(row_chunk + 1) * {SDPA_BLOCK}"
         lines = [
             sig,
             f"  __shared__ {self.comp} K_tile[{SDPA_TILE_K}][{self.hd}];",
             f"  __shared__ {self.comp} V_tile[{SDPA_TILE_K}][{self.hd_v}];",
             f"  long long b = blockIdx.x / {self.q_chunks};",
             f"  long long row_chunk = blockIdx.x - b * {self.q_chunks};",
-            f"  int i = (int)(row_chunk * {BLOCK} + threadIdx.x);",
+            f"  int i = (int)(row_chunk * {SDPA_BLOCK} + threadIdx.x);",
             f"  int valid = i < {self.t_q};",
             f"  const {self.mem}* k_base = in1 + b * {self.t_k} * {self.hd};",
             f"  const {self.mem}* v_base = in2 + b * {self.t_k} * {self.hd_v};",
@@ -987,13 +996,13 @@ def emit_sdpa_bwd_kv(node) -> str:
 
     Both totals sum over queries and both need the same recomputed P, so they come out of one
     pass; splitting them would walk the queries twice to build the same probabilities. A causal
-    block starts at the first query its own keys can see, which is its own first key: BLOCK is a
+    block starts at the first query its own keys can see, which is its own first key: SDPA_BLOCK is a
     multiple of the tile, so that bound lands on a tile edge, and it depends only on blockIdx, so
     every thread reaches the same barriers. Inside the tile each thread starts at its own
     diagonal.
     """
     f = sdpa_form(node)
-    first_row = f"key_chunk * {BLOCK}" if f.causal else "0"
+    first_row = f"key_chunk * {SDPA_BLOCK}" if f.causal else "0"
 
     lines = [
         kernel_sig(SDPA_BWD_KV, [n.dtype for n in node.srcs], [dtype for dtype, _ in node.arg.outs]),
@@ -1003,7 +1012,7 @@ def emit_sdpa_bwd_kv(node) -> str:
         f"  __shared__ {f.comp} D_tile[{SDPA_TILE_K}];",
         f"  long long b = blockIdx.x / {f.k_chunks};",
         f"  long long key_chunk = blockIdx.x - b * {f.k_chunks};",
-        f"  long long j = key_chunk * {BLOCK} + threadIdx.x;",
+        f"  long long j = key_chunk * {SDPA_BLOCK} + threadIdx.x;",
         f"  int valid = j < {f.t_k};",
         f"  const {f.mem}* q_base = in0 + b * {f.t_q} * {f.hd};",
         f"  const {f.mem}* do_base = in3 + b * {f.t_q} * {f.hd_v};",
