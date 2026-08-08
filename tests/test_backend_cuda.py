@@ -166,3 +166,20 @@ def test_the_pool_recycles_dropped_buffers():
     dev.trim()
     assert not dev.pool
     assert dev._alloc(1024).ptr != 0
+
+
+def test_a_run_releases_each_link_of_a_chain_as_its_reader_runs():
+    """A chain of n kernels must run in the memory of a couple of links, not all of them.
+
+    Each gather cuts a kernel, so this is n calls each reading only the link before it.
+    run() drops a buffer after its last reader and the pool hands the bytes to the next
+    output, so two link-sized allocations circulate for the whole chain; without the
+    release, every link stays live to the barrier and the pool ends holding all n."""
+    dev = CudaDevice()
+    rows = Tensor(np.arange(1 << 18, dtype=np.int32))
+    y = Tensor(np.ones((1 << 18, 4), dtype=np.float32))
+    for _ in range(8):
+        y = (y + 1.0)[rows]
+    out = dev.copyout(dev.execute([y.node])[0]).view(np.float32)
+    np.testing.assert_array_equal(out, np.full(1 << 20, 9.0, dtype=np.float32))
+    assert len(dev.pool.get(4 << 20, [])) <= 4

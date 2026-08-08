@@ -257,6 +257,22 @@ def test_an_output_nothing_reads_still_gets_its_buffer():
     assert runs == ["pair"]
 
 
+@needs_cc
+def test_a_plan_releases_positions_after_their_last_reader():
+    set_device("c")
+    rows = Tensor(np.arange(8, dtype=np.int32))
+    y = Tensor(randf(8, 2))
+    for _ in range(3):
+        y = (y + 1.0)[rows]  # each gather cuts a kernel, so the chain is one call per link
+    y.numpy()
+    dev = device.active()
+    assert isinstance(dev, CompiledDevice)
+    plan = next(iter(dev.plans.values()))
+    outs = [call.outputs[0] for call in plan.calls]
+    assert outs[0] in plan.releases[1] and outs[1] in plan.releases[2]
+    assert not any(s in drop for drop in plan.releases for s in plan.sinks)
+
+
 def test_on_an_interpreting_device_the_function_just_runs():
     data = batches(4)
     counter = {"ran": 0}

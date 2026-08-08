@@ -84,6 +84,7 @@ class Plan:
     buffers: tuple[int, ...]  # the BUFFER positions, whose bytes come from this step's graph
     sinks: tuple[int, ...]  # realized() resolved to positions, so alias chains are walked once
     positions: int  # how many nodes the graph had: the size of a run's buffer table
+    releases: tuple[tuple[int, ...], ...]  # per call: the positions whose bytes no later call reads
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,12 +165,20 @@ class CompiledDevice:
         repointed at the fresh value so sinks read what was just written rather than a copy the
         commit never touched. execute() and capture.replay both come through here, so the
         transaction rule has one owner.
+
+        A position is dropped right after its last reader's call: the run's peak footprint is
+        what is live between two kernels, not the sum of everything the graph computes, which
+        for a training step is most of a backward pass held to the barrier for no reason. The
+        reuse is safe on an asynchronous backend because kernels, memsets and commits all go
+        down one in-order stream: whatever still reads the old bytes was enqueued first. A
+        deferred value stays alive in `deferred` regardless, and a source buffer's bytes belong
+        to its tensor, so dropping the reference here frees at most prepare()'s migrated copy.
         """
         bufs: list[Buffer] = [None] * plan.positions
         for p, buf in sources.items():
             bufs[p] = self.prepare(buf)
         deferred: list[tuple[int, Buffer]] = []
-        for call in plan.calls:
+        for call, drop in zip(plan.calls, plan.releases, strict=True):
             outs = [self.out_alloc(nb, call.zero_fill) for nb in call.out_nbytes]
             call.fn([bufs[p] for p in call.inputs], outs)
             for p, out in zip(call.outputs, outs, strict=True):
@@ -177,6 +186,8 @@ class CompiledDevice:
                     bufs[p] = out
             if call.assign_target is not None:
                 deferred.append((call.assign_target, outs[0]))
+            for p in drop:
+                bufs[p] = None
         for p, value in deferred:
             self.commit(sources[p], value)
             bufs[p] = value
@@ -234,9 +245,19 @@ class CompiledDevice:
                     assign_target=position[kernel.target] if root.op is Op.ASSIGN else None,
                 )
             )
+        # each position's last reader, so run() can drop it there; a sink is read after the
+        # last call, and an assign value is deferred until the commit, but `deferred` holds
+        # its own reference, so only the sinks need shielding from release
+        sunk = tuple(position[realized(sink)] for sink in sinks)
+        last_read = {p: k for k, call in enumerate(calls) for p in call.inputs}
+        released: list[list[int]] = [[] for _ in calls]
+        for p, k in last_read.items():
+            if p not in sunk:
+                released[k].append(p)
         return Plan(
             tuple(calls),
             tuple(p for p, node in enumerate(order) if node.op is Op.BUFFER),
-            tuple(position[realized(sink)] for sink in sinks),
+            sunk,
             len(order),
+            tuple(map(tuple, released)),
         )
