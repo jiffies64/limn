@@ -12,9 +12,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import check, cudev, needs_cc, needs_cuda
+from conftest import COMPILED, check, cudev, needs_cc, needs_cuda
 
-from limn import Tensor, grad, set_device, set_seed
+from limn import Tensor, grad, realize, set_device, set_seed
 from limn.nn import Linear, parameters
 from limn.ops import Custom, DType, Op, bfloat16, float16, float32, topological
 from limn.optim import AdamW
@@ -127,6 +127,53 @@ def test_a_key_mask_matches_the_composed_form():
     args = (shape, shape, shape, True, data, keys_live(shape[:-1], live))
     for got, want in zip(*(_weighted_grads(f, *args) for f in (True, False)), strict=True):
         np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+def test_kv_decode_matches_the_causal_forward():
+    """The contract kv inference rests on: writing each position's k and v into a fixed cache
+    buffer and reading one query row against the slots filled so far reproduces the causal
+    forward row for row. Attention must read the updated value, not the cache buffer, since
+    assigns commit only after every sink computes."""
+    b, h, t, hd = 2, 3, 24, 8
+    qd, kd, vd = (rng.standard_normal((b, h, t, hd)).astype(np.float32) for _ in range(3))
+    want = Tensor(qd).attention(Tensor(kd), Tensor(vd), causal=True).numpy()
+    kc, vc = (Tensor.zeros((b, h, t, hd)).realize() for _ in "kv")
+    for i in range(t):
+        slot = Tensor.arange(t).reshape(t, 1).eq(i)
+        new_k, new_v = slot.where(Tensor(kd[:, :, i : i + 1]), kc), slot.where(Tensor(vd[:, :, i : i + 1]), vc)
+        got = Tensor(qd[:, :, i : i + 1]).attention(new_k, new_v, key_mask=Tensor.arange(t) <= i)
+        kc.assign(new_k)
+        vc.assign(new_v)
+        realize(got, kc, vc)
+        np.testing.assert_allclose(got.numpy(), want[:, :, i : i + 1], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("backend", COMPILED)
+def test_capture_replays_the_kv_decode_step(backend):
+    """The inference loop the cache exists for: one captured step, fresh bytes in the argument
+    buffers, assigns committing to the same cache buffers, every replayed row still the causal
+    forward's. On cuda the step runs the fused kernel, on c the composed fallback."""
+    from limn import capture
+
+    h, t, hd = 2, 12, 8
+    qd, kd, vd = (rng.standard_normal((1, h, t, hd)).astype(np.float32) for _ in range(3))
+    want = Tensor(qd).attention(Tensor(kd), Tensor(vd), causal=True).numpy()  # on numpy, before the switch
+    set_device(backend.name)
+    kc, vc = (Tensor.zeros((1, h, t, hd)).realize() for _ in "kv")
+
+    @capture
+    def step(qi: Tensor, ki: Tensor, vi: Tensor, pos: Tensor) -> Tensor:
+        slot = Tensor.arange(t).reshape(t, 1).eq(pos)
+        new_k, new_v = slot.where(ki, kc), slot.where(vi, vc)
+        out = qi.attention(new_k, new_v, key_mask=Tensor.arange(t) <= pos)
+        kc.assign(new_k)
+        vc.assign(new_v)
+        realize(out, kc, vc)
+        return out
+
+    for i in range(t):
+        args = [Tensor(d[:, :, i : i + 1]) for d in (qd, kd, vd)] + [Tensor(np.array([i], dtype=np.int32))]
+        np.testing.assert_allclose(step(*args).numpy(), want[:, :, i : i + 1], rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("q_shape,k_shape,v_shape,causal", CASES, ids=str)
