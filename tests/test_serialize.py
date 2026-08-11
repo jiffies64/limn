@@ -13,7 +13,7 @@ from safetensors import safe_open
 from limn import Tensor, capture, realize, set_device, set_seed
 from limn.nn import Embedding, LayerNorm, Linear, named_parameters
 from limn.ops import DTYPES as LIMN_DTYPES
-from limn.optim import SGD
+from limn.optim import SGD, AdamW
 from limn.serialize import DTYPES, NAMES, load_file, load_into, load_metadata, save_file
 
 TORCH_DTYPES = {
@@ -157,6 +157,44 @@ def test_load_into_refuses_what_it_cannot_land(tmp_path):
         load_into({"w": Tensor.zeros((3, 2))}, path)
     with pytest.raises(ValueError, match="which is"):
         load_into({"w": Tensor.zeros((2, 3), dtype=DTYPES["F16"])}, path)
+
+
+def steps(layer: Linear, opt: AdamW, batches: list[tuple[np.ndarray, np.ndarray]]) -> list[float]:
+    losses = []
+    for x, y in batches:
+        opt.zero_grad()
+        err = layer(Tensor(x)) - Tensor(y)
+        loss = (err * err).mean()
+        loss.backward()
+        opt.step(loss)
+        losses.append(loss.item())
+    return losses
+
+
+def test_a_run_resumes_out_of_one_file(tmp_path):
+    """Parameters and optimizer state in the same file: what follows the load is the trajectory
+    the uninterrupted run took, which the parameters on their own do not reproduce."""
+    path = tmp_path / "run.safetensors"
+    data = [(randf(6, 4), randf(6, 3)) for _ in range(8)]
+
+    def fresh(seed: int) -> tuple[Linear, dict[str, Tensor], AdamW]:
+        set_seed(seed)
+        layer = Linear(4, 3)
+        named = dict(named_parameters(layer))
+        return layer, named, AdamW(list(named.values()), lr=1e-2)
+
+    layer, named, opt = fresh(0)
+    steps(layer, opt, data[:4])
+    save_file({**named, **opt.state_dict(named)}, path)
+    straight = steps(layer, opt, data[4:])
+
+    layer, named, opt = fresh(1)  # a different init, so only the file can carry the run across
+    load_into({**named, **opt.state_dict(named)}, path)
+    assert steps(layer, opt, data[4:]) == straight
+
+    layer, named, opt = fresh(1)
+    load_into(named, path)  # the weights alone: the moments and beta**t stay cold, and it shows
+    assert steps(layer, opt, data[4:]) != straight
 
 
 @needs_cuda
