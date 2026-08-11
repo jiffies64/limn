@@ -157,34 +157,48 @@ class Embedding:
         return self.weight.gather_rows(indices)
 
 
-def parameters(module: object) -> list[Tensor]:
-    """Every requires_grad Tensor reachable from module's attributes, depth-first, deduplicated.
+def named_parameters(module: object) -> list[tuple[str, Tensor]]:
+    """Every requires_grad Tensor reachable from module's attributes, depth-first, deduplicated,
+    under the dotted path the walk took to reach it: "blocks.0.attn.w.weight".
+
+    The path is an attribute name per module, an index per list or tuple, and a key per dict, so
+    it is stable across runs while a position in parameters() is stable only across a fixed
+    build order. That is what a checkpoint keys on, and the whole reason this walk carries a name.
 
     Containers are tracked by identity too, so a module that holds a reference to itself, or two
-    that hold each other, is walked once rather than forever.
+    that hold each other, is walked once rather than forever. A tensor two paths reach is one
+    parameter, named for the first path there.
     """
-    found: list[Tensor] = []
+    found: list[tuple[str, Tensor]] = []
     seen: set[int] = set()
 
-    def walk(obj: object) -> None:
+    def walk(obj: object, path: str) -> None:
         if isinstance(obj, Tensor):
             if obj.requires_grad and id(obj) not in seen:
                 seen.add(id(obj))
-                found.append(obj)
+                found.append((path, obj))
             return
         if id(obj) in seen:
             return
         if isinstance(obj, (list, tuple)):
-            children = obj
+            children = enumerate(obj)
         elif isinstance(obj, dict):
-            children = obj.values()
+            children = obj.items()
         elif hasattr(obj, "__dict__"):
-            children = vars(obj).values()
+            children = vars(obj).items()
         else:
             return
         seen.add(id(obj))
-        for value in children:
-            walk(value)
+        for key, value in children:
+            walk(value, f"{path}.{key}" if path else str(key))
 
-    walk(module)
+    walk(module, "")
     return found
+
+
+def parameters(module: object) -> list[Tensor]:
+    """The parameters named_parameters finds, without their names: what an optimizer takes.
+
+    One walk under both, so a container type either walk learns about, the other has already.
+    """
+    return [p for _, p in named_parameters(module)]

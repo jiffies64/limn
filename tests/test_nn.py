@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from conftest import randf
 
 from limn import Tensor, set_seed
-from limn.nn import Conv1d, Conv2d, Embedding, LayerNorm, Linear, parameters
+from limn.nn import Conv1d, Conv2d, Embedding, LayerNorm, Linear, named_parameters, parameters
 
 BATCH, SEQ, VOCAB, DIM, HEADS, LAYERS = 2, 6, 19, 16, 4, 2
 
@@ -215,6 +215,27 @@ def test_conv_rejects_bad_input():
         Conv1d(3, 4, 3)(Tensor.zeros((1, 5, 8)))
     with pytest.raises(ValueError, match="spatial"):
         Conv1d(3, 4, 3)(Tensor.zeros((1, 3, 8, 8)))
+
+
+def test_named_parameters_names_the_path_it_walked():
+    class Model:
+        def __init__(self):
+            self.stem = Linear(3, 2)
+            self.heads = {"a": Linear(2, 4)}
+            self.blocks = [LayerNorm(2)]
+            self.tied = self.stem.weight  # a second path to a tensor already found
+
+    model = Model()
+    named = named_parameters(model)
+    assert [name for name, _ in named] == [
+        "stem.weight",
+        "stem.bias",
+        "heads.a.weight",
+        "heads.a.bias",
+        "blocks.0.weight",
+        "blocks.0.bias",
+    ]
+    assert [id(p) for _, p in named] == [id(p) for p in parameters(model)]  # one walk, so one order
 
 
 def test_parameters_finds_layers_held_in_a_dict():
