@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from limn import Tensor, no_grad
+from limn.nn import Linear, named_parameters, parameters
 from limn.optim import SGD, AdamW, Muon
 
 rng = np.random.default_rng(11)
@@ -171,6 +172,30 @@ def test_newton_schulz_lands_singular_values_near_one(shape):
 def test_muon_rejects_non_2d_parameters():
     with pytest.raises(ValueError, match="2D"):
         Muon([Tensor(np.ones(3, dtype=np.float32), requires_grad=True)])
+
+
+def test_state_dict_is_keyed_by_parameter_name():
+    layer = Linear(3, 2)
+    named = dict(named_parameters(layer))
+    params = list(named.values())
+
+    assert SGD(params, lr=0.1).state_dict(named) == {}  # nothing to carry between steps
+    assert set(SGD(params, lr=0.1, momentum=0.9).state_dict(named)) == {"opt.weight.momentum", "opt.bias.momentum"}
+    assert set(Muon([named["weight"]]).state_dict(named)) == {"opt.weight.momentum"}
+    assert set(AdamW(params).state_dict(named)) == {
+        "opt.weight.m",
+        "opt.weight.v",
+        "opt.bias.m",
+        "opt.bias.v",
+        "opt.float32.beta1_t",  # one pair per state dtype: it counts steps, not parameters
+        "opt.float32.beta2_t",
+    }
+
+
+def test_state_dict_needs_a_name_for_every_parameter():
+    layer = Linear(3, 2)
+    with pytest.raises(ValueError, match="not in the given names"):
+        AdamW(parameters(layer)).state_dict({"weight": layer.weight})
 
 
 def test_step_realizes_extras_in_the_same_batch():

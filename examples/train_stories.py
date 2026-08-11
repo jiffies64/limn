@@ -2,8 +2,10 @@
 
 The default run is small (50M tokens): enough for word-correct baby English. --full trains
 500M tokens overnight. Both log loss and throughput, checkpoint as they go, resume with
---resume, and finish by sampling a story. The dataset (about 2 GB of text) downloads on
-first use into examples/data/.
+--resume, and finish by sampling a story. The checkpoint is one safetensors file holding the
+weights and the optimizer state, so a resumed run continues the trajectory the uninterrupted
+one would have taken. The dataset (about 2 GB of text) downloads on first use into
+examples/data/.
 """
 
 import argparse
@@ -14,8 +16,9 @@ from pathlib import Path
 import numpy as np
 
 from limn import Tensor, capture, no_grad, realize, set_device, set_seed
-from limn.nn import Embedding, LayerNorm, Linear, parameters
+from limn.nn import Embedding, LayerNorm, Linear, named_parameters
 from limn.optim import AdamW
+from limn.serialize import load_into, save_file
 
 DATA_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStories-train.txt"
 DATA_DIR = Path(__file__).parent / "data"
@@ -100,16 +103,6 @@ def batch_of(data: np.ndarray, batch: int, rng: np.random.Generator) -> tuple[Te
     return Tensor(chunk[:, :-1]), Tensor(chunk[:, 1:])
 
 
-def save_checkpoint(path: Path, params: list[Tensor]) -> None:
-    np.savez(path, *[p.numpy() for p in params])  # arr_0..arr_N, in parameters() order
-
-
-def load_checkpoint(path: Path, params: list[Tensor]) -> None:
-    stored = np.load(path)
-    assert len(stored.files) == len(params), f"checkpoint has {len(stored.files)} tensors, model has {len(params)}"
-    realize(*[p.assign(Tensor(stored[f"arr_{i}"])) for i, p in enumerate(params)])
-
-
 def sample(model: GPT, n: int, temperature: float, rng: np.random.Generator) -> str:
     """One byte at a time against the kv caches. Prefill and decode are the same captured step,
     so each byte costs one recorded plan over a single position instead of a full-window
@@ -159,17 +152,18 @@ def main() -> None:
     data = load_data()
 
     model = GPT()
-    params = parameters(model)
-    checkpoint = DATA_DIR / "stories_checkpoint.npz"
+    named = dict(named_parameters(model))
+    opt = AdamW(named.values(), lr=args.lr)
+    state = {**named, **opt.state_dict(named)}  # live buffers, so the one map both saves and resumes
+    checkpoint = DATA_DIR / "stories_checkpoint.safetensors"
     if args.resume and checkpoint.exists():
-        load_checkpoint(checkpoint, params)
+        load_into(state, checkpoint)
         print(f"resumed from {checkpoint}")
-    opt = AdamW(params, lr=args.lr)
 
     budget = args.tokens if args.tokens is not None else (500_000_000 if args.full else 50_000_000)
     tokens_per_step = args.batch * CTX
     steps = max(1, budget // tokens_per_step)
-    print(f"{sum(p.numel for p in params) / 1e6:.2f}M params, {steps} steps of {tokens_per_step} tokens on {args.device}")
+    print(f"{sum(p.numel for p in named.values()) / 1e6:.2f}M params, {steps} steps of {tokens_per_step} tokens on {args.device}")
 
     @capture
     def train_step(x: Tensor, y: Tensor) -> Tensor:
@@ -190,7 +184,7 @@ def main() -> None:
             eta = (steps - step) * tokens_per_step / rate
             print(f"step {step:6d}/{steps}  loss {loss.item():.4f}  {rate:8.0f} tok/s  eta {eta / 3600:.2f}h", flush=True)
         if step % args.checkpoint_every == 0 or step == steps:
-            save_checkpoint(checkpoint, params)
+            save_file(state, checkpoint)
 
     print(f"\ndone in {(time.perf_counter() - start) / 3600:.2f}h; a story:\n")
     print(sample(model, args.sample_bytes, args.temperature, rng))

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from conftest import randf
 
 from limn import Tensor, set_seed
-from limn.nn import Conv1d, Conv2d, Embedding, LayerNorm, Linear, parameters
+from limn.nn import Conv1d, Conv2d, Embedding, LayerNorm, Linear, named_parameters, parameters
 
 BATCH, SEQ, VOCAB, DIM, HEADS, LAYERS = 2, 6, 19, 16, 4, 2
 
@@ -217,6 +217,27 @@ def test_conv_rejects_bad_input():
         Conv1d(3, 4, 3)(Tensor.zeros((1, 3, 8, 8)))
 
 
+def test_named_parameters_names_the_path_it_walked():
+    class Model:
+        def __init__(self):
+            self.stem = Linear(3, 2)
+            self.heads = {"a": Linear(2, 4)}
+            self.blocks = [LayerNorm(2)]
+            self.tied = self.stem.weight  # a second path to a tensor already found
+
+    model = Model()
+    named = named_parameters(model)
+    assert [name for name, _ in named] == [
+        "stem.weight",
+        "stem.bias",
+        "heads.a.weight",
+        "heads.a.bias",
+        "blocks.0.weight",
+        "blocks.0.bias",
+    ]
+    assert [id(p) for _, p in named] == [id(p) for p in parameters(model)]  # one walk, so one order
+
+
 def test_parameters_finds_layers_held_in_a_dict():
     class Model:
         def __init__(self):
@@ -227,17 +248,17 @@ def test_parameters_finds_layers_held_in_a_dict():
 
 
 def test_parameters_walks_reference_cycles_once():
-    class Block:
+    class Cell:
         def __init__(self, layer: Linear):
             self.layer = layer
-            self.peer: Block | None = None
+            self.peer: Cell | None = None
 
-    first, second = Block(Linear(3, 2)), Block(Linear(2, 4))
-    first.peer, second.peer = second, first  # a cycle between two blocks
+    first, second = Cell(Linear(3, 2)), Cell(Linear(2, 4))
+    first.peer, second.peer = second, first  # a cycle between two cells
     found = parameters(first)
     assert len(found) == 4  # two weights and two biases, each seen exactly once
     assert len({id(p) for p in found}) == 4
 
-    solo = Block(Linear(3, 2))
+    solo = Cell(Linear(3, 2))
     solo.peer = solo
     assert len(parameters(solo)) == 2

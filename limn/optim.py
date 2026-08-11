@@ -17,7 +17,7 @@ plan serve the whole run and a captured step (limn.capture) replay with no host 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 
 from limn.ops import DType, float32, promote
 from limn.tensor import Tensor, no_grad, realize
@@ -52,6 +52,34 @@ class Optimizer:
         """(target, new value) for every tensor this step writes; building them commits nothing."""
         raise NotImplementedError
 
+    def slots(self) -> dict[str, Sequence[Tensor | None]]:
+        """The per-parameter state this optimizer carries between steps, by slot name, one entry
+        per parameter in order. None is a parameter with nothing in that slot, as SGD without
+        momentum has."""
+        return {}
+
+    def state_dict(self, named: Mapping[str, Tensor]) -> dict[str, Tensor]:
+        """Everything this optimizer must keep across a stop, as "opt.<parameter name>.<slot>".
+
+        Keyed by the parameter's name rather than by its position, so a model whose layers are
+        built in another order still resumes onto the right state. The names come in as an
+        argument because an optimizer is given parameters, not a module: pass nn.named_parameters
+        of whatever the parameters came from.
+
+        The tensors are the live state buffers, so the map serves both directions: save_file reads
+        them, and load_into assigns the file straight back into them.
+        """
+        names = {id(p): name for name, p in named.items()}
+        unnamed = [p for p in self.params if id(p) not in names]
+        if unnamed:
+            raise ValueError(f"{len(unnamed)} of {len(self.params)} parameters are not in the given names")
+        return {
+            f"opt.{names[id(p)]}.{slot}": state
+            for slot, states in self.slots().items()
+            for p, state in zip(self.params, states)
+            if state is not None
+        }
+
 
 class SGD(Optimizer):
     def __init__(self, params: Iterable[Tensor], lr: float, momentum: float = 0.0):
@@ -59,6 +87,9 @@ class SGD(Optimizer):
         self.lr = lr
         self.momentum = momentum
         self.velocity = [state_like(p) for p in self.params] if momentum else [None] * len(self.params)
+
+    def slots(self) -> dict[str, Sequence[Tensor | None]]:
+        return {"momentum": self.velocity}
 
     def updates(self) -> list[tuple[Tensor, Tensor]]:
         updates: list[tuple[Tensor, Tensor]] = []
@@ -96,6 +127,16 @@ class AdamW(Optimizer):
         self.powers: dict[DType, tuple[Tensor, Tensor]] = {
             dtype: (Tensor.ones((1,), dtype=dtype), Tensor.ones((1,), dtype=dtype)) for dtype in {m.dtype for m in self.m}
         }
+
+    def slots(self) -> dict[str, Sequence[Tensor | None]]:
+        return {"m": self.m, "v": self.v}
+
+    def state_dict(self, named: Mapping[str, Tensor]) -> dict[str, Tensor]:
+        """The moments, and beta**t alongside them: it belongs to the step count rather than to
+        any one parameter, and a resume that left it at 1 would bias-correct a warm run as if it
+        had just started."""
+        powers = {f"opt.{dtype}.beta{i + 1}_t": t for dtype, pair in self.powers.items() for i, t in enumerate(pair)}
+        return super().state_dict(named) | powers
 
     def updates(self) -> list[tuple[Tensor, Tensor]]:
         updates: list[tuple[Tensor, Tensor]] = []
@@ -155,6 +196,9 @@ class Muon(Optimizer):
         self.ns_steps = ns_steps
         self.eps = eps
         self.buf = [state_like(p) for p in self.params]
+
+    def slots(self) -> dict[str, Sequence[Tensor | None]]:
+        return {"momentum": self.buf}
 
     def newton_schulz(self, mat: Tensor) -> Tensor:
         """Approximate the matrix sign function: drives every singular value toward 1.
