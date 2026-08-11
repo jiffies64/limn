@@ -248,17 +248,17 @@ def test_parameters_finds_layers_held_in_a_dict():
 
 
 def test_parameters_walks_reference_cycles_once():
-    class Block:
+    class Cell:
         def __init__(self, layer: Linear):
             self.layer = layer
-            self.peer: Block | None = None
+            self.peer: Cell | None = None
 
-    first, second = Block(Linear(3, 2)), Block(Linear(2, 4))
-    first.peer, second.peer = second, first  # a cycle between two blocks
+    first, second = Cell(Linear(3, 2)), Cell(Linear(2, 4))
+    first.peer, second.peer = second, first  # a cycle between two cells
     found = parameters(first)
     assert len(found) == 4  # two weights and two biases, each seen exactly once
     assert len({id(p) for p in found}) == 4
 
-    solo = Block(Linear(3, 2))
+    solo = Cell(Linear(3, 2))
     solo.peer = solo
     assert len(parameters(solo)) == 2

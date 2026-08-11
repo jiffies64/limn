@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from limn import Tensor, capture, no_grad, set_device, set_seed
+from limn import Tensor, capture, no_grad, realize, set_device, set_seed
 from limn.nn import Embedding, LayerNorm, Linear, named_parameters
 from limn.optim import AdamW
 from limn.serialize import load_into, save_file
@@ -42,6 +42,21 @@ class Block:
         x = x + self.proj(att.permute(0, 2, 1, 3).reshape(b, t, c))
         return x + self.down(self.up(self.ln2(x)).relu())
 
+    def step(self, x: Tensor, kc: Tensor, vc: Tensor, pos: Tensor) -> Tensor:
+        """One position against the kv caches: its k and v land in slot pos, and the query row
+        reads the slots filled so far. Attention reads the updated value rather than the cache
+        buffer, since assigns commit only after every sink computes."""
+        b, _, c = x.shape
+        hd = c // HEADS
+        q, k, v = self.qkv(self.ln1(x)).reshape(b, 1, 3, HEADS, hd).permute(2, 0, 3, 1, 4)
+        slot = Tensor.arange(CTX).reshape(CTX, 1).eq(pos)
+        new_k, new_v = slot.where(k, kc), slot.where(v, vc)
+        att = q.attention(new_k, new_v, key_mask=Tensor.arange(CTX) <= pos)
+        kc.assign(new_k)
+        vc.assign(new_v)
+        x = x + self.proj(att.permute(0, 2, 1, 3).reshape(b, 1, c))
+        return x + self.down(self.up(self.ln2(x)).relu())
+
 
 class GPT:
     def __init__(self):
@@ -55,6 +70,13 @@ class GPT:
         x = self.tok(tokens) + self.pos(Tensor.arange(CTX))
         for block in self.blocks:
             x = block(x)
+        return self.head(self.ln(x))
+
+    def step(self, token: Tensor, pos: Tensor, caches: list[list[Tensor]]) -> Tensor:
+        """Next-byte logits for one position, reading and advancing the per-block kv caches."""
+        x = self.tok(token) + self.pos(pos)
+        for block, (kc, vc) in zip(self.blocks, caches):
+            x = block.step(x, kc, vc, pos)
         return self.head(self.ln(x))
 
 
@@ -82,19 +104,31 @@ def batch_of(data: np.ndarray, batch: int, rng: np.random.Generator) -> tuple[Te
 
 
 def sample(model: GPT, n: int, temperature: float, rng: np.random.Generator) -> str:
-    window = np.full(CTX, ord("\n"), dtype=np.int32)
+    """One byte at a time against the kv caches. Prefill and decode are the same captured step,
+    so each byte costs one recorded plan over a single position instead of a full-window
+    forward. When the caches fill, the newest half of the text refeeds at fresh positions: the
+    forgetting the old sliding window did every byte, once per half context instead."""
+    caches = [[Tensor.zeros((1, HEADS, CTX, DIM // HEADS)).realize() for _ in "kv"] for _ in model.blocks]
+
+    @capture
+    def step(token: Tensor, pos: Tensor) -> Tensor:
+        logits = model.step(token, pos, caches)
+        realize(logits, *[c for pair in caches for c in pair])
+        return logits
+
     prompt = b"Once upon a time"
-    window[-len(prompt) :] = np.frombuffer(prompt, dtype=np.uint8)
     out = bytearray(prompt)
+    fed = pos = 0  # bytes of out already in the caches, and the slot the next one lands in
     with no_grad():
-        for _ in range(n):
-            # only the last position predicts, so drop the rest on the device rather than copy it back
-            logits = model(Tensor(window.reshape(1, CTX)))[0, -1].numpy()
-            weights = np.exp((logits - logits.max()) / temperature)
-            token = int(rng.choice(VOCAB, p=weights / weights.sum()))
-            out.append(token)
-            window[:-1] = window[1:]
-            window[-1] = token
+        while len(out) < len(prompt) + n:
+            if pos == CTX:
+                fed, pos = len(out) - CTX // 2, 0
+            logits = step(Tensor(np.array([[out[fed]]], dtype=np.int32)), Tensor(np.array([pos], dtype=np.int32)))
+            fed, pos = fed + 1, pos + 1
+            if fed == len(out):  # caught up: these logits predict a byte nothing has seen
+                row = logits.numpy()[0, 0]
+                weights = np.exp((row - row.max()) / temperature)
+                out.append(int(rng.choice(VOCAB, p=weights / weights.sum())))
     return out.decode("utf-8", errors="replace")
 
 
