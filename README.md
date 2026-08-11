@@ -9,8 +9,8 @@
 A deep learning framework built to be read. The whole stack is here: lazy tensors over a
 closed set of 19 primitive ops, reverse-mode autograd that can differentiate its own
 gradients, a scheduler that fuses the graph into kernels, an IR you can print, conv layers,
-dtypes from int8 to float64, and C and CUDA backends that JIT-compile it, with numpy and
-ml_dtypes as the only runtime dependencies. In spirit it sits between micrograd and tinygrad:
+dtypes from int8 to float64, safetensors checkpoints, and C and CUDA backends that
+JIT-compile it, with numpy and ml_dtypes as the only runtime dependencies. In spirit it sits between micrograd and tinygrad:
 small enough to read in one sitting, real enough that a matmul comes out the other end as one
 fused loop nest with the stride-1 dim innermost.
 
@@ -46,7 +46,8 @@ uv run python examples/train_stories.py  # byte-level GPT on TinyStories; --full
 ```
 
 `uv sync` installs numpy and ml_dtypes, which supplies the bfloat16 numpy lacks, plus the
-dev group (pytest, ruff, CPU-only torch). The `c` device also needs a C compiler on `PATH`
+dev group (pytest, ruff, CPU-only torch, and safetensors, which the checkpoints answer to).
+The `c` device also needs a C compiler on `PATH`
 as `cc`. The `cuda` device needs an NVIDIA driver and NVRTC: either a CUDA toolkit, or no
 root access at all with `uv sync --extra cuda`, which pulls NVRTC as a wheel.
 
@@ -266,17 +267,30 @@ assign transaction. A backend is one rendering of that instruction stream plus f
 for moving bytes. `backend_c.py` is both halves for C; on the CUDA side the rendering lives
 in `cuda_emit.py` and the hooks in `backend_cuda.py`.
 
-## nn and optim
+## nn, optim and checkpoints
 
-`limn.nn` holds `Linear`, `LayerNorm`, `Embedding`, and a `parameters()` walker that collects
-every trainable tensor reachable from a module's attributes. `limn.optim` holds `SGD` (with
-momentum) and `AdamW`. An optimizer step is a batch of `ASSIGN` graphs committed in one
-`realize()`, so every update expression reads pre-step values and update order cannot matter;
-`step()` also takes extra tensors to realize in that same batch, which is how a logged loss
-shares the forward pass with the gradients. Everything a step changes lives on the device,
-AdamW's `beta**t` included, so a captured step replays whole. Semantics match `torch.nn` and
-`torch.optim` down to weight layouts, LayerNorm's biased variance, and AdamW's decoupled
-weight decay; the tests hold them to it step for step.
+`limn.nn` holds `Linear`, `LayerNorm`, `Embedding`, `Conv1d` and `Conv2d`, and a
+`parameters()` walker that collects every trainable tensor reachable from a module's
+attributes; `named_parameters()` is the same walk carrying the dotted path it took there.
+`limn.optim` holds `SGD` (with momentum), `AdamW`, and `Muon`, whose orthogonalized momentum
+is defined on matrices, so a model routes its 2D parameters there and the rest to AdamW. An
+optimizer step is a batch of `ASSIGN` graphs committed in one `realize()`, so every update
+expression reads pre-step values and update order cannot matter; `step()` also takes extra
+tensors to realize in that same batch, which is how a logged loss shares the forward pass with
+the gradients. Everything a step changes lives on the device, AdamW's `beta**t` included, so a
+captured step replays whole. Semantics match `torch.nn` and `torch.optim` down to weight
+layouts, LayerNorm's biased variance, and AdamW's decoupled weight decay; the tests hold them
+to it step for step.
+
+A checkpoint is one safetensors file: an 8-byte length, a json header naming each tensor's
+dtype, shape and byte range, then plain row-major bytes, and nothing in it executes.
+`limn.serialize` reads and writes it with numpy and ml_dtypes alone, so it costs no
+dependency, and limn's layouts are torch's, so a file written here loads there untransposed.
+Both halves of a run go in the one file: `Optimizer.state_dict` names the per-parameter state
+under the same paths `named_parameters()` gives, AdamW's `beta**t` beside it, since a resume
+that left it at 1 would bias-correct a warm run as if it had just started. `load_into`
+assigns the file into the tensors' own buffers rather than rebinding them, one `realize()` for
+the whole checkpoint, so a `limn.capture` recording goes on replaying the buffers it holds.
 
 ## Correctness
 
@@ -292,6 +306,7 @@ Every layer answers to an oracle above it:
 | the half-width floats | the numpy device | the corpus and the matmuls again at each width, diffed at the width's own rounding, plus the dtype rules, that a cast between float dtypes still carries gradients, and that the two meet at float32 |
 | `int8`, `int16` | the numpy device | an integer corpus (wraparound, compares, reduces, matmul, gather) on the `c` and `cuda` devices, diffed for exact equality since modular arithmetic leaves nothing to rounding |
 | `float64` | the numpy device | the corpus and the tiled matmuls again in double, diffed at 1e-12, plus that gradients and optimizer state hold the width and that a `cuda` scatter adds atomically in double |
+| checkpoints | the `safetensors` library | a round trip through limn alone would pass with a wrong header length or a swapped dtype tag, so every dtype is written here and read by the library, and written by the library and read here; a run stopped and resumed out of one file must then take the trajectory the uninterrupted one took, which its parameters without its optimizer state do not |
 | fused attention | PyTorch, then the numpy device | forward and backward diffed against the composed form at every shape the seam allows and against `torch`'s own sdpa, with a check that the backward graph holds no `t_q` by `t_k` node at all; the `cuda` kernels then diffed against the numpy ones at each width, over ragged tiles, rows past one block, and rectangular keys, and held to giving the same bits twice; a key mask is checked against slicing the hidden keys away entirely |
 
 ## Layout
@@ -310,8 +325,9 @@ limn/
   backend_c.py   renders the IR as C, compiles it, calls it through ctypes
   cuda_emit.py   renders the IR as CUDA C: one thread per cell, split reduces, tiled matmuls
   backend_cuda.py  binds the driver and NVRTC, compiles, owns device memory and launching
-  nn.py          Linear, LayerNorm, Embedding
-  optim.py       SGD, AdamW
+  nn.py          Linear, LayerNorm, Embedding, Conv1d, Conv2d
+  optim.py       SGD, AdamW, Muon
+  serialize.py   checkpoints as safetensors: weights and optimizer state in one file
 tests/           one file per layer, a 300-case autograd fuzzer, an IR interpreter
 examples/        train_mlp.py, a toy regression; train_stories.py, a byte-level GPT on TinyStories
 ```
