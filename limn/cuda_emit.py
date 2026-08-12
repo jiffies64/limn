@@ -30,7 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from limn.backend_c import C_TYPE, c_literal, fold_c, value_c
-from limn.codegen import REDUCES, Index, Instr, LoopNest, Opcode
+from limn.codegen import REDUCES, Index, Instr, LoopNest, Opcode, reduce_axes
 from limn.ops import HALF_FLOATS, DType, Op, accumulate_in, bfloat16, float16, float32, int8, int16
 from limn.sdpa import SDPA, SDPA_BWD_KV, SDPA_BWD_Q
 
@@ -113,11 +113,6 @@ struct __align__(8) bf16x4_t {
 def value_cuda(instr: Instr, indent: str) -> str:
     """One value-defining instruction, spelled for this device: computed as a value, stored as one."""
     return value_c(instr, indent, "", CUDA_VALUE, CUDA_TYPE)
-
-
-def reduce_axes(nest: LoopNest) -> tuple[int, ...]:
-    root = nest.kernel.ast
-    return root.arg if root.op in REDUCES else ()
 
 
 def outer_extent(nest: LoopNest) -> int:
