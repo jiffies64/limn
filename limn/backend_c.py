@@ -3,6 +3,15 @@
 Each scheduled kernel becomes one C function taking void* pointers (one per input, one for
 output), cast to the right type inside. The emitter is a second rendering of the same Instr
 stream that render() in codegen.py prints; correctness is proven by diffing against NumpyDevice.
+
+-march=native gets a nest the host's vector width, which is one core's worth of speed; the cores
+come from OpenMP. A nest's leading non-reduce loops go to a thread team, so the threads divide
+the output cells between them and each cell is still computed start to finish by one thread,
+folding in the order the serial nest folds. That leaves threading with no numerical consequence:
+the same nest emitted without the pragmas gives back the same bits, not merely the same answer to
+a tolerance, which is what test_backend_c.py holds it to. Whether a cc has a usable OpenMP runtime
+is not knowable up front, so it is probed, and the pragmas are simply not emitted when the probe
+fails.
 """
 
 from __future__ import annotations
@@ -12,19 +21,34 @@ import ctypes
 import functools
 import hashlib
 import math
+import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
 
-from limn.codegen import Instr, LoopNest, Opcode, Valid, loop_range, split_masked
+from limn.codegen import Instr, LoopNest, Opcode, Valid, loop_range, reduce_axes, split_masked
 from limn.device import NUMPY_DTYPES, Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
 from limn.ops import DType, FLOATS, HALF_FLOATS, Op, float32, float64, int8, int16, int32
 
 C_TYPE = {float64: "double", float32: "float", int32: "int32_t", int16: "int16_t", int8: "int8_t"}
+
+PARALLEL_MIN = 1 << 15  # a nest smaller than this stays serial: waking a team costs more than it does
+CHUNKS_PER_THREAD = 4  # slabs of the parallel space to give each thread, so no core holds up the rest
+
+OPENMP_PROBE = """\
+#include <omp.h>
+int probe(void) {
+  int total = 0;
+  #pragma omp parallel for reduction(+ : total)
+  for (int i = 0; i < 8; i++) total += i;
+  return total + omp_get_max_threads();
+}
+"""
 
 cache: dict[str, ctypes.CDLL] = {}
 tmpdirs: list[Path] = []
@@ -34,21 +58,131 @@ def has_cc() -> bool:
     return shutil.which("cc") is not None
 
 
+def cc_builds(flags: tuple[str, ...], source: str = "") -> bool:
+    """Whether this machine's cc compiles *and links* a probe with these flags.
+
+    Linking is the point. A driver can accept a flag and then fail at the link for want of a
+    runtime library, which is exactly what clang does with -fopenmp where there is no libomp.
+    """
+    with tempfile.TemporaryDirectory(prefix="limn_probe_") as tmp:
+        src = Path(tmp) / "probe.c"
+        src.write_text(source)
+        probe = ["cc", *flags, "-shared", "-fPIC", "-o", str(Path(tmp) / "probe.so"), str(src)]
+        return subprocess.run(probe, capture_output=True, text=True).returncode == 0
+
+
 @functools.cache
 def cc_flags() -> tuple[str, ...]:
     """Optimisation flags for this machine's cc.
 
     A reordered nest only vectorises if the compiler may target the vector width this CPU actually
     has; plain -O3 compiles for baseline x86-64, which stops at SSE2. Not every cc takes
-    -march=native (clang on arm64 rejects it), so probe rather than assume and fall back to -O3.
+    -march=native (clang on arm64 rejects it), and not every one has an OpenMP runtime to link
+    against, so probe rather than assume; openmp() is how the emitter asks whether that one
+    survived.
 
     Targeting the host also lets the compiler contract a multiply and an add into one FMA, so a
     float result can differ in the last bit from the numpy device's, and between two machines.
     test_backend_c.py diffs at 1e-5, which absorbs that. -ffp-contract=off would buy the bit back
     at most of the speed.
     """
-    probe = subprocess.run(["cc", "-march=native", "-E", "-x", "c", "-"], input="", capture_output=True, text=True)
-    return ("-O3", "-march=native") if probe.returncode == 0 else ("-O3",)
+    flags = ("-O3",) + (("-march=native",) if cc_builds(("-march=native",)) else ())
+    return flags + (("-fopenmp",) if cc_builds(("-fopenmp",), OPENMP_PROBE) else ())
+
+
+def openmp() -> bool:
+    return "-fopenmp" in cc_flags()
+
+
+@functools.cache
+def team_size() -> int:
+    """How many threads a kernel's team gets: what OMP_NUM_THREADS says, else one per physical core.
+
+    libgomp's own default is one per logical processor, and its idle threads spin. Between two
+    kernels the whole team is idle while the executor finds and calls the next one, so on an SMT
+    machine both siblings of every core sit there spinning and the thread doing the useful work has
+    to share a core with one of them. Siblings share a core's vector units and its L1 anyway, so
+    what the second adds to a kernel already streaming memory is small.
+
+    sysfs is the only place the topology is written down; without it (a non-Linux host) the logical
+    count is the best guess available. Either way the affinity mask is the ceiling, so a run pinned
+    to two cores asks for two threads. The answer is fixed on first use, since it is compiled into
+    the kernels as a num_threads clause and the collapse decision is taken against it.
+    """
+    asked = os.environ.get("OMP_NUM_THREADS", "").split(",")[0].strip()  # a list sets one count per nesting level
+    if asked.isdigit() and int(asked) > 0:
+        return int(asked)
+    usable = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    cores = {p.read_text() for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/topology/thread_siblings_list")}
+    return min(usable, len(cores)) if cores else usable
+
+
+def collapse_depth(bounds: Sequence[int]) -> int:
+    """How many of a chain's leading loops to fuse into one parallel iteration space; 0 for none.
+
+    Static scheduling cuts the space into one contiguous slab per thread, so a loop with fewer
+    iterations than there are threads leaves cores idle, and one with only a couple each leaves
+    them waiting on whichever thread drew the slowest core. Fusing the next loop in multiplies the
+    slabs there are to divide up. Fusing is not free, since the fused index costs a division per
+    slab, so it stops as soon as there is enough work to go round, which for most nests is at the
+    first loop.
+    """
+    target = CHUNKS_PER_THREAD * team_size()
+    extent, depth = 1, 0
+    for bound in bounds:
+        if extent >= target:
+            break
+        extent *= bound
+        depth += 1
+    return depth if extent > 1 else 0
+
+
+def parallel_loops(nest: LoopNest, instrs: Sequence[Instr]) -> dict[int, int]:
+    """Which loops open a thread team: the index of one in `instrs` -> how many loops it fuses.
+
+    A nest is one or two top-level chains of loops (a reduce that folds into its output fills it
+    with the identity in a chain of its own first). The leading non-reduce loops of a chain are the
+    ones worth threading: the output's index is affine in exactly those variables, so two of their
+    iterations never name the same cell, and everything an iteration carries is declared inside it.
+
+    Where a chain starts on a reduce axis it stays serial. That axis carries a running total, in a
+    register or in the output cell, that every later iteration folds into; splitting it needs
+    partial accumulators, which regroup the additions and stop the answer being the serial one bit
+    for bit. It costs the nests that reduce nearly all of what they read: a full reduce, and one
+    whose single surviving dim loop_order moved innermost for being the stride-1 one.
+
+    A SCATTER stays serial too. It adds into whichever rows its indices name, so two iterations can
+    collide; an atomic add would fix the race and leave the sum's order up to thread timing, which
+    is a bad trade for the host backend the other ones are diffed against.
+
+    `instrs` is the stream the emitter renders rather than nest.instrs, since a team is opened by
+    position. That stream is split_masked's, which cuts innermost loops into siblings, and a
+    collapse clause may only span loops that are perfectly nested. Two things keep it to those: the
+    run has to open back to back in the stream, and it is cut back to the depth above any sibling.
+    """
+    if not openmp() or math.prod(nest.space) < PARALLEL_MIN:
+        return {}
+    if any(instr.opcode is Opcode.SCATTER for instr in instrs):
+        return {}
+    reduce_vars = {f"r{d}" for d in reduce_axes(nest)}
+    teams: dict[int, int] = {}
+    depth, start, deepest, lead = 0, 0, 0, []
+    for k, instr in enumerate(instrs):
+        if instr.opcode is Opcode.LOOP:
+            if depth == 0:
+                start, deepest, lead = k, 0, []
+            if depth < deepest:  # a second loop at this depth, so the chain is no longer one loop wide below it
+                del lead[depth:]
+            deepest = max(deepest, depth + 1)
+            lo, hi = loop_range(instr)
+            if len(lead) == depth == k - start and instr.dest not in reduce_vars:  # the leading run is unbroken
+                lead.append(hi - lo)
+            depth += 1
+        elif instr.opcode is Opcode.ENDLOOP:
+            depth -= 1
+            if depth == 0 and (collapse := collapse_depth(lead)):
+                teams[start] = collapse
+    return teams
 
 
 def c_literal(value: float | int, dtype: DType) -> str:
@@ -159,10 +293,15 @@ def emit_function(nest: LoopNest) -> str:
     depth = 1
     # cc vectorises the innermost loop or it vectorises nothing, and a pad's mask left riding on that
     # loop's variable is what stops it; split_masked turns those checks into loop bounds instead
-    for instr in split_masked(nest.instrs):
+    instrs = split_masked(nest.instrs)
+    teams = parallel_loops(nest, instrs)
+    for k, instr in enumerate(instrs):
         indent = "  " * (depth + 1)
         match instr.opcode:
             case Opcode.LOOP:
+                if (collapse := teams.get(k)) is not None:
+                    fuse = f" collapse({collapse})" if collapse > 1 else ""
+                    lines.append(f"{indent}#pragma omp parallel for{fuse} num_threads({team_size()})")
                 lo, hi = loop_range(instr)
                 lines.append(f"{indent}for (int {instr.dest} = {lo}; {instr.dest} < {hi}; {instr.dest}++) {{")
                 depth += 1
@@ -181,7 +320,7 @@ def emit_function(nest: LoopNest) -> str:
                 lines.append(indent + fold_c(fold, f"_{buf}[{index.render()}]", instr.srcs[0]))
             case Opcode.SCATTER:
                 buf, index = instr.arg
-                # two iterations can name the same row, so a threaded backend owes this an atomic add
+                # two iterations can name the same row, which is why parallel_loops leaves this nest serial
                 lines.append(f"{indent}_{buf}[{index.render()}] += {instr.srcs[0]};")
     lines.append("}")
     return "\n".join(lines)
