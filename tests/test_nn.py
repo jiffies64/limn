@@ -1,5 +1,6 @@
-"""A 2-layer transformer (embeddings, causal attention, layernorm, relu MLP, cross-entropy)
-built from limn layers, forward+backward checked against an identical torch model."""
+"""Layers built from limn, held to torch: a 2-layer transformer (embeddings, causal attention,
+layernorm, relu MLP, cross-entropy) forward+backward against an identical torch model, convs
+against F.conv, and BatchNorm's forward, backward and running stats against BatchNorm2d."""
 
 import math
 
@@ -7,10 +8,11 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from conftest import randf
+from conftest import COMPILED, check, randf
 
-from limn import Tensor, set_seed
-from limn.nn import Conv1d, Conv2d, Embedding, LayerNorm, Linear, named_parameters, parameters
+from limn import Tensor, realize, set_seed
+from limn.nn import BatchNorm, Conv1d, Conv2d, Embedding, LayerNorm, Linear, named_parameters, parameters
+from limn.ops import Op
 
 BATCH, SEQ, VOCAB, DIM, HEADS, LAYERS = 2, 6, 19, 16, 4, 2
 
@@ -262,3 +264,110 @@ def test_parameters_walks_reference_cycles_once():
     solo = Cell(Linear(3, 2))
     solo.peer = solo
     assert len(parameters(solo)) == 2
+
+
+def batchnorm_pair(channels: int) -> tuple[BatchNorm, torch.nn.BatchNorm2d]:
+    """Same init on both sides: weight 1, bias 0, running mean 0 and var 1, momentum 0.1."""
+    bn, tbn = BatchNorm(channels), torch.nn.BatchNorm2d(channels)
+    assert tbn.weight is not None and tbn.bias is not None
+    tbn.weight.data = torch.tensor(bn.weight.numpy())
+    tbn.bias.data = torch.tensor(bn.bias.numpy())
+    return bn, tbn
+
+
+def test_batchnorm_matches_torch():
+    """Train forward, backward, and the first stats update, against torch.nn.BatchNorm2d."""
+    set_seed(0)
+    bn, tbn = batchnorm_pair(3)
+    x = randf(4, 3, 5, 6)
+    lx, tx = Tensor(x, requires_grad=True), torch.tensor(x, requires_grad=True)
+    out, tout = bn(lx), tbn(tx)
+    realize(out, bn.running_mean, bn.running_var)  # the stats assigns commit with the step
+    np.testing.assert_allclose(out.numpy(), tout.detach().numpy(), atol=1e-4, rtol=1e-4)
+
+    (out * out).sum().backward()
+    (tout * tout).sum().backward()
+    for name, lgrad, tgrad in [
+        ("input", lx.grad, tx.grad),
+        ("weight", bn.weight.grad, tbn.weight.grad),
+        ("bias", bn.bias.grad, tbn.bias.grad),
+    ]:
+        assert lgrad is not None and tgrad is not None, f"missing gradient for {name}"
+        np.testing.assert_allclose(lgrad.numpy(), tgrad.numpy(), atol=1e-4, rtol=1e-4, err_msg=f"gradient mismatch for {name}")
+    assert tbn.running_mean is not None and tbn.running_var is not None
+    np.testing.assert_allclose(bn.running_mean.numpy(), tbn.running_mean.numpy(), atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(bn.running_var.numpy(), tbn.running_var.numpy(), atol=1e-5, rtol=1e-5)
+
+
+def test_batchnorm_running_stats_track_torch_across_training():
+    """The deliverable: a hundred train steps leave the stats torch-exact, and eval reads them."""
+    bn, tbn = batchnorm_pair(3)
+    rng = np.random.default_rng(5)
+    for step in range(100):
+        x = rng.standard_normal((4, 3, 4, 4)).astype(np.float32)
+        out = bn(Tensor(x))
+        tbn(torch.tensor(x))
+        realize(out, bn.running_mean, bn.running_var)
+        assert tbn.running_mean is not None and tbn.running_var is not None
+        np.testing.assert_allclose(
+            bn.running_mean.numpy(), tbn.running_mean.numpy(), atol=1e-5, rtol=1e-5, err_msg=f"mean diverged at step {step}"
+        )
+        np.testing.assert_allclose(
+            bn.running_var.numpy(), tbn.running_var.numpy(), atol=1e-5, rtol=1e-5, err_msg=f"var diverged at step {step}"
+        )
+    bn.training = False
+    tbn.eval()
+    x = rng.standard_normal((2, 3, 4, 4)).astype(np.float32)
+    np.testing.assert_allclose(bn(Tensor(x)).numpy(), tbn(torch.tensor(x)).detach().numpy(), atol=1e-5, rtol=1e-5)
+
+
+def test_batchnorm_small_batch_exposes_the_unbiased_factor():
+    """Two values per channel: the biased/unbiased factor is 2, not a rounding blur."""
+    bn, tbn = batchnorm_pair(2)
+    x = randf(2, 2, 1, 1)
+    out, tout = bn(Tensor(x)), tbn(torch.tensor(x))
+    realize(out, bn.running_mean, bn.running_var)
+    np.testing.assert_allclose(out.numpy(), tout.detach().numpy(), atol=1e-5, rtol=1e-5)
+    assert tbn.running_var is not None
+    np.testing.assert_allclose(bn.running_var.numpy(), tbn.running_var.numpy(), atol=1e-5, rtol=1e-5)
+
+
+def test_batchnorm_eval_leaves_the_stats_bit_identical():
+    bn, _ = batchnorm_pair(3)
+    out = bn(Tensor(randf(4, 3, 4, 4)))
+    realize(out, bn.running_mean, bn.running_var)
+    mean_before, var_before = bn.running_mean.numpy().copy(), bn.running_var.numpy().copy()
+    bn.training = False
+    bn(Tensor(randf(4, 3, 4, 4))).numpy()
+    assert bn.running_mean.node.op is Op.BUFFER and bn.running_var.node.op is Op.BUFFER  # eval built no assign
+    np.testing.assert_array_equal(bn.running_mean.numpy(), mean_before)
+    np.testing.assert_array_equal(bn.running_var.numpy(), var_before)
+
+
+def test_batchnorm_stats_advance_once_per_realized_step():
+    """forward -> realize -> forward -> realize: each realize commits exactly one update."""
+    bn = BatchNorm(2)
+    rng = np.random.default_rng(6)
+    expected_mean, expected_var = np.zeros(2, dtype=np.float32), np.ones(2, dtype=np.float32)
+    for _ in range(2):
+        x = rng.standard_normal((3, 2, 4, 4)).astype(np.float32)
+        out = bn(Tensor(x))  # a second forward before the first realize would raise
+        realize(out, bn.running_mean, bn.running_var)
+        expected_mean = 0.9 * expected_mean + 0.1 * x.mean(axis=(0, 2, 3))
+        expected_var = 0.9 * expected_var + 0.1 * x.var(axis=(0, 2, 3)) * (48 / 47)  # unbiased, 48 values per channel
+        np.testing.assert_allclose(bn.running_mean.numpy(), expected_mean, atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(bn.running_var.numpy(), expected_var, atol=1e-5, rtol=1e-5)
+
+
+def test_batchnorm_second_forward_before_realize_raises():
+    bn = BatchNorm(3)
+    bn(Tensor(randf(4, 3, 4, 4)))
+    with pytest.raises(ValueError, match="realized buffer"):
+        bn(Tensor(randf(4, 3, 4, 4)))
+
+
+@pytest.mark.parametrize("backend", COMPILED)
+def test_batchnorm_forward_on_compiled_backends(backend):
+    set_seed(0)
+    bn = BatchNorm(3)
+    check(backend.shared, bn(Tensor(randf(2, 3, 7))))  # (batch, channels, length): axes reduce over 0 and 2

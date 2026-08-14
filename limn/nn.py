@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 import math
 
-from limn.tensor import Tensor
+from limn.tensor import Tensor, no_grad
 
 
 class Linear:
@@ -34,6 +34,54 @@ class LayerNorm:
         centered = x - x.mean(axis=-1, keepdim=True)
         variance = (centered * centered).mean(axis=-1, keepdim=True)  # biased, like torch.nn.LayerNorm
         return centered / (variance + self.eps).sqrt() * self.weight + self.bias
+
+
+class BatchNorm:
+    """Normalize (batch, channels, *spatial) per channel, with torch.nn.BatchNorm's semantics.
+
+    Train mode reduces mean and biased variance over every axis but channels and normalizes
+    with them, so autograd differentiates through the statistics and the cross-sample terms
+    land in the gradient without a custom backward. It also queues the running statistics as
+    ASSIGNs onto their fixed buffers, and the graph commits them only when they are realized
+    alongside the step's other sinks — realize(loss, bn.running_mean, bn.running_var), or
+    hand them to Optimizer.step — so a second forward before the first realize raises, and
+    the transaction rule guarantees this batch was normalized with the pre-update statistics.
+
+    momentum weights the new observation, like torch's; the layer normalizes with the biased
+    variance but stores the unbiased one in running_var, like torch does. Eval mode
+    normalizes with the running statistics and builds no assign, so it never mutates state.
+    The training flag is a plain Python value: a captured step (limn.capture) replays the
+    ASSIGNs against the same buffers, but freezes the flag at record time.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-5, momentum: float = 0.1):
+        self.weight = Tensor.ones((channels,), requires_grad=True)
+        self.bias = Tensor.zeros((channels,), requires_grad=True)
+        self.running_mean = Tensor.zeros((channels,))
+        self.running_var = Tensor.ones((channels,))
+        self.eps = eps
+        self.momentum = momentum
+        self.training = True
+
+    def __call__(self, x: Tensor) -> Tensor:
+        channels = self.weight.shape[0]
+        if x.ndim < 2 or x.shape[1] != channels:
+            raise ValueError(f"BatchNorm over {channels} channels takes (batch, channels, ...), got input {x.shape}")
+        dims = (1, channels, *(1,) * (x.ndim - 2))
+        if not self.training:
+            mean, var = self.running_mean.reshape(*dims), self.running_var.reshape(*dims)
+            centered = x - mean
+        else:
+            axes = (0, *range(2, x.ndim))
+            mean = x.mean(axis=axes, keepdim=True)
+            centered = x - mean
+            var = (centered * centered).mean(axis=axes, keepdim=True)  # biased, like torch normalizes
+            with no_grad():  # the running stats are bookkeeping, not part of the step's gradient
+                count = x.numel // channels
+                unbiased = var.reshape(channels) * (count / (count - 1))  # torch stores the unbiased variance
+                self.running_mean.assign((1 - self.momentum) * self.running_mean + self.momentum * mean.reshape(channels))
+                self.running_var.assign((1 - self.momentum) * self.running_var + self.momentum * unbiased)
+        return centered / (var + self.eps).sqrt() * self.weight.reshape(*dims) + self.bias.reshape(*dims)
 
 
 def as_dims(value: int | tuple[int, ...], n: int, name: str) -> tuple[int, ...]:
