@@ -10,7 +10,7 @@ from __future__ import annotations
 import itertools
 import math
 
-from limn.tensor import Tensor
+from limn.tensor import Tensor, no_grad
 
 
 class Linear:
@@ -34,6 +34,54 @@ class LayerNorm:
         centered = x - x.mean(axis=-1, keepdim=True)
         variance = (centered * centered).mean(axis=-1, keepdim=True)  # biased, like torch.nn.LayerNorm
         return centered / (variance + self.eps).sqrt() * self.weight + self.bias
+
+
+class BatchNorm:
+    """Batch normalization over (N, C, *spatial): statistics shared across every axis but channels.
+
+    Training normalizes by this batch's mean and biased variance, and folds them into
+    running_mean / running_var through one ASSIGN each. An assign only commits when the step
+    realizes it, and it refuses a target that is not a buffer, so the training loop must
+    realize the stats with the step's other sinks — realize(loss, bn.running_mean,
+    bn.running_var), the transaction serialize.load_into builds — or the second forward
+    raises. The transaction rule then guarantees the step read pre-update stats.
+
+    The stat semantics are torch's: momentum weights the new observation, and running_var
+    stores the unbiased variance (times n/(n-1)) the biased normalization did not use.
+    training is a plain Python flag on the layer: eval normalizes by the running stats and
+    queues no assign, so it cannot mutate state. A captured training step replays the assigns
+    into the same buffers, but the flag is a Python value and freezes at record time.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-5, momentum: float = 0.1):
+        self.weight = Tensor.ones((channels,), requires_grad=True)
+        self.bias = Tensor.zeros((channels,), requires_grad=True)
+        self.running_mean = Tensor.zeros((channels,))
+        self.running_var = Tensor.ones((channels,))
+        self.eps = eps
+        self.momentum = momentum
+        self.training = True
+
+    def __call__(self, x: Tensor) -> Tensor:
+        if x.ndim < 2:
+            raise ValueError(f"BatchNorm needs (batch, channels, ...), got input {x.shape}")
+        axes = (0, *range(2, x.ndim))  # every axis but channels
+        stats = (1, x.shape[1], *(1,) * (x.ndim - 2))
+        gain, shift = self.weight.reshape(*stats), self.bias.reshape(*stats)
+        if not self.training:
+            mean, var = self.running_mean.reshape(*stats), self.running_var.reshape(*stats)
+            return (x - mean) / (var + self.eps).sqrt() * gain + shift
+        count = math.prod(x.shape[d] for d in axes)
+        if count == 1:
+            raise ValueError(f"BatchNorm needs more than one value per channel when training, got input {x.shape}")
+        mean = x.mean(axis=axes, keepdim=True)
+        centered = x - mean
+        variance = (centered * centered).mean(axis=axes, keepdim=True)  # biased, like torch's normalization
+        with no_grad():  # the stat update records no graph, so it costs no gradient and replays in place
+            unbiased = variance * (count / (count - 1))  # torch's running var: unbiased, never the biased one
+            self.running_mean.assign(self.running_mean * (1 - self.momentum) + mean.reshape(x.shape[1]) * self.momentum)
+            self.running_var.assign(self.running_var * (1 - self.momentum) + unbiased.reshape(x.shape[1]) * self.momentum)
+        return centered / (variance + self.eps).sqrt() * gain + shift
 
 
 def as_dims(value: int | tuple[int, ...], n: int, name: str) -> tuple[int, ...]:

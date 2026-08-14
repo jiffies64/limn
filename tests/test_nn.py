@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from conftest import randf
+from conftest import COMPILED, check, randf
 
-from limn import Tensor, set_seed
-from limn.nn import Conv1d, Conv2d, Embedding, LayerNorm, Linear, named_parameters, parameters
+from limn import Tensor, realize, set_seed
+from limn.nn import BatchNorm, Conv1d, Conv2d, Embedding, LayerNorm, Linear, named_parameters, parameters
 
 BATCH, SEQ, VOCAB, DIM, HEADS, LAYERS = 2, 6, 19, 16, 4, 2
 
@@ -215,6 +215,100 @@ def test_conv_rejects_bad_input():
         Conv1d(3, 4, 3)(Tensor.zeros((1, 5, 8)))
     with pytest.raises(ValueError, match="spatial"):
         Conv1d(3, 4, 3)(Tensor.zeros((1, 3, 8, 8)))
+
+
+def batchnorm_pair(channels: int, eps: float = 1e-5, momentum: float = 0.1) -> tuple[BatchNorm, torch.nn.BatchNorm2d]:
+    """A limn BatchNorm and a torch one over the same weights; the stat buffers start identical too."""
+    bn = BatchNorm(channels, eps, momentum)
+    tbn = torch.nn.BatchNorm2d(channels, eps, momentum)
+    tbn.weight.data = torch.tensor(bn.weight.numpy())
+    tbn.bias.data = torch.tensor(bn.bias.numpy())
+    return bn, tbn
+
+
+def test_batchnorm_train_matches_torch():
+    set_seed(0)
+    torch.manual_seed(0)
+    bn, tbn = batchnorm_pair(5)
+    x = randf(4, 5, 3, 3)
+    lx, tx = Tensor(x, requires_grad=True), torch.tensor(x, requires_grad=True)
+
+    out, tout = bn(lx), tbn(tx)
+    np.testing.assert_allclose(out.numpy(), tout.detach().numpy(), atol=1e-5, rtol=1e-5)
+
+    (out * out).sum().backward()
+    (tout * tout).sum().backward()
+    for name, lparam, tparam in [("input", lx, tx), ("weight", bn.weight, tbn.weight), ("bias", bn.bias, tbn.bias)]:
+        assert lparam.grad is not None and tparam.grad is not None
+        np.testing.assert_allclose(lparam.grad.numpy(), tparam.grad.numpy(), atol=1e-4, rtol=1e-4, err_msg=f"{name} gradient")
+
+    # the same forward folded the batch stats into the running ones, torch's conventions and all
+    assert tbn.running_mean is not None and tbn.running_var is not None  # tracking stays on: momentum is a float
+    np.testing.assert_allclose(bn.running_mean.numpy(), tbn.running_mean.detach().numpy(), atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(bn.running_var.numpy(), tbn.running_var.detach().numpy(), atol=1e-5, rtol=1e-5)
+
+
+def test_batchnorm_running_stats_match_torch_over_steps():
+    set_seed(1)
+    torch.manual_seed(1)
+    bn, tbn = batchnorm_pair(3)
+    assert tbn.running_mean is not None and tbn.running_var is not None  # tracking stays on: momentum is a float
+    for step in range(100):
+        x = randf(2, 3, 1, 1)  # n = 2 per channel: the biased/unbiased factor is a 2x, not a rounding blur
+        out = bn(Tensor(x))
+        tbn(torch.tensor(x))  # advances the torch stats; its output is not what this loop compares
+        realize(out, bn.running_mean, bn.running_var)  # the stat assigns commit with the step's work
+        np.testing.assert_allclose(
+            bn.running_mean.numpy(), tbn.running_mean.detach().numpy(), atol=1e-5, rtol=1e-5, err_msg=f"mean, step {step}"
+        )
+        np.testing.assert_allclose(
+            bn.running_var.numpy(), tbn.running_var.detach().numpy(), atol=1e-5, rtol=1e-5, err_msg=f"var, step {step}"
+        )
+    bn.training = False  # eval on the advanced stats lands where torch's does
+    tbn.eval()
+    x = randf(2, 3, 4, 4)
+    np.testing.assert_allclose(bn(Tensor(x)).numpy(), tbn(torch.tensor(x)).detach().numpy(), atol=1e-5, rtol=1e-5)
+
+
+def test_batchnorm_eval_leaves_stats_untouched():
+    bn = BatchNorm(4)
+    realize(bn(Tensor(randf(2, 4, 3, 3))), bn.running_mean, bn.running_var)  # eval has real stats to read
+    mean, var = bn.running_mean.numpy(), bn.running_var.numpy()
+    bn.training = False
+    bn(Tensor(randf(2, 4, 3, 3))).numpy()
+    np.testing.assert_array_equal(bn.running_mean.numpy(), mean)  # eval must not touch state, bit for bit
+    np.testing.assert_array_equal(bn.running_var.numpy(), var)
+
+
+def test_batchnorm_stats_advance_once_per_realized_step():
+    bn = BatchNorm(2, momentum=1.0)  # new stats are the batch's own, so the batch is the oracle
+    for x in (Tensor(randf(2, 2)), Tensor(randf(2, 2))):
+        bn(x)  # the second call only works because the previous realize retired the assigns
+        realize(bn.running_mean, bn.running_var)
+        np.testing.assert_array_equal(bn.running_mean.numpy(), x.numpy().mean(axis=0))
+        np.testing.assert_array_equal(bn.running_var.numpy(), x.numpy().var(axis=0) * 2.0)  # unbiased, n = 2
+
+
+def test_batchnorm_unrealized_stats_refuse_a_second_forward():
+    bn = BatchNorm(3)
+    bn(Tensor(randf(2, 3, 3, 3)))
+    with pytest.raises(ValueError, match="assign target"):
+        bn(Tensor(randf(2, 3, 3, 3)))
+
+
+def test_batchnorm_rejects_a_single_value_per_channel():
+    with pytest.raises(ValueError, match="more than one value per channel"):
+        BatchNorm(4)(Tensor(randf(1, 4, 1, 1)))
+
+
+@pytest.mark.parametrize("backend", COMPILED)
+def test_batchnorm_compiled_backends(backend):
+    bn = BatchNorm(3)
+    x = Tensor(randf(2, 3, 3, 3))
+    check(backend.shared, bn(x))  # the train path, reduces and all, diffed against the numpy reference
+    realize(bn.running_mean, bn.running_var)
+    bn.training = False
+    check(backend.shared, bn(x))  # the eval path, which reads the committed stats across devices
 
 
 def test_named_parameters_names_the_path_it_walked():
