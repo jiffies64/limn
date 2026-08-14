@@ -144,6 +144,12 @@ class NumpyDevice(HostDevice):
                 result = srcs[0] * srcs[1]
             case Op.CMPLT:
                 result = (srcs[0] < srcs[1]).astype(NUMPY_DTYPES[node.dtype])
+            case Op.XOR:
+                result = srcs[0] ^ srcs[1]
+            case Op.SHL:  # uint32 views reinterpret the bits; casts would convert the values
+                result = (srcs[0].view(np.uint32) << srcs[1].view(np.uint32)).view(np.int32)
+            case Op.SHR:  # logical: numpy's signed >> repeats the sign bit instead
+                result = (srcs[0].view(np.uint32) >> srcs[1].view(np.uint32)).view(np.int32)
             case Op.WHERE:
                 result = np.where(srcs[0] != 0, srcs[1], srcs[2])
             case Op.SUM:  # the running total is wider than a half width; the astype below rounds it back

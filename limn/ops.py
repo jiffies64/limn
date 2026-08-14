@@ -79,6 +79,9 @@ class Op(Enum):
     ADD = auto()
     MUL = auto()
     CMPLT = auto()  # a < b as 0/1 in the src dtype; not differentiable
+    XOR = auto()  # bitwise xor; int32 only, not differentiable
+    SHL = auto()  # shift left; int32 only, not differentiable
+    SHR = auto()  # logical shift right: shifts in zeros, on the uint32 representation; int32 only
     # elementwise ternary
     WHERE = auto()  # (cond, a, b): a where cond != 0 else b
     # reduce; arg is a tuple of axes, reduced dims are kept as size 1

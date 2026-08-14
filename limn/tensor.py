@@ -325,6 +325,26 @@ class Tensor:
         a, b = broadcast_pair(self, other, "CMPLT")  # not differentiable: never gets an autograd record
         return Tensor.from_node(Node(Op.CMPLT, (a.node, b.node), a.dtype, a.shape))
 
+    def bitwise(self, other: Tensor | int, op: Op) -> Tensor:
+        """XOR, SHL and SHR: int32 only, never differentiable, so no autograd record."""
+        a, b = broadcast_pair(self, other, op.name)
+        if a.dtype is not int32:
+            raise ValueError(f"{op.name} needs int32, got {a.dtype}")
+        return Tensor.from_node(Node(op, (a.node, b.node), a.dtype, a.shape))
+
+    def __xor__(self, other: Tensor | int) -> Tensor:
+        return self.bitwise(other, Op.XOR)
+
+    def __lshift__(self, other: Tensor | int) -> Tensor:
+        """Shift left. The shift amount must be a constant in [0, 31]: C leaves larger ones undefined."""
+        return self.bitwise(other, Op.SHL)
+
+    def __rshift__(self, other: Tensor | int) -> Tensor:
+        """Logical shift right: shifts in zeros, on the uint32 representation, so a negative
+        value shifts to a positive one. The shift amount must be a constant in [0, 31]: C
+        leaves larger ones undefined."""
+        return self.bitwise(other, Op.SHR)
+
     def __gt__(self, other: Tensor | float | int) -> Tensor:
         return as_tensor(other, self) < self
 
