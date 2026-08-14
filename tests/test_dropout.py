@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 from conftest import COMPILED, check, randf
 
-from limn import Tensor
+from limn import Tensor, int32
+from limn.tensor import _threefry2x32
 
 # threefry2x32, R=20, from Random123's tests/kat_vectors: (counter, key) -> output, as uint32 words
 KAT_VECTORS = [
@@ -18,6 +19,30 @@ KAT_VECTORS = [
     ((0xFFFFFFFF, 0xFFFFFFFF), (0xFFFFFFFF, 0xFFFFFFFF), (0x1CB996FC, 0xBB002BE7)),
     ((0x243F6A88, 0x85A308D3), (0x13198A2E, 0x03707344), (0xC4923A9C, 0x483DF7A0)),
 ]
+
+
+def as_words(words: tuple[int, ...]) -> np.ndarray:
+    """The kat file spells its words in hex; int32 holds the same bits."""
+    return np.array(words, dtype=np.uint32).view(np.int32)
+
+
+def test_threefry_matches_the_random123_kat_vectors():
+    for counter, key, expected in KAT_VECTORS:
+        h0, h1 = _threefry2x32(
+            Tensor(as_words(counter[:1])), Tensor(as_words(counter[1:])), Tensor(as_words(key[:1])), Tensor(as_words(key[1:]))
+        )
+        np.testing.assert_array_equal(np.array([h0.item(), h1.item()], dtype=np.int32), as_words(expected))
+
+
+@pytest.mark.parametrize("backend", COMPILED)
+def test_threefry_is_bit_exact_on_compiled_backends(backend):
+    """The composed hash through every backend, diffed for equality: this is what stress-tests
+    the unsigned-wrapping templates, since threefry's additions overflow constantly."""
+    n = 4096
+    k0, k1 = Tensor(as_words((0x13198A2E,))), Tensor(as_words((0x03707344,)))
+    h0, h1 = _threefry2x32(Tensor.arange(n), Tensor.const(0, int32), k0, k1)
+    check(backend.shared, h0, exact=True)
+    check(backend.shared, h1, exact=True)
 
 
 def test_numpy_int32_addition_wraps():

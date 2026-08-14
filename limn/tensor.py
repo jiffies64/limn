@@ -690,6 +690,31 @@ def scatter_rows(values: Tensor, indices: Tensor, shape: tuple[int, ...]) -> Ten
     return Tensor.from_node(node, (values,), lambda g: (g.gather_rows(indices),))
 
 
+def _threefry2x32(c0: Tensor, c1: Tensor, k0: Tensor, k1: Tensor) -> tuple[Tensor, Tensor]:
+    """Threefry2x32-20, the Random123 counter-based hash: the counter (c0, c1) under the key
+    (k0, k1), as two int32 streams, all four inputs broadcasting against each other.
+
+    Twenty rounds in five groups of four: x0 += x1, x1 = rotl(x1, r) ^ x0, with r cycling
+    through (13, 15, 26, 6, 17, 29, 16, 24). After group r the key schedule injects:
+    x0 += ks[r mod 3], x1 += ks[(r + 1) mod 3] + r, where ks is (k0, k1, k0 ^ k1 ^ 0x1BD11BDA).
+    The rotation is (x << r) + (x >> (32 - r)): the two sides land on disjoint bits, so the
+    wrapping ADD is the OR a rotation wants, and every shift amount is a literal, which the
+    shift primitives require. The spec and the known-answer vectors live in Random123's
+    include/Random123/threefry.h and tests/kat_vectors.
+    """
+    ks = (k0, k1, k0 ^ k1 ^ Tensor.const(0x1BD11BDA, int32))
+    x0, x1 = c0 + ks[0], c1 + ks[1]
+    rotations = (13, 15, 26, 6, 17, 29, 16, 24)
+    for i in range(20):
+        r = rotations[i % 8]
+        x0 = x0 + x1
+        x1 = ((x1 << r) + (x1 >> (32 - r))) ^ x0
+        if i % 4 == 3:
+            inject = i // 4 + 1
+            x0, x1 = x0 + ks[inject % 3], x1 + ks[(inject + 1) % 3] + inject
+    return x0, x1
+
+
 def composed_attention(q: Tensor, k: Tensor, v: Tensor, *, causal: bool, scale: float, key_mask: Tensor | None = None) -> Tensor:
     """Attention from the primitives: what every device runs when no fused kernel is
     registered, and the form the fused kernel's grad_fn falls back to."""
