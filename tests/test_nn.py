@@ -7,10 +7,12 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from conftest import randf
+from conftest import COMPILED, check, randf
 
-from limn import Tensor, set_seed
-from limn.nn import Conv1d, Conv2d, Embedding, LayerNorm, Linear, named_parameters, parameters
+from limn import Tensor, realize, set_device, set_seed
+from limn.capture import capture
+from limn.nn import Conv1d, Conv2d, Dropout, Embedding, LayerNorm, Linear, named_parameters, parameters
+from limn.ops import Op
 
 BATCH, SEQ, VOCAB, DIM, HEADS, LAYERS = 2, 6, 19, 16, 4, 2
 
@@ -262,3 +264,104 @@ def test_parameters_walks_reference_cycles_once():
     solo = Cell(Linear(3, 2))
     solo.peer = solo
     assert len(parameters(solo)) == 2
+
+
+def test_dropout_statistics():
+    """About p of the elements zero, and the survivors are exactly x/(1-p)."""
+    set_seed(0)
+    d = Dropout(0.5)
+    x = Tensor(np.ones((200, 200), dtype=np.float32))
+    out = d(x)
+    realize(out, d.key)
+    kept = out.numpy() != 0
+    assert 0.49 < kept.mean() < 0.51
+    np.testing.assert_array_equal(out.numpy()[kept], np.full(kept.sum(), 2.0, dtype=np.float32))
+
+
+def test_dropout_backward_uses_the_forward_mask():
+    """Gradients are zero exactly where the mask dropped and 1/(1-p) where it kept.
+
+    The backward graph recomputes the mask from the key's buffer, so the key's assign must
+    commit in the same realize batch as the gradients; an assign committed earlier would
+    recompute a different mask and break this exact equality.
+    """
+    set_seed(0)
+    d = Dropout(0.5)
+    x = Tensor(np.arange(1, 25, dtype=np.float32).reshape(4, 6), requires_grad=True)
+    out = d(x)
+    out.sum().backward()
+    assert x.grad is not None
+    realize(x.grad, out, d.key)  # one batch: mask and gradient read pre-assign key bytes
+    kept = out.numpy() != 0
+    np.testing.assert_array_equal(x.grad.numpy(), np.where(kept, 2.0, 0.0).astype(np.float32))
+
+
+def test_dropout_key_advances_once_per_realized_step():
+    """Each realized step commits one step-word increment and a fresh mask, not each forward."""
+    set_seed(0)
+    d = Dropout(0.5)
+    x = Tensor(np.ones((64,), dtype=np.float32))
+    seed = int(d.key.numpy()[0])
+    masks = []
+    for step in range(3):
+        out = d(x)
+        realize(out, d.key)
+        key = d.key.numpy()
+        assert (int(key[0]), int(key[1])) == (seed, step + 1)
+        masks.append(out.numpy())
+    assert not np.array_equal(masks[0], masks[1])  # threefry: consecutive steps hash different masks
+
+
+def test_dropout_second_forward_before_realize_raises():
+    d = Dropout(0.5)
+    x = Tensor(np.ones((8,), dtype=np.float32))
+    d(x)
+    with pytest.raises(ValueError, match="realized buffer"):
+        d(x)  # the key's assign is still pending, like any unrealized assign target
+
+
+def test_dropout_eval_returns_x_untouched_and_leaves_the_key():
+    set_seed(0)
+    d = Dropout(0.5)
+    x = Tensor(randf(4, 5))
+    realize(d(x), d.key)
+    key = d.key.numpy().copy()
+    d.training = False
+    np.testing.assert_array_equal(d(x).numpy(), x.numpy())  # eval: x itself, not a scaled copy
+    assert d.key.node.op is Op.BUFFER  # eval queued no assign
+    np.testing.assert_array_equal(d.key.numpy(), key)
+
+
+def test_dropout_rejects_bad_probability():
+    with pytest.raises(ValueError, match="probability"):
+        Dropout(1.0)
+    with pytest.raises(ValueError, match="probability"):
+        Dropout(-0.1)
+
+
+@pytest.mark.parametrize("backend", COMPILED)
+def test_dropout_forward_on_compiled_backends(backend):
+    set_seed(0)
+    d = Dropout(0.5)
+    check(backend.shared, d(Tensor(randf(8, 12))))
+
+
+@pytest.mark.parametrize("backend", COMPILED)
+def test_captured_dropout_steps_replay_fresh_masks(backend):
+    """The payoff: a captured train step replays with fresh masks, which host-side dropout cannot do."""
+    set_device(backend.name)
+    set_seed(0)
+    d = Dropout(0.5)
+    x = Tensor(np.ones((64,), dtype=np.float32))
+
+    def step(batch: Tensor) -> Tensor:
+        out = d(batch)
+        realize(out, d.key)  # the key assign commits in the step's batch
+        return out
+
+    recorded = capture(step)
+    recorded(x)  # the first two calls observe and settle the recording
+    recorded(x)
+    first = recorded(x).numpy()  # replays read the key their predecessor's assign left
+    second = recorded(x).numpy()
+    assert not np.array_equal(first, second)

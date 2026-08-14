@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 from conftest import randf
 
-from limn import Tensor, float32, int32
+from limn import Tensor, float32, int16, int32
 from limn.ops import Op
+from limn.tensor import _threefry2x32
 
 
 def check(limn_out: Tensor, expected: np.ndarray) -> None:
@@ -58,6 +59,58 @@ def test_comparisons_and_where():
     check(Tensor(a).maximum(Tensor(b)), np.maximum(a, b))
     check(Tensor(a).minimum(0.0), np.minimum(a, 0))
     check(Tensor(a).relu(), np.maximum(a, 0))
+
+
+def test_bitwise_ops_match_numpy_uint32_semantics():
+    a = np.array([0, 1, -1, 2**30, -(2**31), 0x1234567], dtype=np.int32)
+    b = np.array([1, 3, 7, 5, 31, 13], dtype=np.int32)
+    check(Tensor(a) ^ Tensor(b), a ^ b)
+    check(Tensor(a) << Tensor(b), (a.view(np.uint32) << b.view(np.uint32)).view(np.int32))
+    check(Tensor(a) >> Tensor(b), (a.view(np.uint32) >> b.view(np.uint32)).view(np.int32))
+    check(Tensor(a) << 4, (a.view(np.uint32) << 4).view(np.int32))  # scalar counts, like rotl uses
+    check(Tensor(a) >> 9, (a.view(np.uint32) >> 9).view(np.int32))
+
+
+def test_bitwise_ops_are_int32_only():
+    f = Tensor(randf(2, 2))
+    with pytest.raises(ValueError, match="int32"):
+        _ = f ^ f
+    with pytest.raises(ValueError, match="int32"):
+        _ = f << 1
+    with pytest.raises(ValueError, match="int32"):
+        _ = f >> 1
+    with pytest.raises(ValueError, match="int32"):
+        _ = Tensor([1, 2], dtype=int16) ^ 1  # the narrow ints too: the ops speak uint32
+
+
+def test_int32_add_wraps_on_the_numpy_device():
+    top = Tensor(np.array([2**31 - 1], dtype=np.int32))
+    assert (top + 1).item() == -(2**31)  # the unsigned C ADD template owes this same wrap
+
+
+# threefry2x32, 20 rounds, straight from Random123's tests/kat_vectors: name, rounds, then
+# two counter words, two key words and the two output words, all hex.
+THREEFRY_KAT = [
+    (0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x6B200159, 0x99BA4EFE),
+    (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x1CB996FC, 0xBB002BE7),
+    (0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344, 0xC4923A9C, 0x483DF7A0),
+]
+
+
+def test_threefry2x32_known_answer_vectors():
+    """The published hash must land on Random123's kat_vectors: a wrong hash still looks random."""
+
+    def signed(word: int) -> int:  # kat_vectors spells words as hex; an int32 carries them signed
+        return int(np.uint32(word).view(np.int32))
+
+    for c0, c1, k0, k1, e0, e1 in THREEFRY_KAT:
+        x0, x1 = _threefry2x32(
+            Tensor.const(signed(c0), int32),
+            Tensor.const(signed(c1), int32),
+            Tensor.const(signed(k0), int32),
+            Tensor.const(signed(k1), int32),
+        )
+        assert (x0.item(), x1.item()) == (signed(e0), signed(e1))
 
 
 def test_reduces():

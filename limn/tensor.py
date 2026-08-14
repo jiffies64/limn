@@ -325,6 +325,26 @@ class Tensor:
         a, b = broadcast_pair(self, other, "CMPLT")  # not differentiable: never gets an autograd record
         return Tensor.from_node(Node(Op.CMPLT, (a.node, b.node), a.dtype, a.shape))
 
+    def __xor__(self, other: Tensor | float | int) -> Tensor:
+        a, b = broadcast_pair(self, other, "XOR")
+        if a.dtype != int32:
+            raise ValueError(f"XOR requires int32, got {a.dtype}")
+        return Tensor.from_node(Node(Op.XOR, (a.node, b.node), a.dtype, a.shape))  # no autograd record, like CMPLT
+
+    def __lshift__(self, other: Tensor | float | int) -> Tensor:
+        a, b = broadcast_pair(self, other, "SHL")
+        if a.dtype != int32:
+            raise ValueError(f"SHL requires int32, got {a.dtype}")
+        # shift amounts are C shift amounts: outside [0, 31] is undefined, so a caller owes a constant
+        return Tensor.from_node(Node(Op.SHL, (a.node, b.node), a.dtype, a.shape))
+
+    def __rshift__(self, other: Tensor | float | int) -> Tensor:
+        a, b = broadcast_pair(self, other, "SHR")
+        if a.dtype != int32:
+            raise ValueError(f"SHR requires int32, got {a.dtype}")
+        # logical: shifts in zeros on the uint32 representation, whatever the int32 sign
+        return Tensor.from_node(Node(Op.SHR, (a.node, b.node), a.dtype, a.shape))
+
     def __gt__(self, other: Tensor | float | int) -> Tensor:
         return as_tensor(other, self) < self
 
@@ -655,6 +675,29 @@ def realize(*tensors: Tensor) -> list[device.Buffer]:
         if realized(node).op is not Op.BUFFER:
             node.op, node.srcs, node.arg = Op.BUFFER, (), buf
     return buffers
+
+
+def _threefry2x32(x0: Tensor, x1: Tensor, k0: Tensor, k1: Tensor) -> tuple[Tensor, Tensor]:
+    """Two counter words through threefry2x32-20, Random123's 20-round keyed bijection, as int32 graphs.
+
+    Elementwise end to end, so scalar words hash one (counter, key) pair and shaped counters
+    hash once per element (nn.Dropout hashes its mask). int32 wraps at every step: XOR is
+    bit-exact, the shifts go through the uint32 representation, and the adds wrap modulo
+    2**32, which the C template's unsigned round trip owes them. The pre-keying, rotation
+    schedule and per-group key injection are Random123's, and test_ops.py holds the result
+    to the published kat_vectors.
+    """
+    ks = (k0, k1, k0 ^ k1 ^ Tensor.const(0x1BD11BDA, int32))  # the third key word: parity constant xor the two
+    x0, x1 = x0 + ks[0], x1 + ks[1]  # Random123 pre-keys the counters before any round
+    rotations = (13, 15, 26, 6, 17, 29, 16, 24)
+    for group in range(5):
+        for round_ in range(4):
+            x0 = x0 + x1
+            rotation = rotations[4 * (group % 2) + round_]
+            x1 = ((x1 << rotation) + (x1 >> (32 - rotation))) ^ x0  # rotl via +: the two sides hold disjoint bits
+        x0 = x0 + ks[(group + 1) % 3]  # key injection after each group of 4 rounds, as Random123 unrolls it
+        x1 = x1 + ks[(group + 2) % 3] + (group + 1)
+    return x0, x1
 
 
 def scatter_rows(values: Tensor, indices: Tensor, shape: tuple[int, ...]) -> Tensor:

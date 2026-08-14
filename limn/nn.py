@@ -10,7 +10,11 @@ from __future__ import annotations
 import itertools
 import math
 
-from limn.tensor import Tensor
+import numpy as np
+
+from limn import tensor
+from limn.ops import FLOATS, int32
+from limn.tensor import Tensor, _threefry2x32, no_grad
 
 
 class Linear:
@@ -34,6 +38,51 @@ class LayerNorm:
         centered = x - x.mean(axis=-1, keepdim=True)
         variance = (centered * centered).mean(axis=-1, keepdim=True)  # biased, like torch.nn.LayerNorm
         return centered / (variance + self.eps).sqrt() * self.weight + self.bias
+
+
+class Dropout:
+    """Zero each element with probability p, survivors scaled by 1/(1-p), like torch.nn.Dropout.
+
+    The mask is random inside the graph rather than drawn on the host: every element hashes
+    its flat index against the layer's key through threefry2x32-20, so the same layer never
+    repeats a mask within 2**32 realized steps, and two layers are independent because their
+    seed words differ. That is what a captured step needs: limn.capture replays a step's
+    kernels against fresh state buffers, so a mask recomputed from the key's buffer is fresh
+    on every replay, where a host-drawn mask would freeze at record time.
+
+    The layer owns its key and advances it by ASSIGN once per realized train step, and that
+    assign owes the transaction rule: it must realize in the same batch as this step's
+    gradients — Optimizer.step(loss, dropout.key), or realize(loss, dropout.key) — never an
+    earlier realize(loss) on its own. The mask is recomputed from the key's buffer wherever
+    the graph needs it, the backward pass included, so an assign that committed first would
+    recompute a different mask for the gradients and corrupt them silently. A second forward
+    before the realize raises, like any pending assign. Eval mode returns x untouched and
+    queues nothing; the training flag is a plain Python value, so a captured step freezes it
+    at record time.
+    """
+
+    def __init__(self, p: float = 0.5):
+        if not 0 <= p < 1:
+            raise ValueError(f"dropout probability must be in [0, 1), got {p}")
+        self.p = p
+        self.training = True
+        # one int32 seed word per layer, drawn from the host rng the session's set_seed controls
+        seed = tensor.rng.integers(np.iinfo(np.int32).min, np.iinfo(np.int32).max, endpoint=True, dtype=np.int32)
+        self.key = Tensor([seed, 0], dtype=int32)  # (seed word, step word)
+        self.step_increment = Tensor([0, 1], dtype=int32)  # the step word counts realized steps
+
+    def __call__(self, x: Tensor) -> Tensor:
+        if not self.training:
+            return x
+        if x.dtype not in FLOATS:
+            raise ValueError(f"Dropout needs a float input, got {x.dtype}")
+        counter = Tensor.arange(x.numel).reshape(*x.shape)  # the per-element counter word
+        x0, _ = _threefry2x32(counter, Tensor.const(0, int32), self.key[0], self.key[1])
+        uniform = (x0 >> 9).float() * 2.0**-23  # the top 23 bits as an exact float32 in [0, 1)
+        keep = (uniform >= self.p).cast(x.dtype)  # >= keeps u == p in, like torch, and leaves p=0 all-on
+        with no_grad():  # the key is bookkeeping, not part of the step's gradient
+            self.key.assign(self.key + self.step_increment)
+        return x * keep * (1 / (1 - self.p))
 
 
 def as_dims(value: int | tuple[int, ...], n: int, name: str) -> tuple[int, ...]:

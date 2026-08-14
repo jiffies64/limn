@@ -12,6 +12,7 @@ from conftest import COMPILED, GRAPHS, check, randf, read
 from limn import Tensor, device, set_device, set_seed
 from limn.nn import Linear, parameters
 from limn.optim import SGD, AdamW
+from limn.tensor import _threefry2x32
 
 pytestmark = pytest.mark.parametrize("backend", COMPILED)
 
@@ -32,6 +33,18 @@ def test_the_corpus_matches_the_numpy_device(backend, name):
 
 def test_matmul_4x5_5x3(backend):
     check(backend.shared, Tensor(randf(4, 5)) @ Tensor(randf(5, 3)))
+
+
+def test_threefry_matches_numpy_bit_for_bit(backend):
+    """The composed hash is exact on every compiled backend: unsigned shifts and wrapping adds."""
+    rng = np.random.default_rng(11)
+
+    def words() -> np.ndarray:
+        return rng.integers(-(2**31), 2**31, size=(3, 5), dtype=np.int32)
+
+    x0, x1 = _threefry2x32(Tensor(words()), Tensor(words()), Tensor(words()), Tensor(words()))
+    check(backend.shared, x0, exact=True)
+    check(backend.shared, x1, exact=True)
 
 
 def test_backward_pass(backend):

@@ -33,7 +33,7 @@ import numpy as np
 from limn.codegen import Instr, LoopNest, Opcode, Valid, loop_range, reduce_axes, split_masked
 from limn.device import NUMPY_DTYPES, Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
-from limn.ops import DType, FLOATS, HALF_FLOATS, Op, float32, float64, int8, int16, int32
+from limn.ops import DType, FLOATS, HALF_FLOATS, INTS, Op, float32, float64, int8, int16, int32
 
 C_TYPE = {float64: "double", float32: "float", int32: "int32_t", int16: "int16_t", int8: "int8_t"}
 
@@ -236,11 +236,16 @@ ARITH_C = {
     Op.ADD: "{0} + {1}",
     Op.MUL: "{0} * {1}",
     Op.CMPLT: "({t})({0} < {1})",
+    Op.XOR: "{0} ^ {1}",
+    Op.SHL: "({t})((unsigned int){0} << (unsigned int){1})",
+    Op.SHR: "({t})((unsigned int){0} >> (unsigned int){1})",
     Op.WHERE: "{0} != 0 ? {1} : {2}",
 }
 
 
 def arith_c(op: Op, srcs: list[str], dtype: DType, types: dict[DType, str]) -> str:
+    if op is Op.ADD and dtype in INTS:  # ints wrap like numpy; C's signed + overflows into undefined
+        return f"({types[dtype]})((unsigned int){srcs[0]} + (unsigned int){srcs[1]})"
     if op not in ARITH_C:
         raise NotImplementedError(f"no C lowering for {op}")
     return ARITH_C[op].format(*srcs, f="" if dtype == float64 else "f", t=types[dtype])

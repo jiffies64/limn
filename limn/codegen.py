@@ -42,7 +42,7 @@ from limn.view import View, canonical_strides
 if TYPE_CHECKING:
     from limn.tensor import Tensor
 
-ARITH_OPS = (Op.NEG, Op.EXP, Op.LOG, Op.SQRT, Op.RECIP, Op.ADD, Op.MUL, Op.CMPLT, Op.WHERE)
+ARITH_OPS = (Op.NEG, Op.EXP, Op.LOG, Op.SQRT, Op.RECIP, Op.ADD, Op.MUL, Op.CMPLT, Op.XOR, Op.SHL, Op.SHR, Op.WHERE)
 
 
 class Reduce(NamedTuple):
