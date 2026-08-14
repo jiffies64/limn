@@ -10,7 +10,11 @@ from __future__ import annotations
 import itertools
 import math
 
-from limn.tensor import Tensor
+import numpy as np
+
+from limn import tensor
+from limn.ops import FLOATS, float32, int32
+from limn.tensor import Tensor, _threefry2x32
 
 
 class Linear:
@@ -34,6 +38,45 @@ class LayerNorm:
         centered = x - x.mean(axis=-1, keepdim=True)
         variance = (centered * centered).mean(axis=-1, keepdim=True)  # biased, like torch.nn.LayerNorm
         return centered / (variance + self.eps).sqrt() * self.weight + self.bias
+
+
+class Dropout:
+    """Zero each element with probability p and scale the survivors by 1/(1-p), with the mask
+    built in the graph.
+
+    The mask is a Threefry2x32-20 hash of a per-element counter under the layer's key, so it
+    is a pure function of buffers: a captured step (limn.capture) replays it, and the replay
+    advances the key the way an eager step does. The key is (seed word, step word); the seed
+    word is drawn once from the host rng, so two layers hash under different keys, and each
+    train forward queues an ASSIGN that bumps the step word. The training flag is a plain
+    Python value, frozen at a capture's record time like every host value.
+
+    The assign must be realized in the same batch as the gradients — hand the key to
+    Optimizer.step, or realize it alongside them — because the backward graph recomputes the
+    mask from the key's buffer wherever it needs it. A key that commits before the gradients
+    are realized changes the mask under them: no error, just gradients for a different mask
+    than the forward used. Eval returns x untouched and queues nothing.
+    """
+
+    def __init__(self, p: float = 0.5):
+        if not 0 <= p < 1:
+            raise ValueError(f"dropout probability must be in [0, 1), got {p}")
+        self.p = p
+        self.key = Tensor(tensor.rng.integers(0, 2**32, size=2, dtype=np.uint32).view(np.int32))
+        self.training = True
+
+    def __call__(self, x: Tensor) -> Tensor:
+        if x.dtype not in FLOATS:
+            raise ValueError(f"dropout needs a float dtype, got {x.dtype}")
+        if not self.training or self.p == 0:
+            return x
+        h0, _ = _threefry2x32(Tensor.arange(x.numel), Tensor.const(0, int32), self.key[0], self.key[1])
+        # the top 23 bits become a uniform in [0, 1): int -> float32 is exact below 2**24
+        u = (h0 >> 9).cast(float32) * (2.0**-23)
+        keep = (u > self.p).cast(x.dtype)
+        out = x.reshape(-1) * keep * (1.0 / (1.0 - self.p))
+        self.key.assign(self.key + Tensor(np.array([0, 1], dtype=np.int32)))
+        return out.reshape(*x.shape)
 
 
 def as_dims(value: int | tuple[int, ...], n: int, name: str) -> tuple[int, ...]:
