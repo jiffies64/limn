@@ -328,7 +328,7 @@ class Tensor:
     def bitwise(self, other: Tensor | int, op: Op) -> Tensor:
         """XOR, SHL and SHR: int32 only, never differentiable, so no autograd record."""
         a, b = broadcast_pair(self, other, op.name)
-        if a.dtype is not int32:
+        if a.dtype != int32:
             raise ValueError(f"{op.name} needs int32, got {a.dtype}")
         return Tensor.from_node(Node(op, (a.node, b.node), a.dtype, a.shape))
 

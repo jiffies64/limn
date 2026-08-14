@@ -141,10 +141,18 @@ def test_dropout_eval_leaves_the_key_bit_identical():
 
 
 def test_two_dropout_layers_get_independent_streams():
+    """Per-layer keys: seeds drawn apart at construction, masks apart in use, and a step with
+    both layers queues two assigns that one realize batch commits — the assign-chaining error
+    a shared global key would hit."""
     a, b = Dropout(0.5), Dropout(0.5)
-    assert not np.array_equal(a.key.numpy(), b.key.numpy())  # seeds drawn separately at construction
+    ka, kb = a.key.numpy().copy(), b.key.numpy().copy()
+    assert not np.array_equal(ka, kb)
     x = Tensor(np.ones((16, 16), dtype=np.float32))
-    assert not np.array_equal(a(x).numpy() == 0, b(x).numpy() == 0)
+    ya, yb = a(x), b(x)
+    realize(ya, yb, a.key, b.key)
+    assert not np.array_equal(ya.numpy() == 0, yb.numpy() == 0)
+    np.testing.assert_array_equal(a.key.numpy(), ka + np.array([0, 1], dtype=np.int32))
+    np.testing.assert_array_equal(b.key.numpy(), kb + np.array([0, 1], dtype=np.int32))
 
 
 def test_dropout_rejects_bad_probability_and_dtype():
@@ -172,8 +180,11 @@ def test_a_captured_step_replays_advance_the_mask(backend):
     drop = Dropout(0.5)
     w = Tensor(randf(8, 8), requires_grad=True)
     opt = SGD([w], lr=0.01)
+    ran = 0
 
     def step(x: Tensor) -> tuple[Tensor, Tensor]:
+        nonlocal ran
+        ran += 1
         y = drop(x @ w)
         loss = (y * y).sum()
         loss.backward()
@@ -187,4 +198,5 @@ def test_a_captured_step_replays_advance_the_mask(backend):
     captured(x)  # second runs and is recorded
     _, y1 = captured(x)  # every later call is a replay
     _, y2 = captured(x)
+    assert ran == 2  # the last two calls skipped the function: their masks came from replays
     assert not np.array_equal(y1.numpy() == 0, y2.numpy() == 0)
