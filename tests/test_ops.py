@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from conftest import randf
+from conftest import EDGES, comparisons, ieee, randf
 
 from limn import Tensor, float32, int32
 from limn.ops import Op
@@ -58,6 +58,24 @@ def test_comparisons_and_where():
     check(Tensor(a).maximum(Tensor(b)), np.maximum(a, b))
     check(Tensor(a).minimum(0.0), np.minimum(a, 0))
     check(Tensor(a).relu(), np.maximum(a, 0))
+
+
+def test_comparisons_follow_ieee_at_nan_and_the_infinities():
+    """CMPLT is 0 for a NaN either way round, and the ops composed from it used to read that as an
+    ordinary answer: NaN <= 1 came out true, relu(NaN) came out 0. The reference device composes
+    the same way, so the oracle has to be numpy's own IEEE comparisons."""
+    x, y = EDGES.reshape(7, 1), EDGES.reshape(1, 7)
+    expected = ieee(x, y)
+    for name, got in comparisons(Tensor(x), Tensor(y)).items():
+        np.testing.assert_array_equal(got.numpy(), expected[name], err_msg=name)
+
+
+def test_relu_keeps_a_zero_gradient_at_zero():
+    """The NaN guard must not move relu's subgradient at 0, which torch puts at 0."""
+    x = Tensor(np.array([-1.0, -0.0, 0.0, 2.0], dtype=np.float32), requires_grad=True)
+    x.relu().sum().backward()
+    assert x.grad is not None
+    np.testing.assert_array_equal(x.grad.numpy(), [0.0, 0.0, 0.0, 1.0])
 
 
 def test_reduces():

@@ -7,7 +7,7 @@ cuda's tiles, pool and atomics in test_backend_cuda.py.
 
 import numpy as np
 import pytest
-from conftest import COMPILED, GRAPHS, check, randf, read
+from conftest import COMPILED, EDGES, GRAPHS, check, comparisons, ieee, randf, read
 
 from limn import Tensor, device, set_device, set_seed
 from limn.nn import Linear, parameters
@@ -28,6 +28,14 @@ def on_backend(backend):
 def test_the_corpus_matches_the_numpy_device(backend, name):
     a, b = Tensor(randf(3, 4)), Tensor(randf(3, 4))
     check(backend.shared, GRAPHS[name](a, b))
+
+
+def test_comparisons_follow_ieee_at_nan_and_the_infinities(backend):
+    """The compiled rendering of the NaN-guarded compositions, against numpy's IEEE answers."""
+    x, y = EDGES.reshape(7, 1), EDGES.reshape(1, 7)
+    expected = ieee(x, y)
+    for name, t in comparisons(Tensor(x), Tensor(y)).items():
+        np.testing.assert_array_equal(read(backend.shared, backend.shared.execute([t.node])[0], t), expected[name], err_msg=name)
 
 
 def test_matmul_4x5_5x3(backend):

@@ -91,3 +91,31 @@ GRAPHS = {
     "movement then reduce": lambda a, b: (a.transpose() * 2.0).sum(axis=0),
     "reduce then elementwise": lambda a, b: (a.sum(axis=1, keepdim=True) * b).relu(),
 }
+
+
+EDGES = np.array([np.nan, -np.inf, -1.0, -0.0, 0.0, 2.0, np.inf], dtype=np.float32)
+
+
+def comparisons(x: Tensor, y: Tensor) -> dict[str, Tensor]:
+    """Every composed op a NaN can reach through CMPLT, over x and y broadcast to all pairs."""
+    return {
+        "<=": x <= y,
+        ">=": x >= y,
+        "eq": x.eq(y),
+        "maximum": x.maximum(y),
+        "minimum": x.minimum(y),
+        "relu": x.relu(),
+    }
+
+
+def ieee(x: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray]:
+    """What numpy answers for the same pairs: a NaN orders against nothing and wins every maximum."""
+    with np.errstate(invalid="ignore"):
+        return {
+            "<=": (x <= y).astype(np.float32),
+            ">=": (x >= y).astype(np.float32),
+            "eq": (x == y).astype(np.float32),
+            "maximum": np.maximum(x, y),
+            "minimum": np.minimum(x, y),
+            "relu": np.maximum(x, 0),
+        }
