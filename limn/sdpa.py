@@ -254,9 +254,10 @@ def _worst(got: np.ndarray, want: np.ndarray) -> float:
     A gradient of q scaled by 100 is itself scaled by 100, and holding it to the absolute
     tolerance an order-1 output meets would be asking float32 for digits it does not have.
     Dividing by the answer's own magnitude (never sharpening below 1) puts every case on the
-    one tolerance.
+    one tolerance. A NaN is infinitely far: it compares false against everything, so left as
+    NaN it would lose every "is this worse" and pass.
     """
-    return float(np.abs(got - want).max() / max(1.0, float(np.abs(want).max())))
+    return float(np.nan_to_num(np.abs(got - want), nan=np.inf).max() / max(1.0, float(np.abs(want).max())))
 
 
 def check() -> None:
