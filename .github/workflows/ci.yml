@@ -14,7 +14,8 @@ jobs:
         with:
           python-version: "3.13"
           enable-cache: true
-      - run: uv sync --frozen
+      # NVRTC as a wheel: no GPU here, but test_cuda_emit.py compiles every kernel form through it
+      - run: uv sync --frozen --extra cuda
       - run: uv run ruff check limn tests
       - run: uv run ruff format --check limn tests
       # pinned: an unpinned pyright can turn a green tree red on a release we did not make

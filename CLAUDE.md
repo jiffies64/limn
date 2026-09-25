@@ -18,7 +18,9 @@ suite. Merge branches into main by rebasing, never with a merge commit.
 
 The `c` device needs `cc` on PATH; the `cuda` device needs an NVIDIA driver plus NVRTC, from a
 toolkit or from `uv sync --extra cuda`. Tests that need either are skipped without them, so a
-green run on a machine with neither proves less than it looks.
+green run on a machine with neither proves less than it looks. NVRTC alone, with no driver, is
+enough for test_cuda_emit.py to compile every kernel form, which is how CI catches a broken
+CUDA emitter without a GPU.
 
 ## Invariants
 
