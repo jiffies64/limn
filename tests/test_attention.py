@@ -1,6 +1,6 @@
-"""Attention: the CUSTOM seam. The forward diffs against the composed form on the numpy
-device, the backward against the composed form and torch, and a device that registers no
-kernel gets the composed form back."""
+"""Attention: the CUSTOM seam. The numpy kernels check themselves against plain softmax, the
+forward diffs against the composed form on the numpy device, the backward against the composed
+form and torch, and a device that registers no kernel gets the composed form back."""
 
 import gc
 import weakref
@@ -33,6 +33,11 @@ CASES = [
     ((2, 40, 60, 8), (2, 40, 60, 8), (2, 40, 60, 8), False),
     ((1, 3, 16, 8), (4, 3, 16, 8), (4, 1, 16, 12), True),
 ]
+
+
+def test_the_numpy_kernels_check_themselves():
+    """sdpa.check, the reference every fused kernel is diffed against; -s prints its table."""
+    sdpa.check()
 
 
 def test_the_self_check_fails_a_forward_that_answers_nan(monkeypatch):
