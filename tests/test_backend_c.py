@@ -13,8 +13,7 @@ import numpy as np
 import pytest
 from conftest import GRAPHS, cdev, check, randf, read
 
-import limn.backend_c as backend_c
-from limn import Tensor, set_seed
+from limn import Tensor, backend_c, set_seed
 from limn.backend_c import PARALLEL_MIN, CDevice, emit_c, has_cc, openmp, team_size
 from limn.codegen import lower_all
 from limn.nn import Conv2d

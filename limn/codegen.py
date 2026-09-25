@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from limn.ops import DType, FLOATS, INTS, Node, Op
+from limn.ops import FLOATS, INTS, DType, Node, Op
 from limn.schedule import Kernel, addressed, realized, schedule
 from limn.view import View, canonical_strides
 
@@ -396,7 +396,7 @@ def cut(body: Sequence[Instr], var: str, lo: int, hi: int) -> list[tuple[int, in
     edges = {lo, hi}
     edges |= {edge for instr in body for v, blo, bhi, _ in mask_of(instr).bounds if v == var for edge in (blo, bhi)}
     ordered = sorted(edge for edge in edges if lo <= edge <= hi)
-    return list(zip(ordered, ordered[1:]))
+    return list(itertools.pairwise(ordered))
 
 
 def split_innermost(loop: Instr, body: Sequence[Instr], endloop: Instr) -> list[Instr]:

@@ -33,7 +33,7 @@ import numpy as np
 from limn.codegen import Instr, LoopNest, Opcode, Valid, loop_range, reduce_axes, split_masked
 from limn.device import NUMPY_DTYPES, Buffer, HostDevice
 from limn.jit import CompiledDevice, Runner
-from limn.ops import DType, FLOATS, HALF_FLOATS, Op, float32, float64, int8, int16, int32
+from limn.ops import FLOATS, HALF_FLOATS, DType, Op, float32, float64, int8, int16, int32
 
 C_TYPE = {float64: "double", float32: "float", int32: "int32_t", int16: "int16_t", int8: "int8_t"}
 
@@ -68,7 +68,7 @@ def cc_builds(flags: tuple[str, ...], source: str = "") -> bool:
         src = Path(tmp) / "probe.c"
         src.write_text(source)
         probe = ["cc", *flags, "-shared", "-fPIC", "-o", str(Path(tmp) / "probe.so"), str(src)]
-        return subprocess.run(probe, capture_output=True, text=True).returncode == 0
+        return subprocess.run(probe, capture_output=True, text=True, check=False).returncode == 0
 
 
 @functools.cache
@@ -185,7 +185,7 @@ def parallel_loops(nest: LoopNest, instrs: Sequence[Instr]) -> dict[int, int]:
     return teams
 
 
-def c_literal(value: float | int, dtype: DType) -> str:
+def c_literal(value: float, dtype: DType) -> str:
     """A scalar as a C literal of this dtype, including the awkward ones (infinities, NAN, int min).
 
     A half-width literal is the float it rounds to: backends compute in float, so this costs nothing.
@@ -360,6 +360,7 @@ def compile_c(source: str) -> ctypes.CDLL:
         ["cc", *cc_flags(), "-shared", "-fPIC", "-o", str(lib_path), str(src_path), "-lm"],
         capture_output=True,
         text=True,
+        check=False,
     )
     src_path.unlink()
     if result.returncode != 0:

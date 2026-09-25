@@ -22,8 +22,22 @@ from typing import SupportsIndex
 import numpy as np
 
 from limn import device, sdpa
-from limn.ops import DTYPES, FLOATS, DType, Node, Op, accumulate_in, bfloat16, custom, float16, float32, float64, int32
-from limn.ops import promote, topological
+from limn.ops import (
+    DTYPES,
+    FLOATS,
+    DType,
+    Node,
+    Op,
+    accumulate_in,
+    bfloat16,
+    custom,
+    float16,
+    float32,
+    float64,
+    int32,
+    promote,
+    topological,
+)
 from limn.schedule import CUT_OPS, realized
 from limn.view import View
 
@@ -51,7 +65,7 @@ type Index = SupportsIndex | slice | EllipsisType | Tensor | None
 
 
 class Tensor:
-    def __init__(self, data: np.ndarray | list | float | int, dtype: DType | None = None, requires_grad: bool = False):
+    def __init__(self, data: np.ndarray | list | float, dtype: DType | None = None, requires_grad: bool = False):
         array = np.asarray(data)
         if dtype is None:
             dtype = int32 if array.dtype.kind in "iub" else float32
@@ -83,14 +97,14 @@ class Tensor:
         return t
 
     @staticmethod
-    def const(value: float | int, dtype: DType) -> Tensor:
+    def const(value: float, dtype: DType) -> Tensor:
         """A scalar CONST node: lives in the graph, no buffer behind it."""
         return Tensor.from_node(Node(Op.CONST, (), dtype, (), value))
 
     # ---- creation helpers (host-side numpy, loaded as buffers) ----
 
     @staticmethod
-    def full(shape: Sequence[int], value: float | int, dtype: DType = float32, requires_grad: bool = False) -> Tensor:
+    def full(shape: Sequence[int], value: float, dtype: DType = float32, requires_grad: bool = False) -> Tensor:
         return Tensor(np.full(shape, value), dtype=dtype, requires_grad=requires_grad)
 
     @staticmethod
@@ -784,7 +798,7 @@ def canon_axes(axis: int | Sequence[int] | None, ndim: int) -> tuple[int, ...]:
     return wrapped
 
 
-def as_tensor(x: Tensor | float | int, like: Tensor) -> Tensor:
+def as_tensor(x: Tensor | float, like: Tensor) -> Tensor:
     if isinstance(x, Tensor):
         return x
     # a python scalar takes the tensor's dtype rather than widening it; only a float scalar
@@ -830,7 +844,7 @@ def broadcast_to(t: Tensor, shape: tuple[int, ...], opname: str) -> Tensor:
     return lifted.expand(*shape)
 
 
-def broadcast_pair(a: Tensor, b: Tensor | float | int, opname: str) -> tuple[Tensor, Tensor]:
+def broadcast_pair(a: Tensor, b: Tensor | float, opname: str) -> tuple[Tensor, Tensor]:
     b = as_tensor(b, a)
     if a.dtype != b.dtype:
         wider = promote(a.dtype, b.dtype)
