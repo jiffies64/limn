@@ -9,16 +9,17 @@ natively, seven digits tighter. int8 and int16 are exact storage whose arithmeti
 table below; the tests it feeds are shared.
 """
 
+from collections.abc import Callable
 from functools import partial
-from typing import Any, Callable, NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 import pytest
-from conftest import BACKENDS, GRAPHS, check, cdev, cudev, needs_cc, needs_cuda, randf
+from conftest import BACKENDS, GRAPHS, cdev, check, cudev, needs_cc, needs_cuda, randf
 
 from limn import Tensor, set_device
 from limn.device import NUMPY_DTYPES
-from limn.ops import DType, INTS, bfloat16, float16, float32, float64, int8, int16, int32, promote
+from limn.ops import INTS, DType, bfloat16, float16, float32, float64, int8, int16, int32, promote
 from limn.optim import AdamW
 from limn.tensor import scatter_rows
 

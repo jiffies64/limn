@@ -1,6 +1,6 @@
-"""Attention: the CUSTOM seam. The forward diffs against the composed form on the numpy
-device, the backward against the composed form and torch, and a device that registers no
-kernel gets the composed form back."""
+"""Attention: the CUSTOM seam. The numpy kernels check themselves against plain softmax, the
+forward diffs against the composed form on the numpy device, the backward against the composed
+form and torch, and a device that registers no kernel gets the composed form back."""
 
 import gc
 import weakref
@@ -11,10 +11,9 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-
 from conftest import COMPILED, check, cudev, needs_cc, needs_cuda
 
-from limn import Tensor, grad, realize, set_device, set_seed
+from limn import Tensor, grad, realize, sdpa, set_device, set_seed
 from limn.nn import Linear, parameters
 from limn.ops import Custom, DType, Op, bfloat16, float16, float32, topological
 from limn.optim import AdamW
@@ -34,6 +33,20 @@ CASES = [
     ((2, 40, 60, 8), (2, 40, 60, 8), (2, 40, 60, 8), False),
     ((1, 3, 16, 8), (4, 3, 16, 8), (4, 1, 16, 12), True),
 ]
+
+
+def test_the_numpy_kernels_check_themselves():
+    """sdpa.check, the reference every fused kernel is diffed against; -s prints its table."""
+    sdpa.check()
+
+
+def test_the_self_check_fails_a_forward_that_answers_nan(monkeypatch):
+    """A NaN compares false against the worst diff so far, so unless it counts as infinitely far
+    it never becomes the worst, and an all-NaN forward reads as a perfect one."""
+    forward = sdpa.sdpa
+    monkeypatch.setattr(sdpa, "sdpa", lambda *args, **kwargs: tuple(np.full_like(x, np.nan) for x in forward(*args, **kwargs)))
+    with pytest.raises(AssertionError, match="max diff inf"):
+        sdpa.check()
 
 
 def test_forward_matches_composed():

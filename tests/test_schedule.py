@@ -514,7 +514,7 @@ def test_scatter_runs_over_the_values_not_the_table():
     indices = Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32))
     (table.gather_rows(indices) * Tensor(randf(2, 3, 4))).sum().backward()
     assert table.grad is not None
-    nest = [n for n in lower_all([table.grad.node]) if n.kernel.ast.op is Op.SCATTER][0]
+    nest = next(n for n in lower_all([table.grad.node]) if n.kernel.ast.op is Op.SCATTER)
     assert nest.space == (2, 3, 4)  # the incoming gradient's shape, not the (6, 4) table's
     assert nest.kernel.target.shape == (6, 4)
     assert sum(1 for i in nest.instrs if i.opcode is Opcode.STORE) == 0  # the scatter is the write

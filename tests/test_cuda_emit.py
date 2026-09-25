@@ -1,17 +1,25 @@
-"""CUDA emission: which kernel shape a nest gets, and that the shape it gets is self-consistent.
+"""CUDA emission: which kernel shape a nest gets, that the shape it gets is self-consistent, and
+that NVRTC accepts what comes out.
 
-Emission is pure text, so none of this needs a GPU, a driver, or NVRTC. That is the point: the
-tiling decision has invariants a machine without a card can still hold it to. What those kernels
-compute is checked separately, against the numpy device, in test_backend_cuda.py.
+Emission is pure text, so none of this needs a GPU or a driver. That is the point: the tiling
+decision has invariants a machine without a card can still hold it to, and NVRTC compiles to
+PTX without one too, so CI installs it (uv sync --extra cuda) and a broken emitter fails there
+instead of on the next GPU run. What those kernels compute is checked separately, against the
+numpy device, in test_backend_cuda.py.
 """
 
 import re
 
+import numpy as np
 import pytest
 
 from limn import Tensor
+from limn.backend_cuda import nvrtc, pick_arch, ptx
 from limn.codegen import LoopNest, lower_all
-from limn.cuda_emit import BLOCK, TILE_K, emit_one, split_partials, stages_whole, tile_count, tiled
+from limn.cuda_emit import BLOCK, SDPA_KERNELS, TILE_K, emit_cuda, emit_one, split_partials, stages_whole, tile_count, tiled
+from limn.ops import DTYPES, FLOATS, DType, Op, float32, float64, int32
+from limn.schedule import schedule
+from limn.tensor import scatter_rows
 
 
 def matmul_nest(m: int, k: int, n: int, transposed: bool = False) -> LoopNest:
@@ -102,3 +110,67 @@ def test_a_split_reduce_beats_a_tile_where_both_would_take_the_nest():
     nest = matmul_nest(32, 8192, 32, transposed=True)
     assert split_partials(nest) and tiled(nest) is not None
     assert "_part" in emit_one(nest)
+
+
+# ---- NVRTC: every kernel form, at every dtype, has to compile ----
+
+SCATTERS = (float32, float64, int32)  # the dtypes atomicAdd has an overload for that NVRTC can reach
+
+
+def workload(dtype: DType) -> list[Tensor]:
+    """A graph per kernel form at this dtype: elementwise, casts, reduces, the split reduce and the
+    tiled matmul, then the atomic scatter where the device has one, and for a float, fused
+    attention and the gradients of everything. The tensors are zeros because nothing here runs."""
+    leaves: list[Tensor] = []
+
+    def t(*shape: int) -> Tensor:
+        leaves.append(Tensor.zeros(shape, dtype, requires_grad=dtype in FLOATS))
+        return leaves[-1]
+
+    a, b, long = t(3, 4), t(3, 4), t(1 << 18)
+    outs = [
+        (a + b) * 2 - a,
+        (a < b).where(a, b).relu(),
+        (a * b).max(axis=0, keepdim=True),
+        (a.transpose() * 2).sum(axis=0),
+        a.pad(((1, 1), (0, 2))).sum(axis=1),
+        a.cast(float32),
+        Tensor.zeros((3, 4)).cast(dtype),
+        t(2048, 192).sum(-1),  # four-wide loads down the reduce
+        long.sum(),
+        long.max(),
+        long.pad(((3, 5),)).sum(),
+        t(129, 40) @ t(40, 65),
+        t(129, 40) @ t(65, 40).transpose(),
+        t(4, 64, 64) @ t(4, 64, 128),
+        (t(128, 64) * 2) @ (t(64, 128) + 1),
+    ]
+    if dtype in SCATTERS:
+        outs.append(scatter_rows(t(2, 3, 4), Tensor(np.array([[5, 1, 1], [0, 3, 5]], dtype=np.int32)), (6, 4)))
+    if dtype in FLOATS:
+        outs += [a / (b * b + 0.5), (a * a + 1.0).log().exp().sqrt(), (a + b).softmax(axis=1), (a * b).log_softmax(axis=0)]
+        q, k, v = t(2, 64, 16), t(2, 64, 16), t(2, 64, 24)
+        outs += [q.attention(k, v, causal=True), q.attention(k, v, key_mask=Tensor.ones((2, 64), dtype))]
+        sum((out.cast(float32).sum() for out in outs), Tensor.zeros(())).backward()
+        outs += [leaf.grad for leaf in leaves if leaf.grad is not None]
+    return outs
+
+
+def sources(outs: list[Tensor]) -> set[str]:
+    """What the cuda device hands NVRTC for these tensors: the lowered nests as one batch, as
+    runners() compiles them, and each fused-attention kernel on its own."""
+    sinks = [out.node for out in outs]
+    kernels = schedule(sinks)
+    custom = {SDPA_KERNELS[kernel.ast.arg.name][0](kernel.ast) for kernel in kernels if kernel.ast.op is Op.CUSTOM}
+    return custom | {emit_cuda(lower_all(sinks, kernels=kernels))}
+
+
+@pytest.mark.skipif(nvrtc() is None, reason="no NVRTC found (uv sync --extra cuda)")
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+def test_every_kernel_form_compiles(dtype):
+    """At the oldest architecture this NVRTC has, where pick_arch puts a device older than all of
+    them, and where an instruction only newer cards have would go missing."""
+    nv = nvrtc()
+    assert nv is not None
+    for source in sources(workload(dtype)):
+        ptx(source, pick_arch(0, nv))

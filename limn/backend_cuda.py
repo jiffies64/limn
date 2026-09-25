@@ -86,21 +86,21 @@ NVRTC = {
     "nvrtcGetPTXSize": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)],
     "nvrtcGetPTX": [ctypes.c_void_p, ctypes.c_char_p],
     "nvrtcDestroyProgram": [ctypes.POINTER(ctypes.c_void_p)],
-}
-
-
-# present only in NVRTC >= 11.2; bound when the library has them, and pick_arch copes when not
-NVRTC_OPTIONAL = {
     "nvrtcGetNumSupportedArchs": [ctypes.POINTER(ctypes.c_int)],
     "nvrtcGetSupportedArchs": [ctypes.POINTER(ctypes.c_int)],
 }
+
+# present only in NVRTC >= 11.2; bound when the library has them, and pick_arch copes when not
+NVRTC_OPTIONAL = frozenset({"nvrtcGetNumSupportedArchs", "nvrtcGetSupportedArchs"})
 
 
 class Lib:
     """Bound functions of one shared library; every call returns a status int checked by check()."""
 
-    def __init__(self, lib: ctypes.CDLL, signatures: dict[str, list], versioned: frozenset[str], optional: dict[str, list] = {}):
-        for name, argtypes in (signatures | optional).items():
+    def __init__(
+        self, lib: ctypes.CDLL, signatures: dict[str, list], versioned: frozenset[str], optional: frozenset[str] = frozenset()
+    ):
+        for name, argtypes in signatures.items():
             fn = None
             for candidate in (name + "_v2", name) if name in versioned else (name,):
                 try:
@@ -121,7 +121,7 @@ class Lib:
 
 
 def _load(
-    paths: list[str | None], signatures: dict[str, list], versioned: frozenset[str], optional: dict[str, list] = {}
+    paths: list[str | None], signatures: dict[str, list], versioned: frozenset[str], optional: frozenset[str] = frozenset()
 ) -> Lib | None:
     for path in paths:
         if not path:
@@ -188,13 +188,11 @@ def has_cuda() -> bool:
 cache: dict[str, dict[str, ctypes.c_void_p]] = {}
 
 
-def compile_cuda(source: str, arch: int, kernel_names: list[str]) -> dict[str, ctypes.c_void_p]:
-    """PTX-compile this source for the arch and resolve the named kernels to function handles."""
-    key = hashlib.sha256(f"compute_{arch}:{source}".encode()).hexdigest()
-    if key in cache:
-        return cache[key]
-    api, nv = driver(), nvrtc()
-    assert api is not None and nv is not None
+def ptx(source: str, arch: int) -> ctypes.Array[ctypes.c_char]:
+    """NVRTC's PTX for this source at the arch. It needs no driver and no GPU, which is what
+    lets a machine without a card compile every kernel shape the emitter has."""
+    nv = nvrtc()
+    assert nv is not None
     prog = ctypes.c_void_p()
     if nv.nvrtcCreateProgram(ctypes.byref(prog), source.encode(), b"limn.cu", 0, None, None) != 0:
         raise RuntimeError("nvrtc: could not create a program")
@@ -209,12 +207,22 @@ def compile_cuda(source: str, arch: int, kernel_names: list[str]) -> dict[str, c
         raise RuntimeError(f"nvrtc failed:\n{log.value.decode()}")
     size = ctypes.c_size_t()
     nv.nvrtcGetPTXSize(prog, ctypes.byref(size))
-    ptx = ctypes.create_string_buffer(size.value)
-    nv.nvrtcGetPTX(prog, ptx)
+    out = ctypes.create_string_buffer(size.value)
+    nv.nvrtcGetPTX(prog, out)
     nv.nvrtcDestroyProgram(ctypes.byref(prog))
+    return out
 
+
+def compile_cuda(source: str, arch: int, kernel_names: list[str]) -> dict[str, ctypes.c_void_p]:
+    """PTX-compile this source for the arch and resolve the named kernels to function handles."""
+    key = hashlib.sha256(f"compute_{arch}:{source}".encode()).hexdigest()
+    if key in cache:
+        return cache[key]
+    api = driver()
+    assert api is not None
     module = ctypes.c_void_p()
-    check(api.cuModuleLoadData(ctypes.byref(module), ptx), "loading PTX (a driver older than the toolkit cannot JIT its PTX)")
+    loaded = api.cuModuleLoadData(ctypes.byref(module), ptx(source, arch))
+    check(loaded, "loading PTX (a driver older than the toolkit cannot JIT its PTX)")
     functions: dict[str, ctypes.c_void_p] = {}
     for name in kernel_names:
         fn = ctypes.c_void_p()
@@ -236,7 +244,7 @@ class CudaBuffer:
     trim() gives it back, and allocation failure trims and retries before giving up.
     """
 
-    __slots__ = ("ptr", "nbytes", "pool")
+    __slots__ = ("nbytes", "pool", "ptr")
 
     def __init__(self, ptr: int, nbytes: int, pool: dict[int, list[int]]):
         self.ptr = ptr
@@ -246,7 +254,7 @@ class CudaBuffer:
     def __del__(self) -> None:
         try:
             self.pool.setdefault(self.nbytes, []).append(self.ptr)
-        except Exception:  # interpreter teardown can have unloaded anything by now
+        except Exception:  # noqa: BLE001, S110 -- interpreter teardown can have unloaded anything by now
             pass
 
 

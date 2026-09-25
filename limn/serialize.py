@@ -57,8 +57,7 @@ def save_file(tensors: Mapping[str, Tensor], path: str | Path, metadata: Mapping
     with open(path, "wb") as f:
         f.write(len(blob).to_bytes(8, "little"))
         f.write(blob)
-        for array in arrays.values():
-            f.write(array.tobytes())
+        f.writelines(array.tobytes() for array in arrays.values())
 
 
 def load_file(path: str | Path) -> dict[str, Tensor]:

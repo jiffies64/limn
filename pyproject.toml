@@ -35,6 +35,10 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 130
 
+[tool.ruff.lint]
+# an input limn does not take is a ValueError whatever made it wrong, its type included; callers match on that
+ignore = ["TRY004"]
+
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
