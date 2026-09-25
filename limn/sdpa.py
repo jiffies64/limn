@@ -25,9 +25,10 @@ share p, and splitting them would recompute it. The other input both passes need
 D_i = sum_d dO_id * O_id, the row dot of the output and its gradient, which is ordinary
 elementwise work the caller supplies.
 
-Running it as a script checks the recurrence against plain softmax and the two backward passes
-against a textbook one that does materialize the t_q by t_k; the registry the numpy device
-uses is KERNELS at the bottom.
+check() holds the recurrence to plain softmax and the two backward passes to a textbook one
+that does materialize the t_q by t_k, and test_attention.py runs it. It is not a script on
+purpose: the package already imports this module, so `python -m` would run a second copy of it
+and warn. The registry the numpy device uses is KERNELS at the bottom.
 """
 
 from __future__ import annotations
@@ -317,7 +318,3 @@ def check() -> None:
         verdict = "ok " if worst <= tol else "FAIL"
         print(f"{verdict} {name:36s} blocks 1,16,{ck.shape[-2]},{ck.shape[-2] + 7}  max diff {worst:.2e} (at {worst_block})")
         assert worst <= tol, f"{name}: max diff {worst:.2e} exceeds {tol:g}"
-
-
-if __name__ == "__main__":
-    check()

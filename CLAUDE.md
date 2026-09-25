@@ -8,7 +8,7 @@ uv run pytest -k "attention and cuda"          # one slice of it
 uv run ruff format limn tests examples         # run on every file you touch
 uv run ruff check limn tests examples
 uv run pyright                                 # bare: CI type-checks the whole tree, examples too
-uv run python -m limn.sdpa                     # the fused-attention reference checks itself
+uv run pytest -s -k check_themselves           # the fused-attention reference checks itself
 uv run python examples/bench_attention.py      # fused against composed, forward and backward
 ```
 
