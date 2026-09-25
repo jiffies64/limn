@@ -329,14 +329,18 @@ class Tensor:
         return as_tensor(other, self) < self
 
     def __le__(self, other: Tensor | float | int) -> Tensor:
-        return 1 - (self > other)
+        other = as_tensor(other, self)
+        le = 1 - (self > other)
+        return unless_nan(le, (self, other), zero(le))
 
     def __ge__(self, other: Tensor | float | int) -> Tensor:
         return as_tensor(other, self) <= self
 
     def eq(self, other: Tensor | float | int) -> Tensor:
-        """Elementwise equality as 0/1, composed as 1 - (a<b) - (b<a)."""
-        return 1 - (self < other) - (self > other)
+        """Elementwise equality as 0/1, composed as 1 - (a<b) - (b<a) where neither side is NaN."""
+        other = as_tensor(other, self)
+        eq = 1 - (self < other) - (self > other)
+        return unless_nan(eq, (self, other), zero(eq))
 
     def where(self, if_true: Tensor | float | int, if_false: Tensor | float | int) -> Tensor:
         """self is the condition (nonzero picks if_true). Gradient flows to the branches only."""
@@ -355,15 +359,15 @@ class Tensor:
         return Tensor.from_node(node, (x, y), backward)
 
     def maximum(self, other: Tensor | float | int) -> Tensor:
-        other = as_tensor(other, self)
-        return (self < other).where(other, self)
+        other = as_tensor(other, self)  # a NaN self already wins: it is never less than other
+        return unless_nan((self < other).where(other, self), (other,), other)
 
     def minimum(self, other: Tensor | float | int) -> Tensor:
         other = as_tensor(other, self)
-        return (other < self).where(other, self)
+        return unless_nan((other < self).where(other, self), (other,), other)
 
     def relu(self) -> Tensor:
-        return (self > 0).where(self, zero(self))
+        return unless_nan((self > 0).where(self, zero(self)), (self,), self)
 
     # ---- reduces (primitive keeps reduced dims as size 1; keepdim=False reshapes after) ----
 
@@ -791,6 +795,20 @@ def as_tensor(x: Tensor | float | int, like: Tensor) -> Tensor:
 
 def zero(like: Tensor) -> Tensor:
     return Tensor.const(0, like.dtype)
+
+
+def unless_nan(answer: Tensor, sides: Sequence[Tensor], nan: Tensor) -> Tensor:
+    """answer, except `nan` wherever one of sides is NaN.
+
+    CMPLT is 0 for a NaN either way round. A composition that reads that 0 as "not less", as <=
+    and eq do, calls a NaN equal to everything, and one that picks a branch on it, as relu and
+    maximum do, trades the NaN for a number; IEEE, numpy and torch do neither. A NaN is the one
+    value neither infinity bounds, so two more compares find it. Ints have no NaN to find.
+    """
+    for side in sides:
+        if side.dtype in FLOATS:
+            answer = ((side > -math.inf) + (side < math.inf)).where(answer, nan)
+    return answer
 
 
 def broadcast_shape(s1: tuple[int, ...], s2: tuple[int, ...], opname: str) -> tuple[int, ...]:
