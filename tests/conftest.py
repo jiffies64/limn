@@ -1,7 +1,8 @@
 """Shared test helpers: the devices, the check that diffs them against the numpy reference,
 and the graph corpus every backend and the lowered IR are run through."""
 
-from typing import Any, Callable, NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import numpy as np
 import pytest

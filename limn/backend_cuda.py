@@ -86,21 +86,21 @@ NVRTC = {
     "nvrtcGetPTXSize": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)],
     "nvrtcGetPTX": [ctypes.c_void_p, ctypes.c_char_p],
     "nvrtcDestroyProgram": [ctypes.POINTER(ctypes.c_void_p)],
-}
-
-
-# present only in NVRTC >= 11.2; bound when the library has them, and pick_arch copes when not
-NVRTC_OPTIONAL = {
     "nvrtcGetNumSupportedArchs": [ctypes.POINTER(ctypes.c_int)],
     "nvrtcGetSupportedArchs": [ctypes.POINTER(ctypes.c_int)],
 }
+
+# present only in NVRTC >= 11.2; bound when the library has them, and pick_arch copes when not
+NVRTC_OPTIONAL = frozenset({"nvrtcGetNumSupportedArchs", "nvrtcGetSupportedArchs"})
 
 
 class Lib:
     """Bound functions of one shared library; every call returns a status int checked by check()."""
 
-    def __init__(self, lib: ctypes.CDLL, signatures: dict[str, list], versioned: frozenset[str], optional: dict[str, list] = {}):
-        for name, argtypes in (signatures | optional).items():
+    def __init__(
+        self, lib: ctypes.CDLL, signatures: dict[str, list], versioned: frozenset[str], optional: frozenset[str] = frozenset()
+    ):
+        for name, argtypes in signatures.items():
             fn = None
             for candidate in (name + "_v2", name) if name in versioned else (name,):
                 try:
@@ -121,7 +121,7 @@ class Lib:
 
 
 def _load(
-    paths: list[str | None], signatures: dict[str, list], versioned: frozenset[str], optional: dict[str, list] = {}
+    paths: list[str | None], signatures: dict[str, list], versioned: frozenset[str], optional: frozenset[str] = frozenset()
 ) -> Lib | None:
     for path in paths:
         if not path:
@@ -236,7 +236,7 @@ class CudaBuffer:
     trim() gives it back, and allocation failure trims and retries before giving up.
     """
 
-    __slots__ = ("ptr", "nbytes", "pool")
+    __slots__ = ("nbytes", "pool", "ptr")
 
     def __init__(self, ptr: int, nbytes: int, pool: dict[int, list[int]]):
         self.ptr = ptr
@@ -246,7 +246,7 @@ class CudaBuffer:
     def __del__(self) -> None:
         try:
             self.pool.setdefault(self.nbytes, []).append(self.ptr)
-        except Exception:  # interpreter teardown can have unloaded anything by now
+        except Exception:  # noqa: BLE001, S110 -- interpreter teardown can have unloaded anything by now
             pass
 
 
